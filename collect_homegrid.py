@@ -87,3 +87,10 @@ if __name__ == '__main__':
             rewards.append(rew)
 
         save_episode(args.dataset_path, val_fraction, counter, executor, futures, pbar, max_futures, observations, actions, rewards)
+
+    for future in futures:
+        future.result()
+        pbar.update(1)
+
+    pbar.close()
+    executor.shutdown()
