@@ -187,7 +187,7 @@ def make_logger(parsed, logdir, step, config):
       embodied.logger.JSONLOutput(logdir, 'metrics.jsonl'),
       embodied.logger.JSONLOutput(logdir, 'scores.jsonl',
                                   '(episode/score|real_step)'),
-      embodied.logger.TensorBoardOutput(logdir),
+      embodied.logger.CometOutput(config.logdir, config, config.run.log_fps)
   ], multiplier)
   if config.use_wandb:
     import wandb

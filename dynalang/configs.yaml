@@ -55,6 +55,7 @@ defaults:
     log_keys_max: '^$'
     log_video_streams: 1
     log_video_timeout: 60
+    log_fps: 10
     from_checkpoint: ''
     sync_every: 10
     actor_host: 'localhost'
