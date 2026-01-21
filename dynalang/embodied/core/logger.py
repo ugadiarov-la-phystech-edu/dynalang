@@ -4,6 +4,7 @@ import datetime
 import json
 import os
 import re
+import sys
 import time
 import uuid
 
@@ -271,6 +272,8 @@ class CometOutput:
     experiment = comet_ml.start(experiment_key=run_id, mode=mode)
     experiment.log_parameters(dict(config))
     experiment.set_name(os.getenv('COMET_EXPERIMENT_NAME', name))
+    experiment.log_system_info('command', ' '.join(sys.argv))
+    experiment.log_system_info('PID', str(os.getpid()))
     self._experiment = experiment
 
   def __call__(self, summaries):
