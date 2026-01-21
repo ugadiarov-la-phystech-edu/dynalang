@@ -30,6 +30,7 @@ defaults:
     sync_every: 10
     profiler: True
     transfer_guard: True
+    mem_fraction: 0.8
 
   run:
     save_frames_to: /dev/null
