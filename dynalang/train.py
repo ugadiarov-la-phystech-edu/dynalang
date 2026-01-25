@@ -70,14 +70,14 @@ def main(argv=None):
       embodied.run.train_eval(
           agent, env, eval_env, replay, eval_replay, logger, args)
 
-    elif args.script == 'train_eval_train':
+    elif args.script == 'train_custom_eval':
       replay = make_replay(config, logdir / 'episodes')
       eval_replay = make_replay(config, logdir / 'eval_episodes', is_eval=True)
       env = wrapped_env(config, batch=True)
       eval_env = wrapped_env(config, batch=True)
       cleanup += [env, eval_env]
       agent = agt.Agent(env.obs_space, env.act_space, step, config)
-      embodied.run.train_eval(
+      embodied.run.train_custom_eval(
           agent, env, eval_env, replay, eval_replay, logger, args)
 
     elif args.script == 'train_holdout':
@@ -186,7 +186,7 @@ def make_logger(parsed, logdir, step, config):
       embodied.logger.TerminalOutput(config.filter),
       embodied.logger.JSONLOutput(logdir, 'metrics.jsonl'),
       embodied.logger.JSONLOutput(logdir, 'scores.jsonl',
-                                  '(episode/score|real_step)'),
+                                  '(episode/score|episode/.*length|real_step)', log_multivalue=True),
       embodied.logger.CometOutput(config.logdir, config, config.run.log_fps)
   ], multiplier)
   if config.use_wandb:

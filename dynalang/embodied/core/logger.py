@@ -158,27 +158,33 @@ class TerminalOutput:
 class JSONLOutput(AsyncOutput):
 
   def __init__(
-      self, logdir, filename='metrics.jsonl', pattern=r'.*',
+      self, logdir, filename='metrics.jsonl', pattern=r'.*', log_multivalue=False,
       strings=False, parallel=True):
     super().__init__(self._write, parallel)
     self._filename = filename
     self._pattern = re.compile(pattern)
     self._strings = strings
+    self._log_multivalue = log_multivalue
     self._logdir = path.Path(logdir)
     self._logdir.mkdirs()
 
   def _write(self, summaries):
-    bystep = collections.defaultdict(dict)
+    bystep = collections.defaultdict(lambda: collections.defaultdict(list))
+
     for step, name, value in summaries:
       if not self._pattern.search(name):
         continue
       if isinstance(value, str) and self._strings:
-        bystep[step][name] = value
+        bystep[step][name].append(value)
       if isinstance(value, np.ndarray) and len(value.shape) == 0:
-        bystep[step][name] = float(value)
+        bystep[step][name].append(float(value))
+
+    if not self._log_multivalue:
+      bystep = {step: {name: values[-1:] for name, values in name2values.items()} for step, name2values in bystep.items()}
+
     lines = ''.join([
         json.dumps({'step': step, **scalars}) + '\n'
-        for step, scalars in bystep.items()])
+        for step, scalars in sorted(bystep.items())])
     with (self._logdir / self._filename).open('a') as f:
       f.write(lines)
 
@@ -277,7 +283,7 @@ class CometOutput:
     self._experiment = experiment
 
   def __call__(self, summaries):
-    bystep = collections.defaultdict(dict)
+    bystep = collections.defaultdict(lambda: collections.defaultdict(list))
     experiment = self._experiment
     for step, name, value in summaries:
       if not self._pattern.search(name):
@@ -286,7 +292,7 @@ class CometOutput:
           # Comet is not happy with logging of strings
           continue
       elif len(value.shape) == 0:
-        bystep[step][name] = float(value)
+        bystep[step][name].append(float(value))
       elif len(value.shape) == 1:
         experiment.log_histogram_3d(value, name=name, step=step)
       elif len(value.shape) in (2, 3):
@@ -320,6 +326,7 @@ class CometOutput:
             os.remove(path)
 
     for step, metrics in bystep.items():
+      metrics = {name: np.mean(value) for name, value in metrics.items()}
       metrics['global_step'] = step
       self._experiment.log_metrics(metrics, step=step)
 
