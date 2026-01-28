@@ -74,7 +74,7 @@ def main(argv=None):
       replay = make_replay(config, logdir / 'episodes')
       eval_replay = make_replay(config, logdir / 'eval_episodes', is_eval=True)
       env = wrapped_env(config, batch=True)
-      eval_env = wrapped_env(config, batch=True)
+      eval_env = wrapped_env(config, batch=True, is_eval=True)
       cleanup += [env, eval_env]
       agent = agt.Agent(env.obs_space, env.act_space, step, config)
       embodied.run.train_custom_eval(
@@ -241,14 +241,15 @@ def make_replay(
   return replay
 
 
-def wrapped_env(config, batch, **overrides):
+def wrapped_env(config, batch, is_eval=False, **overrides):
   ctor = bind(make_env, config, **overrides)
   if batch and config.envs.parallel != 'none':
     ctor = bind(embodied.Parallel, ctor, config.envs.parallel)
   if config.envs.restart:
     ctor = bind(wrappers.RestartOnException, ctor)
   if batch:
-    envs = [ctor() for _ in range(config.envs.amount)]
+    amount = config.envs.eval_amount if is_eval else config.envs.amount
+    envs = [ctor() for _ in range(amount)]
     return embodied.BatchEnv(envs, (config.envs.parallel != 'none'))
   else:
     return ctor()

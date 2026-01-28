@@ -66,7 +66,7 @@ defaults:
     ipv6: False
     trace_malloc: False
 
-  envs: {amount: 4, parallel: process, length: 0, reset: True, restart: True, discretize: 0}
+  envs: {amount: 4, parallel: process, length: 0, reset: True, restart: True, discretize: 0, eval_amount: 4}
   wrapper: {length: 0, reset: True, discretize: 0, checks: False, timeout_reward: 0.0}
   env:
     atari: {size: [64, 64], repeat: 4, sticky: True, gray: True, actions: all, lives: unused, noops: 0, pooling: 2, aggregate: max, resize: pillow}
