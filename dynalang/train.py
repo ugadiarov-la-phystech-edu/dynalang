@@ -18,6 +18,7 @@ sys.path.append(str(directory.parent.parent))
 sys.path.append(str(directory.parent.parent.parent))
 __package__ = directory.name
 
+from embodied.core.logger import CometOutput
 import embodied
 from embodied import wrappers
 from embodied.core import path
@@ -41,7 +42,7 @@ def main(argv=None):
     logdir.mkdirs()
     config.save(logdir / 'config.yaml')
     step = embodied.Counter()
-    logger = make_logger(parsed, logdir, step, config)
+    logger = make_logger(config)
 
   cleanup = []
   try:
@@ -180,36 +181,37 @@ def main(argv=None):
       obj.close()
 
 
-def make_logger(parsed, logdir, step, config):
+def make_logger(config):
+  step = embodied.Counter()
+  logdir = config.logdir
   multiplier = config.env.get(config.task.split('_')[0], {}).get('repeat', 1)
-  logger = embodied.Logger(step, [
-      embodied.logger.TerminalOutput(config.filter),
-      embodied.logger.JSONLOutput(logdir, 'metrics.jsonl'),
-      embodied.logger.JSONLOutput(logdir, 'scores.jsonl',
-                                  '(episode/score|episode/.*length|real_step)', log_multivalue=True),
-      embodied.logger.CometOutput(config.logdir, config, config.run.log_fps)
-  ], multiplier)
-  if config.use_wandb:
-    import wandb
-    wandb_id_file = f"{str(logdir)}/wandb_id.txt"
-    wandb_pa = path.Path(wandb_id_file)
-    if wandb_pa.exists():
-        print("!! Resuming wandb run !!")
-        wandb_id = wandb_pa.read().strip()
+  outputs = []
+  outputs.append(embodied.logger.TerminalOutput(config.logger.filter, 'Agent'))
+  for output in config.logger.outputs:
+    if output == 'jsonl':
+      outputs.append(embodied.logger.JSONLOutput(logdir, 'metrics.jsonl'))
+      outputs.append(embodied.logger.JSONLOutput(
+          logdir, 'scores.jsonl', 'episode/score'))
+    elif output == 'tensorboard':
+      outputs.append(embodied.logger.TensorBoardOutput(
+          logdir, config.logger.fps))
+    elif output == 'expa':
+      exp = logdir.split('/')[-4]
+      run = '/'.join(logdir.split('/')[-3:])
+      proj = 'embodied' if logdir.startswith(('/cns/', 'gs://')) else 'debug'
+      outputs.append(embodied.logger.ExpaOutput(
+          exp, run, proj, config.logger.user, config.flat))
+    elif output == 'wandb':
+      name = '/'.join(logdir.split('/')[-4:])
+      outputs.append(embodied.logger.WandBOutput(name))
+    elif output == 'scope':
+      outputs.append(embodied.logger.ScopeOutput(embodied.Path(logdir)))
+    elif output == 'comet':
+      name = '/'.join(logdir.split('/')[-4:])
+      outputs.append(CometOutput(name, config, config.logger.fps))
     else:
-        wandb_id = wandb.util.generate_id()
-        wandb_pa.write(str(wandb_id))
-    project = config.task
-    wandb.init(
-        id=wandb_id,
-        resume="allow",
-        project=project,
-        name=logdir.name,
-        group=logdir.name[:logdir.name.rfind("_")],
-        sync_tensorboard=True,
-        config=dict(config)
-    )
-
+      raise NotImplementedError(output)
+  logger = embodied.Logger(step, outputs, multiplier)
   return logger
 
 

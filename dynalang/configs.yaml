@@ -2,6 +2,13 @@ defaults:
   use_wandb: True
   debug: False
 
+  logger:
+      outputs: [jsonl, scope]
+      filter: 'score|length|fps|ratio|train/loss/|train/rand/'
+      timer: True
+      fps: 15
+      user: ''
+
   # Trainer
   seed: 0
   method: name
