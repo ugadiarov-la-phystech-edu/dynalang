@@ -1,12 +1,13 @@
 import sys
 
+import chex
 import embodied
 import jax
 import jax.numpy as jnp
 import numpy as np
 import ruamel.yaml as yaml
 tree_map = jax.tree_util.tree_map
-sg = lambda x: tree_map(jax.lax.stop_gradient, x)
+sg = lambda x, skip=False: x if skip else tree_map(jax.lax.stop_gradient, x)
 
 import logging
 logger = logging.getLogger()
@@ -20,7 +21,35 @@ from . import jaxagent
 from . import jaxutils
 from . import nets
 from . import ninjax as nj
+
 import optax
+
+
+def lambda_return(last, term, rew, boot, disc, lam):
+  """Compute lambda-weighted returns bootstrapped from values.
+  
+  Args:
+    last: episode boundaries [batch, seq]
+    term: terminal states [batch, seq]
+    rew: observed rewards [batch, seq]
+    boot: bootstrap values [batch, seq]
+    disc: discount factor
+    lam: lambda parameter for return weighting
+  
+  Returns:
+    returns [batch, seq-1] - returns for all timesteps except the last
+  """
+  chex.assert_equal_shape((last, term, rew, boot))
+  rets = [boot[:, -1]]  # Start with final bootstrap value
+  live = (1 - term.astype(jnp.float32))[:, 1:] * disc  # [batch, seq-1]
+  cont = (1 - last.astype(jnp.float32))[:, 1:] * lam  # [batch, seq-1]
+  interm = rew[:, 1:] + (1 - cont) * live * boot[:, 1:]  # [batch, seq-1]
+  for t in reversed(range(live.shape[1])):
+    rets.append(interm[:, t] + live[:, t] * cont[:, t] * rets[-1])
+  return jnp.stack(list(reversed(rets))[:-1], 1)
+
+
+
 
 
 @jaxagent.Wrapper
@@ -42,6 +71,7 @@ class Agent(nj.Module):
     self.wm = WorldModel(obs_space, act_space, config, preproc_shapes, name='wm')
     self.preprocessors = {k: v() for k, v in
                           self.wm.encoder.preprocessors.items()}
+    #self.opt = jaxutils.Optimizer(name='opt', **config.opt)
     if self.config.run.pretrain_wm_only:
         print("Agent: Pretraining WM only.")
         return
@@ -52,6 +82,12 @@ class Agent(nj.Module):
     else:
       self.expl_behavior = getattr(behaviors, config.expl_behavior)(
           self.wm, self.act_space, self.config, name='expl_behavior')
+    self.wm_modules  = self._build_wm_modules()
+    self.modules = self._build_opt_modules()
+    print(self.modules)
+    self.opt = jaxutils.Optimizer(
+        self.modules, self._make_opt(**config.opt), summary_depth=1,
+        name='opt')
 
   def policy_initial(self, batch_size):
     return (
@@ -61,6 +97,72 @@ class Agent(nj.Module):
 
   def train_initial(self, batch_size):
     return self.wm.initial(batch_size)
+
+  def _build_wm_modules(self):
+    if self.config.skip_mlp_training:
+      assert not self.config.skip_cnn_training
+      enc = self.wm.encoder._cnn
+      dec = self.wm.heads['decoder']._cnn
+      others = {k: v for k, v in self.wm.heads.items() if k != 'decoder'}
+      return [self.wm.rssm, enc, dec, *others.values()]
+    if self.config.skip_cnn_training:
+      assert not self.config.skip_mlp_training
+      enc = self.wm.encoder._mlp
+      dec = self.wm.heads['decoder']._mlp
+      others = {k: v for k, v in self.wm.heads.items() if k != 'decoder'}
+      return [self.wm.rssm, enc, dec, *others.values()]
+    return [self.wm.rssm, *self.wm.heads.values(), self.wm.encoder]
+
+  def _build_opt_modules(self):
+    modules = self._build_wm_modules()
+    if self.config.task_behavior:
+      modules.append(self.task_behavior.ac)
+      modules.extend([critic.net for critic in self.task_behavior.critics.values()])
+    if self.expl_behavior is not self.task_behavior:
+      modules.append(self.expl_behavior.ac)
+      modules.extend([critic.net for critic in self.expl_behavior.critics.values()])
+    return modules
+
+  def _ac_losses(self, ac, start, carry=None, repfeat=None):
+    traj = self.wm.imagine(ac.policy, start, ac.config.imag_horizon, carry)
+    
+    # Concatenate last K replay features with imagined features
+    B, T = repfeat.get('deter', list(repfeat.values())[0]).shape[:2]
+    K = min(self.config.imag_last or T, T)
+    #imag_length == imag_horizon
+    H = ac.config.imag_horizon
+
+    first = tree_map(
+        lambda x: x[:, -K:].reshape((B * K, 1, *x.shape[2:])),
+        repfeat)
+    # (H, B*K, ...) to (B*K, H, ...)
+    traj = tree_map(
+        lambda x: x.transpose((1, 0, *range(2, x.ndim))), traj)
+    for key in list(traj.keys()):
+      if key in first:
+        traj[key] = jnp.concatenate([sg(first[key], skip=self.config.ac_grads), sg(traj[key])], 1)
+    
+    discount = 1 - 1 / self.config.horizon if not self.config.contdisc else 1
+    con = traj['cont']
+    traj['weight'] = jnp.cumprod(discount * con, 1) / discount
+    
+    actor_loss, actor_metrics = ac.loss(traj)
+    critic_losses = []
+    critic_metrics = {}
+    critic_returns = {}
+    for key, critic in ac.critics.items():
+      target = sg(critic.score(traj, ac.actor, slow=critic.config.slow_critic_target)[1])
+      loss, mets = critic.loss(traj, target)
+      critic_losses.append(loss)
+      critic_metrics.update({f'{key}_critic_{k}': v for k, v in mets.items()})
+      if critic.config.slow_critic_target:
+        value = critic.slow(traj).mean()
+      else:
+        value = critic.net(traj).mean()
+      critic_returns[key] = value 
+    critic_loss = sum(critic_losses) if critic_losses else 0.0
+    return actor_loss, actor_metrics, critic_loss, critic_metrics, critic_returns
+
 
   def policy(self, obs, state, mode='train'):
     self.config.jax.jit and print('Tracing policy function.')
@@ -83,18 +185,82 @@ class Agent(nj.Module):
     self.config.jax.jit and print('Tracing train function.')
     metrics = {}
     data = self.preprocess(data)
-    state, wm_outs, mets = self.wm.train(data, state)
-    metrics.update(mets)
-    context = {**data, **wm_outs['post']}
-    if self.config.run.pretrain_wm_only:
-        return wm_outs, state, metrics
-    # Flatten (batch, seq) -> (batch * seq)
-    start = tree_map(lambda x: x.reshape([-1] + list(x.shape[2:])), context)
-    _, mets = self.task_behavior.train(self.wm.imagine, start, context)
-    metrics.update(mets)
-    if self.config.expl_behavior != 'None':
-      _, mets = self.expl_behavior.train(self.wm.imagine, start, context)
-      metrics.update({'expl_' + key: value for key, value in mets.items()})
+    for key in [x for x in self.config.zero_data_keys if x]:
+      data[key] = jnp.zeros_like(data[key])
+
+    def loss(data, state):
+      #calc wm loss
+      wm_loss, (state, wm_outs, wm_metrics) = self.wm.loss(data, state)
+      metrics = dict(wm_metrics)
+      total_loss = wm_loss
+      if self.config.run.pretrain_wm_only:
+        return total_loss, (state, wm_outs, metrics)
+      context = {**data, **wm_outs['post']}
+      start = tree_map(lambda x: x.reshape([-1] + list(x.shape[2:])), sg(context))
+      B, T = context.get('deter', list(context.values())[0]).shape[:2]
+      K = min(self.config.imag_last or T, T)
+      
+      #calc actor and critic losses
+      carry = self.task_behavior.ac.initial(len(start['deter']))
+      actor_loss, actor_metrics, critic_loss, critic_metrics, critic_returns = self._ac_losses(
+        self.task_behavior.ac, start, carry, repfeat=context)
+      metrics['task_actor_loss'] = actor_loss
+      metrics['task_critic_loss'] = critic_loss
+      total_loss = total_loss + actor_loss + critic_loss
+      metrics.update(actor_metrics)
+      metrics.update(critic_metrics)
+      if self.expl_behavior is not self.task_behavior:
+        carry = self.expl_behavior.ac.initial(len(start['deter']))
+        expl_actor_loss, actor_metrics, expl_critic_loss, critic_metrics, expl_returns = self._ac_losses(
+            self.expl_behavior.ac, start, carry, repfeat=context)
+        metrics['expl_actor_loss'] = expl_actor_loss
+        metrics['expl_critic_loss'] = expl_critic_loss
+        total_loss += expl_actor_loss + expl_critic_loss
+        expl_metrics = {}
+        expl_metrics.update(actor_metrics)
+        expl_metrics.update(critic_metrics)
+        metrics.update({f'expl_{k}': v for k, v in expl_metrics.items()})
+      
+      if self.config.repval_loss and not self.config.run.pretrain_wm_only:
+        feat = sg(context, skip=self.config.repval_grad)
+        last, term, rew = [data[k] for k in ('is_last', 'is_terminal', 'reward')]
+        repval_loss = 0.0
+        discount = 1 - 1 / self.config.horizon
+        state_keys = list(self.wm.rssm.initial(1).keys())
+        feat, last, term, rew = tree_map(lambda x: x[:, -K:], (feat, last, term, rew))
+        feats = {k: v for k, v in feat.items() if k in state_keys}
+        
+        for key, critic in self.task_behavior.critics.items():
+          # critic_returns[key] has shape [B*K, H+1]
+          boot = critic_returns[key][:, 0].reshape(B, K)
+          target = lambda_return(last, term, rew, boot, discount, self.config.return_lambda)
+          loss, mets = critic.repval_loss(feats, target, critic.slow, valnorm=None, slowreg=1.0, last=last)
+          repval_loss += loss
+          metrics.update({f'repval_{key}_{k}': v for k, v in mets.items()})
+        
+        metrics['repval_loss'] = repval_loss
+        total_loss += repval_loss
+      
+      return total_loss, (state, wm_outs, metrics)
+
+    losses, (state, wm_outs, loss_metrics) = self.opt(
+        loss, data, state, has_aux=True)
+    metrics.update(loss_metrics)
+    metrics.update(losses)
+
+    if not self.config.run.pretrain_wm_only:
+      for critic in self.task_behavior.critics.values():
+          critic.updater()
+      if self.expl_behavior is not self.task_behavior:
+        for critic in self.expl_behavior.critics.values():
+          critic.updater()
+    if (not self.config.run.pretrain_wm_only and
+        self.config.expl_behavior != 'None'):
+      if hasattr(self.expl_behavior, 'rewards'):
+        for key, rewfn in self.expl_behavior.rewards.items():
+          mets = rewfn.train({**data, **wm_outs['post']})
+          metrics.update({f'expl_{key}_k': v for k, v in mets.items()})
+
     outs = {}
     return outs, state, metrics
 
@@ -148,6 +314,44 @@ class Agent(nj.Module):
     obs['cont'] = 1.0 - obs['is_terminal'].astype(jnp.float32)
     return obs
 
+  def _make_opt(
+      self,
+      lr: float = 4e-5,
+      agc: float = 0.3,
+      eps: float = 1e-20,
+      beta1: float = 0.9,
+      beta2: float = 0.999,
+      momentum: bool = True,
+      nesterov: bool = False,
+      wd: float = 0.0,
+      wdregex: str = r'/kernel$',
+      schedule: str = 'const',
+      warmup: int = 1000,
+      anneal: int = 0,
+  ):
+    chain = []
+    chain.append(jaxutils.clip_by_agc(agc))
+    chain.append(jaxutils.scale_by_rms(beta2, eps))
+    chain.append(jaxutils.scale_by_momentum(beta1, nesterov))
+    if wd:
+      assert not wdregex[0].isnumeric(), wdregex
+      pattern = re.compile(wdregex)
+      wdmask = lambda params: {k: bool(pattern.search(k)) for k in params}
+      chain.append(optax.add_decayed_weights(wd, wdmask))
+    assert anneal > 0 or schedule == 'const'
+    if schedule == 'const':
+      sched = optax.constant_schedule(lr)
+    elif schedule == 'linear':
+      sched = optax.linear_schedule(lr, 0.1 * lr, anneal - warmup)
+    elif schedule == 'cosine':
+      sched = optax.cosine_decay_schedule(lr, anneal - warmup, 0.1 * lr)
+    else:
+      raise NotImplementedError(schedule)
+    if warmup:
+      ramp = optax.linear_schedule(0.0, lr, warmup)
+      sched = optax.join_schedules([ramp, sched], [warmup])
+    chain.append(optax.scale_by_learning_rate(sched))
+    return optax.chain(*chain)
 
 class WorldModel(nj.Module):
 
@@ -170,7 +374,7 @@ class WorldModel(nj.Module):
         'decoder': nets.MultiDecoder(shapes, **config.decoder, name='dec'),
         'reward': nets.MLP((), **config.reward_head, name='rew'),
         'cont': nets.MLP((), **config.cont_head, name='cont')}
-    self.opt = jaxutils.Optimizer(name='model_opt', **config.model_opt)
+    #self.opt = jaxutils.Optimizer(name='model_opt', **config.model_opt)
     scales = self.config.loss_scales.copy()
     image, vector = scales.pop('image'), scales.pop('vector')
     scales.update({k: image for k in self.heads['decoder'].cnn_shapes})
@@ -201,7 +405,7 @@ class WorldModel(nj.Module):
       modules = [self.rssm, enc, dec, *others.values()]
 
     mets, (state, outs, metrics) = self.opt(
-        modules, self.loss, data, state, has_aux=True)
+        self.loss, data, state, has_aux=True)
     metrics.update(mets)
     return state, outs, metrics
 
@@ -222,7 +426,12 @@ class WorldModel(nj.Module):
     dists = {}
     feats = {**post, 'embed': embed}
     for name, head in self.heads.items():
-      inp = feats if name in self.config.grad_heads else sg(feats)
+      if name == 'reward':
+        inp = feats if self.config.reward_grad else sg(feats)
+      elif name in self.config.grad_heads:
+        inp = feats
+      else:
+        inp = sg(feats)
       out = head(inp)
       out = out if isinstance(out, dict) else {name: out}
       dists.update(out)
@@ -247,7 +456,7 @@ class WorldModel(nj.Module):
       context = {k: v[:, :-1].reshape((-1, *v.shape[2:]))
                  for k, v in post.items()}
       one_step_openl = self.heads["decoder"](
-        self.rssm.imagine(next_ac, context),
+        sg(self.rssm.imagine(next_ac, context)),
       )
       truth = data["token"][:, 1:].reshape((-1, 1, *data["token"].shape[2:]))
       nll = -(one_step_openl["token"].log_prob(truth)).mean(-1)
@@ -305,7 +514,6 @@ class WorldModel(nj.Module):
     return traj
 
   def report(self, data):
-    # data: dict, each val with shape (batch, length, <obs shape>)
     state = self.initial(len(data['is_first']))
     report = {}
     report.update(self.loss(data, state)[-1][-1])
@@ -319,9 +527,6 @@ class WorldModel(nj.Module):
       context = self.rssm.observe(
           self.encoder(data)[:6, :5], data['action'][:6, :5],
           data['is_first'][:6, :5])
-    # context:
-    # - deter (batch, prefix_len, rssm.deter)
-    # - logit, stoch (batch, prefix_len, rssm.stoch, rssm.classes)
     start = {k: v[:, -1] for k, v in context.items()}
     recon = self.heads['decoder'](context)
     openl = self.heads['decoder'](
@@ -422,7 +627,7 @@ class ImagActorCritic(nj.Module):
     self.retnorms = {
         k: jaxutils.Moments(**config.retnorm, name=f'retnorm_{k}')
         for k in critics}
-    self.opt = jaxutils.Optimizer(name='actor_opt', **config.actor_opt)
+    #self.opt = jaxutils.Optimizer(name='actor_opt', **config.actor_opt)
 
   def initial(self, batch_size):
     return {}
@@ -497,7 +702,7 @@ class VFunction(nj.Module):
         self.net, self.slow,
         self.config.slow_critic_fraction,
         self.config.slow_critic_update)
-    self.opt = jaxutils.Optimizer(name='critic_opt', **self.config.critic_opt)
+    #self.opt = jaxutils.Optimizer(name='critic_opt', **self.config.critic_opt)
 
   def train(self, traj, actor):
     target = sg(self.score(traj, slow=self.config.slow_critic_target)[1])
@@ -507,26 +712,48 @@ class VFunction(nj.Module):
     return metrics
 
   def loss(self, traj, target):
+    """Compute value function loss with target padding 
+    Args:
+      traj: dict {key: [seq, batch, ...]} trajectory
+      target: [seq-1, batch] target return values
+    
+    Returns:
+      loss: scalar loss
+      metrics: dict of training metrics
+    """
     metrics = {}
-    traj = {k: v[:-1] for k, v in traj.items()}
-    dist = self.net(traj)
-    loss = -dist.log_prob(sg(target))
+    dist = self.net(traj)  # [seq, batch]
+    target_padded = jnp.concatenate([target, jnp.zeros_like(target[-1:])], 0)  # [seq, batch]
+    loss = -dist.log_prob(sg(target_padded))[:-1]  # [seq-1, batch]
     if self.config.critic_slowreg == 'logprob':
-      reg = -dist.log_prob(sg(self.slow(traj).mean()))
+      reg = -self.slow(traj).log_prob(sg(target_padded))[:-1]  # [seq-1, batch]
     elif self.config.critic_slowreg == 'xent':
+      slow_dist = self.slow(traj)
       reg = -jnp.einsum(
           '...i,...i->...',
-          sg(self.slow(traj).probs),
-          jnp.log(dist.probs))
+          sg(slow_dist.probs),
+          jnp.log(dist.probs))[:-1]  # [seq-1, batch]
     else:
       raise NotImplementedError(self.config.critic_slowreg)
     loss += self.config.loss_scales.slowreg * reg
-    loss = (loss * sg(traj['weight'])).mean()
+    loss = (loss * sg(traj['weight'])[:-1]).mean()
     loss *= self.config.loss_scales.critic
     metrics = jaxutils.tensorstats(dist.mean())
     return loss, metrics
 
   def score(self, traj, actor=None, slow=False):
+    """Compute rewards, returns, and baseline values.
+    
+    Args:
+      traj: dict {key: [seq, batch, ...]} trajectory
+      actor: actor for policy evaluation
+      slow: bool, use slow value network if True
+    
+    Returns:
+      rew: [seq-1, batch] rewards
+      ret: [seq, batch] returns
+      value: [seq-1, batch] baseline values
+    """
     rew = self.rewfn(traj)
     assert len(rew) == len(traj['action']) - 1, (
         'should provide rewards for all but last action')
@@ -542,3 +769,46 @@ class VFunction(nj.Module):
       vals.append(interm[t] + disc[t] * self.config.return_lambda * vals[-1])
     ret = jnp.stack(list(reversed(vals))[:-1])
     return rew, ret, value[:-1]
+
+  def repval_loss(self, feats, target, slowval=None, valnorm=None, slowreg=1.0, last=None):
+    """Compute replay value loss on observed trajectory (ocdreamer style).
+    
+    Args:
+      feats: RSSM state features [batch, seq, ...]
+      target: lambda returns from observed trajectory [batch, seq]
+      slowval_net: slow value network for regularization (unused)
+      valnorm: normalizer for value predictions (unused)
+      slowreg: regularization weight for slow value loss (unused)
+      last: episode boundaries [batch, seq] for masking
+    
+    Returns:
+      loss: scalar replay value loss
+      metrics: dict of metrics
+    """
+    metrics = {}
+    target_padded = jnp.concatenate([target, jnp.zeros_like(target[:, -1:])], 1)  # [batch, seq]
+    dist = self.net(feats) 
+    loss = -dist.log_prob(sg(target_padded))[:, :-1]  # [batch, seq-1]
+    if self.config.critic_slowreg == 'logprob':
+      slow_dist = self.slow(feats)
+      reg = -slow_dist.log_prob(sg(target_padded))[:, :-1]  # [batch, seq-1]
+    elif self.config.critic_slowreg == 'xent':
+      slow_dist = self.slow(feats)
+      reg = -jnp.einsum(
+          '...i,...i->...',
+          sg(slow_dist.probs),
+          jnp.log(dist.probs))[:, :-1]  # [batch, seq-1]
+    else:
+      raise NotImplementedError(self.config.critic_slowreg)
+    loss += self.config.loss_scales.slowreg * reg
+    
+    if last is not None:
+      weight = (1.0 - last.astype(jnp.float32))[:, :-1]  # [batch, seq-1]
+      loss = weight * loss
+
+    loss = loss.mean() * self.config.loss_scales.repval
+    loss *= self.config.loss_scales.critic
+    
+    metrics.update(jaxutils.tensorstats(dist.mean(), 'value'))
+    metrics.update(jaxutils.tensorstats(target, 'target'))
+    return loss, metrics
