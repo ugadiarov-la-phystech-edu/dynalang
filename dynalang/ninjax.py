@@ -406,33 +406,33 @@ class Module(object, metaclass=ModuleMeta):
     # Read keys individually to mark them as accessed.
     return {k.removeprefix(p): ctx[k] for k in ctx if k.startswith(p)}
 
-  def value(self, name, make, *args, **kwargs):
-    """Define and read a state entry in the scope of this module."""
-    validate(name)
-    assert SCOPE == self.path, (
-        name, 'Values can only be created in the root scope of a module.')
-    path = self.path + '/' + name
-    if path not in context():
-      if callable(make):
-        value = make(*args, **kwargs)
-      else:
-        assert not args and not kwargs
-        value = make
-      context()[path] = value
-    # Look up the value again to register it as accessed.
-    return context()[path]
+  # def value(self, name, make, *args, **kwargs):
+  #   """Define and read a state entry in the scope of this module."""
+  #   validate(name)
+  #   assert SCOPE == self.path, (
+  #       name, 'Values can only be created in the root scope of a module.')
+  #   path = self.path + '/' + name
+  #   if path not in context():
+  #     if callable(make):
+  #       value = make(*args, **kwargs)
+  #     else:
+  #       assert not args and not kwargs
+  #       value = make
+  #     context()[path] = value
+  #   # Look up the value again to register it as accessed.
+  #   return context()[path]
 
-  def write(self, name, value):
-    """Update the value of a state entry in the scope of this module."""
-    validate(name)
-    path = self.path + '/' + name
-    existing = context()[path]
-    value = jnp.asarray(value, dtype=existing.dtype)
-    assert existing.shape == value.shape, (existing.shape, value.shape)
-    context()[path] = value
-    # Return value without lookup because it was provided by the user and thus
-    # has to be available in the pure function already.
-    return value
+  # def write(self, name, value):
+  #   """Update the value of a state entry in the scope of this module."""
+  #   validate(name)
+  #   path = self.path + '/' + name
+  #   existing = context()[path]
+  #   value = jnp.asarray(value, dtype=existing.dtype)
+  #   assert existing.shape == value.shape, (existing.shape, value.shape)
+  #   context()[path] = value
+  #   # Return value without lookup because it was provided by the user and thus
+  #   # has to be available in the pure function already.
+  #   return value
 
   def get(self, name, *args, **kwargs):
     """Retrieve or create a state entry that belongs to this module."""
@@ -480,21 +480,21 @@ class Module(object, metaclass=ModuleMeta):
         raise KeyError(f'Key {key} does not belong to module {self.path}.')
     context().update(mapping)
 
-  def sub(self, name, make=None, *args, **kwargs):
-    """Define and retrieve a sub module."""
-    validate(name)
-    assert SCOPE == self.path or SCOPE.startswith(self.path + '/'), (
-        name, 'Can only create submodules from inside the parent module.')
-    if SCOPE == self.path:
-      handle = name
-    else:
-      assert SCOPE.startswith(self.path + '/')
-      handle = SCOPE[len(self.path) + 1:] + '/' + name
-    if handle not in self._submodules:
-      assert make, 'Provide constructor for submodule that does not exist.'
-      module = make(*args, **kwargs, name=name)
-      self._submodules[handle] = module
-    return self._submodules[handle]
+  # def sub(self, name, make=None, *args, **kwargs):
+  #   """Define and retrieve a sub module."""
+  #   validate(name)
+  #   assert SCOPE == self.path or SCOPE.startswith(self.path + '/'), (
+  #       name, 'Can only create submodules from inside the parent module.')
+  #   if SCOPE == self.path:
+  #     handle = name
+  #   else:
+  #     assert SCOPE.startswith(self.path + '/')
+  #     handle = SCOPE[len(self.path) + 1:] + '/' + name
+  #   if handle not in self._submodules:
+  #     assert make, 'Provide constructor for submodule that does not exist.'
+  #     module = make(*args, **kwargs, name=name)
+  #     self._submodules[handle] = module
+  #   return self._submodules[handle]
 
 
 class Variable(Module):
@@ -561,19 +561,26 @@ class Tree(Module):
     self.make = functools.partial(make, *args, **kwargs)
 
   def read(self):
-    if not self.values:
+    state = self.getm(allow_empty=True)
+    prefix = self.path + '/'
+    values = {k.removeprefix(prefix): v for k, v in state.items()}
+    if not values:
       mapping, self.treedef = flatten(self.make())
-      [self.value(k, v) for k, v in mapping.items()]
-    return unflatten(self.values, self.treedef)
+      [self.put(k, v) for k, v in mapping.items()]
+      state = self.getm(allow_empty=True)
+      values = {k.removeprefix(prefix): v for k, v in state.items()}
+    return unflatten(values, self.treedef)
 
   def write(self, tree):
-    if not self.values:
+    state = self.getm(allow_empty=True)
+    prefix = self.path + '/'
+    values = {k.removeprefix(prefix): v for k, v in state.items()}
+    if not values:
       mapping, self.treedef = flatten(self.make())
-      [self.value(k, v) for k, v in mapping.items()]
+      [self.put(k, v) for k, v in mapping.items()]
     mapping, treedef = flatten(tree)
     assert treedef == self.treedef, (self.treedef, treedef)
-    write = super().write
-    [write(k, v) for k, v in mapping.items()]
+    [self.put(k, v) for k, v in mapping.items()]
     return jax.tree.map(lambda x: x, tree)
 
 def flatten(tree):
