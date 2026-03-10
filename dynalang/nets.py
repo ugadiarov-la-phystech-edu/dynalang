@@ -11,7 +11,7 @@ tree_map = jax.tree_util.tree_map
 sg = lambda x: tree_map(jax.lax.stop_gradient, x)
 
 from . import jaxutils
-from . import ninjax as nj
+from . import ninjax_compat as nj
 cast = jaxutils.cast_to_compute
 
 from typing import List
@@ -53,7 +53,7 @@ class RSSM(nj.Module):
           logit=jnp.zeros([batch_size, self._stoch, self._classes], f32),
           stoch=jnp.zeros([batch_size, self._stoch, self._classes], f32),
           mask=jnp.zeros([batch_size, self._stoch], bool))
-    deter = self.get('initial', jnp.zeros, state['deter'][0].shape, f32)
+    deter = self.value('initial', jnp.zeros, state['deter'][0].shape, f32)
     state['deter'] = jnp.repeat(jnp.tanh(deter)[None], batch_size, 0)
     state['stoch'] = self._prior(cast(state['deter']), sample=True)['stoch']
     return cast(state)
@@ -78,7 +78,7 @@ class RSSM(nj.Module):
   def obs_step(self, prev_state, prev_action, embed, is_first):
     deter = self._gru(prev_state, prev_action, is_first)
     x = jnp.concatenate([deter, embed], -1)
-    x = self.get('obs_out', Linear, **self._kw)(x)
+    x = self.sub('obs_out', Linear, **self._kw)(x)
     stats = self._stats('obs_stats', x)
     stoch = self.get_dist(stats).sample(seed=nj.rng())
     post = {'deter': deter, 'stoch': stoch, **stats}
@@ -120,12 +120,12 @@ class RSSM(nj.Module):
 
   def _prior(self, deter, sample, post=None):
     if self._impl == 'gaussian':
-      x = self.get('img_out', Linear, **self._kw)(deter)
+      x = self.sub('img_out', Linear, **self._kw)(deter)
       stats = self._stats('img_stats', x)
       stoch = self.get_dist(stats).sample(seed=nj.rng()) if sample else None
       return cast({'deter': deter, 'stoch': stoch, **stats})
     if self._impl == 'softmax':
-      x = self.get('img_out', Linear, **self._kw)(deter)
+      x = self.sub('img_out', Linear, **self._kw)(deter)
       stats = self._stats('img_stats', x)
       stoch = self.get_dist(stats).sample(seed=nj.rng()) if sample else None
       return cast({'deter': deter, 'stoch': stoch, **stats})
@@ -162,13 +162,13 @@ class RSSM(nj.Module):
     x = jnp.concatenate([
         prev_state['stoch'].reshape((*batch_shape, -1)),
         cast(prev_action).reshape((*batch_shape, -1))], -1)
-    x = self.get('img_in', Linear, **self._kw)(x)
+    x = self.sub('img_in', Linear, **self._kw)(x)
     x = jnp.concatenate([prev_state['deter'], x], -1)
     if self._bottleneck > 0:
       kw = {**self._kw, 'units': self._bottleneck}
-      x = self.get('bottleneck', Linear, **kw)(x)
+      x = self.sub('bottleneck', Linear, **kw)(x)
     kw = {**self._kw, 'act': 'none', 'units': 3 * self._deter}
-    x = self.get('gru', Linear, **kw)(x)
+    x = self.sub('gru', Linear, **kw)(x)
     reset, cand, update = jnp.split(x, 3, -1)
     reset = jax.nn.sigmoid(reset)
     cand = jnp.tanh(reset * cand)
@@ -178,12 +178,12 @@ class RSSM(nj.Module):
 
   def _stats(self, name, x):
     if self._impl == 'gaussian':
-      x = self.get(name, Linear, 2 * self._stoch)(x)
+      x = self.sub(name, Linear, 2 * self._stoch)(x)
       mean, std = jnp.split(x, 2, -1)
       std = 2 * jax.nn.sigmoid(std / 2) + 0.1
       return {'mean': mean, 'std': std}
     if self._impl == 'softmax':
-      x = self.get(name, Linear, self._stoch * self._classes)(x)
+      x = self.sub(name, Linear, self._stoch * self._classes)(x)
       logit = x.reshape(x.shape[:-1] + (self._stoch, self._classes))
       if self._unimix:
         probs = jax.nn.softmax(logit, -1)
@@ -192,7 +192,7 @@ class RSSM(nj.Module):
         logit = jnp.log(probs)
       return {'logit': logit}
     if self._impl == 'maskgit':
-      x = self.get(name, Linear, self._stoch * self._classes)(x)
+      x = self.sub(name, Linear, self._stoch * self._classes)(x)
       logit = x.reshape(x.shape[:-1] + (self._stoch, self._classes))
       if self._unimix:
         probs = jax.nn.softmax(logit, -1)
@@ -219,7 +219,7 @@ class TokenRSSM(nj.Module):
     self._kw = kw
 
   def initial(self, batch_size):
-    deter = self.get('initial', jnp.zeros, [self._deter], f32)
+    deter = self.value('initial', jnp.zeros, [self._deter], f32)
     state = dict(
         deter=jnp.repeat(jnp.tanh(deter)[None], batch_size, 0),
         z_logit=jnp.zeros([batch_size, self._stoch, self._classes], f32),
@@ -293,12 +293,12 @@ class TokenRSSM(nj.Module):
         cast(act).reshape((*batch_shape, -1)),
         cast(z_stoch).reshape((*batch_shape, -1)),
         cast(l_stoch).reshape((*batch_shape, -1))], -1)
-    x = self.get('inps', Linear, **self._kw)(x)
+    x = self.sub('inps', Linear, **self._kw)(x)
     return x
 
   def _repr(self, embed, token, sample=True):
-    x = self.get('repr', Linear, **self._kw)(embed)
-    z_logit = self.get('repr_z', Linear, (self._stoch, self._classes))(x)
+    x = self.sub('repr', Linear, **self._kw)(embed)
+    z_logit = self.sub('repr_z', Linear, (self._stoch, self._classes))(x)
     z_logit = self._apply_unimix(z_logit)
     l_logit = jnp.zeros_like(token)
     rep = {'z_logit': z_logit, 'l_logit': l_logit}
@@ -310,10 +310,10 @@ class TokenRSSM(nj.Module):
   def _pred(self, deter, act, sample=True):
     x = jnp.concatenate([deter, act], -1)
     for i in range(self._prior_layers):
-      x = self.get(f'pred{i}', Linear, **self._kw)(x)
-    z_logit = self.get('pred_z', Linear, (self._stoch, self._classes))(x)
+      x = self.sub(f'pred{i}', Linear, **self._kw)(x)
+    z_logit = self.sub('pred_z', Linear, (self._stoch, self._classes))(x)
     z_logit = self._apply_unimix(z_logit)
-    l_logit = self.get('pred_l', Linear, self._vocab)(x)
+    l_logit = self.sub('pred_l', Linear, self._vocab)(x)
     pred = {'z_logit': z_logit, 'l_logit': l_logit}
     if sample:
       pred['z_stoch'] = self.get_dist_z(pred).sample(seed=nj.rng())
@@ -324,9 +324,9 @@ class TokenRSSM(nj.Module):
     x = jnp.concatenate([prev_deter, inputs], -1)
     if self._bottleneck > 0:
       kw = {**self._kw, 'units': self._bottleneck}
-      x = self.get('bottleneck', Linear, **kw)(x)
+      x = self.sub('bottleneck', Linear, **kw)(x)
     kw = {**self._kw, 'act': 'none', 'units': 3 * self._deter}
-    x = self.get('gru', Linear, **kw)(x)
+    x = self.sub('gru', Linear, **kw)(x)
     reset, cand, update = jnp.split(x, 3, -1)
     reset = jax.nn.sigmoid(reset)
     cand = jnp.tanh(reset * cand)
@@ -360,7 +360,7 @@ class EarlyRSSM(nj.Module):
     self._kw = kw
 
   def initial(self, batch_size):
-    deter = self.get('initial', jnp.zeros, [self._deter], f32)
+    deter = self.value('initial', jnp.zeros, [self._deter], f32)
     state = dict(
         deter=jnp.repeat(jnp.tanh(deter)[None], batch_size, 0),
         logit=jnp.zeros([batch_size, self._stoch, self._classes], f32),
@@ -423,11 +423,11 @@ class EarlyRSSM(nj.Module):
     x = jnp.concatenate([
         cast(act).reshape((*batch_shape, -1)),
         cast(stoch).reshape((*batch_shape, -1))], -1)
-    x = self.get('inps', Linear, **self._kw)(x)
+    x = self.sub('inps', Linear, **self._kw)(x)
     return x
 
   def _repr(self, embed, sample=True):
-    x = self.get('repr', Linear, **self._kw)(embed)
+    x = self.sub('repr', Linear, **self._kw)(embed)
     stats = self._stats('repr_stats', x)
     stoch = self.get_dist(stats).sample(seed=nj.rng()) if sample else None
     return cast({**stats, 'stoch': stoch})
@@ -435,7 +435,7 @@ class EarlyRSSM(nj.Module):
   def _pred(self, deter, act, sample=True):
     x = jnp.concatenate([deter, act], -1)
     for i in range(self._prior_layers):
-      x = self.get(f'pred{i}', Linear, **self._kw)(x)
+      x = self.sub(f'pred{i}', Linear, **self._kw)(x)
     stats = self._stats('pred_stats', x)
     stoch = self.get_dist(stats).sample(seed=nj.rng()) if sample else None
     return cast({**stats, 'stoch': stoch})
@@ -444,9 +444,9 @@ class EarlyRSSM(nj.Module):
     x = jnp.concatenate([prev_deter, inputs], -1)
     if self._bottleneck > 0:
       kw = {**self._kw, 'units': self._bottleneck}
-      x = self.get('bottleneck', Linear, **kw)(x)
+      x = self.sub('bottleneck', Linear, **kw)(x)
     kw = {**self._kw, 'act': 'none', 'units': 3 * self._deter}
-    x = self.get('gru', Linear, **kw)(x)
+    x = self.sub('gru', Linear, **kw)(x)
     reset, cand, update = jnp.split(x, 3, -1)
     reset = jax.nn.sigmoid(reset)
     cand = jnp.tanh(reset * cand)
@@ -455,7 +455,7 @@ class EarlyRSSM(nj.Module):
     return deter
 
   def _stats(self, name, x):
-    x = self.get(name, Linear, self._stoch * self._classes)(x)
+    x = self.sub(name, Linear, self._stoch * self._classes)(x)
     logit = x.reshape(x.shape[:-1] + (self._stoch, self._classes))
     if self._unimix:
       probs = jax.nn.softmax(logit, -1)
@@ -612,17 +612,17 @@ class ImageEncoderResnet(nj.Module):
     for i in range(stages):
       kw = {**self._kw, 'preact': False}
       if self._resize == 'stride':
-        x = self.get(f's{i}res', Conv2D, depth, 4, 2, **kw)(x)
+        x = self.sub(f's{i}res', Conv2D, depth, 4, 2, **kw)(x)
       elif self._resize == 'stride3':
         s = 2 if i else 3
         k = 5 if i else 4
-        x = self.get(f's{i}res', Conv2D, depth, k, s, **kw)(x)
+        x = self.sub(f's{i}res', Conv2D, depth, k, s, **kw)(x)
       elif self._resize == 'mean':
         N, H, W, D = x.shape
-        x = self.get(f's{i}res', Conv2D, depth, 3, 1, **kw)(x)
+        x = self.sub(f's{i}res', Conv2D, depth, 3, 1, **kw)(x)
         x = x.reshape((N, H // 2, W // 2, 4, D)).mean(-2)
       elif self._resize == 'max':
-        x = self.get(f's{i}res', Conv2D, depth, 3, 1, **kw)(x)
+        x = self.sub(f's{i}res', Conv2D, depth, 3, 1, **kw)(x)
         x = jax.lax.reduce_window(
             x, -jnp.inf, jax.lax.max, (1, 3, 3, 1), (1, 2, 2, 1), 'same')
       else:
@@ -630,8 +630,8 @@ class ImageEncoderResnet(nj.Module):
       for j in range(self._blocks):
         skip = x
         kw = {**self._kw, 'preact': True}
-        x = self.get(f's{i}b{j}conv1', Conv2D, depth, 3, **kw)(x)
-        x = self.get(f's{i}b{j}conv2', Conv2D, depth, 3, **kw)(x)
+        x = self.sub(f's{i}b{j}conv1', Conv2D, depth, 3, **kw)(x)
+        x = self.sub(f's{i}b{j}conv2', Conv2D, depth, 3, **kw)(x)
         x += skip
         # print(x.shape)
       depth *= 2
@@ -657,14 +657,14 @@ class ImageDecoderResnet(nj.Module):
     stages = int(np.log2(self._shape[-2]) - np.log2(self._minres))
     depth = self._depth * 2 ** (stages - 1)
     x = jaxutils.cast_to_compute(x)
-    x = self.get('in', Linear, (self._minres, self._minres, depth))(x)
+    x = self.sub('in', Linear, (self._minres, self._minres, depth))(x)
 
     for i in range(stages):
       for j in range(self._blocks):
         skip = x
         kw = {**self._kw, 'preact': True}
-        x = self.get(f's{i}b{j}conv1', Conv2D, depth, 3, **kw)(x)
-        x = self.get(f's{i}b{j}conv2', Conv2D, depth, 3, **kw)(x)
+        x = self.sub(f's{i}b{j}conv1', Conv2D, depth, 3, **kw)(x)
+        x = self.sub(f's{i}b{j}conv2', Conv2D, depth, 3, **kw)(x)
         x += skip
         # print(x.shape)
       depth //= 2
@@ -673,14 +673,14 @@ class ImageDecoderResnet(nj.Module):
         kw = {}
         depth = self._shape[-1]
       if self._resize == 'stride':
-        x = self.get(f's{i}res', Conv2D, depth, 4, 2, transp=True, **kw)(x)
+        x = self.sub(f's{i}res', Conv2D, depth, 4, 2, transp=True, **kw)(x)
       elif self._resize == 'stride3':
         s = 3 if i == stages - 1 else 2
         k = 5 if i == stages - 1 else 4
-        x = self.get(f's{i}res', Conv2D, depth, k, s, transp=True, **kw)(x)
+        x = self.sub(f's{i}res', Conv2D, depth, k, s, transp=True, **kw)(x)
       elif self._resize == 'resize':
         x = jnp.repeat(jnp.repeat(x, 2, 1), 2, 2)
-        x = self.get(f's{i}res', Conv2D, depth, 3, 1, **kw)(x)
+        x = self.sub(f's{i}res', Conv2D, depth, 3, 1, **kw)(x)
       else:
         raise NotImplementedError(self._resize)
     if max(x.shape[1:-1]) > max(self._shape[:-1]):
@@ -714,21 +714,21 @@ class ImageDecoderStyle(nj.Module):
 
     style = x
     for i in range(4):
-      style = self.get(f'style{i}', Linear, 1024, **self._kw)(style)
+      style = self.sub(f'style{i}', Linear, 1024, **self._kw)(style)
 
     depth = self._depth * 2 ** (stages - 1)
     x = jaxutils.cast_to_compute(x)
-    x = self.get('in', Linear, (self._minres, self._minres, depth))(x)
+    x = self.sub('in', Linear, (self._minres, self._minres, depth))(x)
     for i in range(stages):
       for j in range(self._blocks):
         skip = x
         kw = {**self._kw, 'preact': True}
-        s1 = self.get(f's{i}b{j}s1', Linear, 2 * depth)(style)
-        s2 = self.get(f's{i}b{j}s2', Linear, 2 * depth)(style)
+        s1 = self.sub(f's{i}b{j}s1', Linear, 2 * depth)(style)
+        s2 = self.sub(f's{i}b{j}s2', Linear, 2 * depth)(style)
         s1 = jnp.split(s1[..., None, None, :], 2, -1)
         s2 = jnp.split(s2[..., None, None, :], 2, -1)
-        x = self.get(f's{i}b{j}c1', Conv2D, depth, 3, **kw)(x, s1)
-        x = self.get(f's{i}b{j}c2', Conv2D, depth, 3, **kw)(x, s2)
+        x = self.sub(f's{i}b{j}c1', Conv2D, depth, 3, **kw)(x, s1)
+        x = self.sub(f's{i}b{j}c2', Conv2D, depth, 3, **kw)(x, s2)
         x += skip
         # print(x.shape)
       depth //= 2
@@ -739,16 +739,16 @@ class ImageDecoderStyle(nj.Module):
       if self._resize == 'stride':
         s = None
         if self._blocks == 0:
-          s = self.get(f's{i}s', Linear, 2 * depth)(style)
+          s = self.sub(f's{i}s', Linear, 2 * depth)(style)
           s = jnp.split(s[..., None, None, :], 2, -1)
-        x = self.get(f's{i}res', Conv2D, depth, 4, 2, transp=True, **kw)(x, s)
+        x = self.sub(f's{i}res', Conv2D, depth, 4, 2, transp=True, **kw)(x, s)
       elif self._resize == 'stride3':
         s = 3 if i == stages - 1 else 2
         k = 5 if i == stages - 1 else 4
-        x = self.get(f's{i}res', Conv2D, depth, k, s, transp=True, **kw)(x)
+        x = self.sub(f's{i}res', Conv2D, depth, k, s, transp=True, **kw)(x)
       elif self._resize == 'resize':
         x = jnp.repeat(jnp.repeat(x, 2, 1), 2, 2)
-        x = self.get(f's{i}res', Conv2D, depth, 3, 1, **kw)(x)
+        x = self.sub(f's{i}res', Conv2D, depth, 3, 1, **kw)(x)
       else:
         raise NotImplementedError(self._resize)
     if max(x.shape[1:-1]) > max(self._shape[:-1]):
@@ -790,7 +790,7 @@ class MLP(nj.Module):
     x = jaxutils.cast_to_compute(feat)
     x = x.reshape([-1, x.shape[-1]])
     for i in range(self._layers):
-      x = self.get(f'h{i}', Linear, self._units, **self._dense)(x)
+      x = self.sub(f'h{i}', Linear, self._units, **self._dense)(x)
     x = x.reshape(feat.shape[:-1] + (x.shape[-1],))
     if self._shape is None:
       return x
@@ -802,7 +802,7 @@ class MLP(nj.Module):
       raise ValueError(self._shape)
 
   def _out(self, name, shape, x):
-    return self.get(f'dist_{name}', Dist, shape, **self._dist)(x)
+    return self.sub(f'dist_{name}', Dist, shape, **self._dist)(x)
 
 
 class Dist(nj.Module):
@@ -833,10 +833,10 @@ class Dist(nj.Module):
     shape = self._shape
     if self._dist.endswith('_twohot'):
       shape = (*self._shape, self._bins)
-    out = self.get('out', Linear, int(np.prod(shape)), **kw)(inputs)
+    out = self.sub('out', Linear, int(np.prod(shape)), **kw)(inputs)
     out = out.reshape(inputs.shape[:-1] + shape).astype(f32)
     if self._dist in ('normal', 'trunc_normal'):
-      std = self.get('std', Linear, int(np.prod(self._shape)), **kw)(inputs)
+      std = self.sub('std', Linear, int(np.prod(self._shape)), **kw)(inputs)
       std = std.reshape(inputs.shape[:-1] + self._shape).astype(f32)
     if self._dist == 'symlog_mse':
       return jaxutils.SymlogDist(out, len(self._shape), 'mse', 'sum')
@@ -937,17 +937,17 @@ class Block(nj.Module):
     embed = self.size // self.groups
     x = x.reshape((*x.shape[:-1], self.groups, x.shape[-1] // self.groups))
     if x.shape[-1] != embed:
-      x = self.get('proj', Linear, embed, **self.kw)(x)
+      x = self.sub('proj', Linear, embed, **self.kw)(x)
     skip = x
-    x = self.get('norm1', Norm, 'layer')(x)
+    x = self.sub('norm1', Norm, 'layer')(x)
     dim = embed // self.heads
-    x = self.get('attn1', Attention, self.heads, dim, **self.kw)(x, x, x)
+    x = self.sub('attn1', Attention, self.heads, dim, **self.kw)(x, x, x)
     x += skip
     skip = x
-    x = self.get('norm2', Norm, 'layer')(x)
-    x = self.get('linear1', Linear, embed, **self.kw)(x)
+    x = self.sub('norm2', Norm, 'layer')(x)
+    x = self.sub('linear1', Linear, embed, **self.kw)(x)
     x = self.act(x)
-    x = self.get('linear2', Linear, embed, **self.kw)(x)
+    x = self.sub('linear2', Linear, embed, **self.kw)(x)
     x += skip
     x = x.reshape((*x.shape[:-2], self.size))
     return x
@@ -962,9 +962,9 @@ class Attention(nj.Module):
 
   def __call__(self, query, key, value, mask=None):
     shape = (self.heads, self.size)
-    query = self.get('query', Linear, shape, **self.kw)(query)
-    key = self.get('key', Linear, shape, **self.kw)(key)
-    value = self.get('value', Linear, shape, **self.kw)(value)
+    query = self.sub('query', Linear, shape, **self.kw)(query)
+    key = self.sub('key', Linear, shape, **self.kw)(key)
+    value = self.sub('value', Linear, shape, **self.kw)(value)
     logits = jnp.einsum('...thd,...Thd->...htT', query, key)
     logits /= np.sqrt(self.size).astype(key.dtype)
     if mask is not None:
@@ -973,7 +973,7 @@ class Attention(nj.Module):
     weights = jax.nn.softmax(logits)
     x = jnp.einsum('...htT,...Thd->...thd', weights, value)
     x = x.reshape((*x.shape[:-2], -1))
-    x = self.get('out', Linear, self.heads * self.size)(x)
+    x = self.sub('out', Linear, self.heads * self.size)(x)
     return x
 
 
@@ -1008,7 +1008,7 @@ class Conv2D(nj.Module):
   def _layer(self, x):
     if self._transp:
       shape = (self._kernel, self._kernel, self._depth, x.shape[-1])
-      kernel = self.get('kernel', Initializer(
+      kernel = self.value('kernel', Initializer(
           self._winit, fan=self._fan), shape)
       kernel = jaxutils.cast_to_compute(kernel)
       x = jax.lax.conv_transpose(
@@ -1016,14 +1016,14 @@ class Conv2D(nj.Module):
           dimension_numbers=('NHWC', 'HWOI', 'NHWC'))
     else:
       shape = (self._kernel, self._kernel, x.shape[-1], self._depth)
-      kernel = self.get('kernel', Initializer(
+      kernel = self.value('kernel', Initializer(
           self._winit, fan=self._fan), shape)
       kernel = jaxutils.cast_to_compute(kernel)
       x = jax.lax.conv_general_dilated(
           x, kernel, (self._stride, self._stride), self._pad,
           dimension_numbers=('NHWC', 'HWIO', 'NHWC'))
     if self._bias:
-      bias = self.get('bias', jnp.zeros, self._depth, np.float32)
+      bias = self.value('bias', jnp.zeros, self._depth, np.float32)
       bias = jaxutils.cast_to_compute(bias)
       x += bias
     return x
@@ -1045,17 +1045,17 @@ class Linear(nj.Module):
 
   def __call__(self, x):
     shape = (x.shape[-1], np.prod(self._units))
-    kernel = self.get('kernel', Initializer(
+    kernel = self.value('kernel', Initializer(
         self._winit, self._outscale, fan=self._fan), shape)
     kernel = jaxutils.cast_to_compute(kernel)
     x = x @ kernel
     if self._bias:
-      bias = self.get('bias', jnp.zeros, np.prod(self._units), np.float32)
+      bias = self.value('bias', jnp.zeros, np.prod(self._units), np.float32)
       bias = jaxutils.cast_to_compute(bias)
       x += bias
     if len(self._units) > 1:
       x = x.reshape(x.shape[:-1] + self._units)
-    x = self.get('norm', Norm, self._norm)(x)
+    x = self.sub('norm', Norm, self._norm)(x)
     x = self._act(x)
     return x
 
@@ -1073,8 +1073,8 @@ class Norm(nj.Module):
       x = x.astype(f32)
       x = jax.nn.standardize(x, axis=-1, epsilon=1e-3)
       if style is None:
-        x *= self.get('scale', jnp.ones, x.shape[-1], f32)
-        x += self.get('bias', jnp.zeros, x.shape[-1], f32)
+        x *= self.value('scale', jnp.ones, x.shape[-1], f32)
+        x += self.value('bias', jnp.zeros, x.shape[-1], f32)
       else:
         x *= style[0]
         x += style[1]

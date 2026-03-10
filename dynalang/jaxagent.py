@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from . import jaxutils
-from . import ninjax as nj
+from . import ninjax_compat as nj
 
 tree_map = jax.tree_util.tree_map
 tree_flatten = jax.tree_util.tree_flatten
@@ -122,11 +122,11 @@ class JAXAgent(embodied.Agent):
       self.mets_promise = self.mets_worker.submit(
           self._convert_mets, mets, self.train_devices)
 
-    if self.once:
-      self.once = False
-      assert jaxutils.Optimizer.PARAM_COUNTS
-      for name, count in jaxutils.Optimizer.PARAM_COUNTS.items():
-        return_mets[f'params_{name}'] = float(count)
+    # if self.once:
+    #   self.once = False
+    #   assert jaxutils.Optimizer.PARAM_COUNTS
+    #   for name, count in jaxutils.Optimizer.PARAM_COUNTS.items():
+    #     return_mets[f'params_{name}'] = float(count)
 
     if self.config.profiler:
       outdir, copyto = self.logdir, None

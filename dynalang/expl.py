@@ -5,7 +5,7 @@ sg = lambda x: tree_map(jax.lax.stop_gradient, x)
 
 from . import nets
 from . import jaxutils
-from . import ninjax as nj
+from . import ninjax_compat as nj
 
 
 class Disag(nj.Module):

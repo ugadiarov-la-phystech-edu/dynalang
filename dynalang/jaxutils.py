@@ -7,7 +7,7 @@ import optax
 import optree
 from tensorflow_probability.substrates import jax as tfp
 
-from . import ninjax as nj
+from . import ninjax_compat as nj
 
 tfd = tfp.distributions
 tree_map = jax.tree_util.tree_map
@@ -395,10 +395,8 @@ class Moments(nj.Module):
 
 class Optimizer(nj.Module):
 
-  PARAM_COUNTS = {}
 
   def __init__(self, modules, opt, summary_depth=2):
-    self.PARAM_COUNTS[self.path] = None
     modules = modules if isinstance(modules, (list, tuple)) else (modules,)
     self.modules = modules
     self.opt = opt
@@ -424,10 +422,6 @@ class Optimizer(nj.Module):
 
     loss, params, grads, aux = nj.grad(
         lossfn2, self.modules, has_aux=True)(*args, **kwargs)
-    if not self.PARAM_COUNTS[self.path]:
-      count = sum([np.prod(x.shape) for x in tree_leaves(params)])
-      print(f'Optimizer {self.name} has {count:,} variables.')
-      self.PARAM_COUNTS[self.path] = count
     if self.scaling:
       loss *= 1 / self.grad_scale.read()
 
@@ -582,16 +576,24 @@ class SlowUpdater:
     self.period = period
     self.updates = nj.Variable(jnp.zeros, (), jnp.int32, name='updates')
 
+  def _getm(self, module):
+    prefix = module.path + '/'
+    ctx = nj.context()
+    return {k: v for k, v in ctx.items() if k.startswith(prefix)}
+
+  def _putm(self, module, mapping):
+    nj.context().update(mapping)
+
   def __call__(self):
-    assert self.src.getm()
+    assert self._getm(self.src)
     updates = self.updates.read()
     need_init = (updates == 0).astype(jnp.float32)
     need_update = (updates % self.period == 0).astype(jnp.float32)
     mix = jnp.clip(1.0 * need_init + self.fraction * need_update, 0, 1)
     source = {
         k.replace(f'/{self.src.name}/', f'/{self.dst.name}/'): v
-        for k, v in self.src.getm().items()}
-    self.dst.putm(tree_map(
+        for k, v in self._getm(self.src).items()}
+    self._putm(self.dst, tree_map(
         lambda s, d: mix * s + (1 - mix) * d,
-        source, self.dst.getm()))
+        source, self._getm(self.dst)))
     self.updates.write(updates + 1)

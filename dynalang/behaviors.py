@@ -4,7 +4,7 @@ tfd = tfp.distributions
 
 from . import agent
 from . import expl
-from . import ninjax as nj
+from . import ninjax_compat as nj
 from . import jaxutils
 
 

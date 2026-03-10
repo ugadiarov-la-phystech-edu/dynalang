@@ -20,7 +20,7 @@ from . import behaviors
 from . import jaxagent
 from . import jaxutils
 from . import nets
-from . import ninjax as nj
+from . import ninjax_compat as nj
 
 import optax
 
