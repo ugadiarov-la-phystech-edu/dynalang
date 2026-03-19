@@ -295,6 +295,8 @@ class CometOutput:
         bystep[step][name].append(float(value))
       elif len(value.shape) == 1:
         experiment.log_histogram_3d(value, name=name, step=step)
+      elif value.shape[-1]==17:
+        continue
       elif len(value.shape) in (2, 3):
         value = value[..., None] if len(value.shape) == 2 else value
         assert value.shape[3] in [1, 3, 4], value.shape

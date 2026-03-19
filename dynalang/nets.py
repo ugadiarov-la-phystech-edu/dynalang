@@ -1,6 +1,8 @@
 import functools
+import math
 import re
 
+import einops
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -469,9 +471,10 @@ class MultiEncoder(nj.Module):
 
   def __init__(
       self, shapes, cnn_keys=r'.*', mlp_keys=r'.*', mlp_layers=4,
-      mlp_units=512, cnn='resize', cnn_depth=48,
-      cnn_blocks=2, resize='stride',
-      symlog_inputs=False, minres=4, **kw):
+      mlp_units=512, cnn='resnet', cnn_depth=48,
+      cnn_blocks=2, resize='stride', minres=4,
+      cnn_mults=(2, 3, 4, 4), cnn_kernel=5, cnn_outer=False, cnn_strided=False,
+      symlog_inputs=False, **kw):
     excluded = ('is_first', 'is_last')
     shapes = {k: v for k, v in shapes.items() if (
         k not in excluded and not k.startswith('log_'))}
@@ -485,10 +488,14 @@ class MultiEncoder(nj.Module):
     self.shapes = {**self.cnn_shapes, **self.mlp_shapes}
     print('Encoder CNN shapes:', self.cnn_shapes)
     print('Encoder MLP shapes:', self.mlp_shapes)
-    cnn_kw = {**kw, 'minres': minres, 'name': 'cnn'}
     mlp_kw = {**kw, 'symlog_inputs': symlog_inputs, 'name': 'mlp'}
     if cnn == 'resnet':
+      cnn_kw = {**kw, 'minres': minres, 'name': 'cnn'}
       self._cnn = ImageEncoderResnet(cnn_depth, cnn_blocks, resize, **cnn_kw)
+    elif cnn == 'simple':
+      self._cnn = ImageEncoderSimple(
+          cnn_depth, cnn_mults, cnn_kernel, cnn_outer, cnn_strided,
+          **kw, name='cnn')
     else:
       raise NotImplementedError(cnn)
     if self.mlp_shapes:
@@ -528,9 +535,11 @@ class MultiDecoder(nj.Module):
 
   def __init__(
       self, shapes, inputs=['tensor'], cnn_keys=r'.*', mlp_keys=r'.*',
-      mlp_layers=4, mlp_units=512, cnn='resize', cnn_depth=48, cnn_blocks=2,
+      mlp_layers=4, mlp_units=512, cnn='resnet', cnn_depth=48, cnn_blocks=2,
       image_dist='mse', vector_dist='mse', resize='stride', bins=255,
-      outscale=1.0, minres=4, cnn_sigmoid=False, **kw):
+      outscale=1.0, minres=4, cnn_sigmoid=False,
+      cnn_mults=(2, 3, 4, 4), cnn_kernel=5, cnn_outer=False, cnn_strided=False,
+      cnn_bspace=8, **kw):
     excluded = ('is_first', 'is_last', 'is_terminal', 'reward')
     shapes = {k: v for k, v in shapes.items() if k not in excluded}
     self.cnn_shapes = {
@@ -554,6 +563,11 @@ class MultiDecoder(nj.Module):
       elif cnn == 'style':
         self._cnn = ImageDecoderStyle(
             shape, cnn_depth, cnn_blocks, resize, **cnn_kw, name='cnn')
+      elif cnn == 'simple':
+        self._cnn = ImageDecoderSimple(
+            shape, cnn_depth, mlp_units, cnn_mults, cnn_kernel,
+            cnn_outer, cnn_strided, cnn_bspace, cnn_sigmoid,
+            **kw, name='cnn')
       else:
         raise NotImplementedError(cnn)
     if self.mlp_shapes:
@@ -570,7 +584,18 @@ class MultiDecoder(nj.Module):
       if drop_loss_indices is not None:
         feat = feat[:, drop_loss_indices]
       flat = feat.reshape([-1, feat.shape[-1]])
-      output = self._cnn(flat)
+      if isinstance(self._cnn, ImageDecoderSimple):
+        deter = stoch = None
+        if isinstance(inputs, dict) and ('deter' in inputs) and ('stoch' in inputs):
+          deter = inputs['deter']
+          stoch = inputs['stoch']
+          if drop_loss_indices is not None:
+            deter = deter[:, drop_loss_indices]
+            stoch = stoch[:, drop_loss_indices]
+        assert deter is None or stoch is not None
+        output = self._cnn(flat, deter=deter, stoch=stoch)
+      else:
+        output = self._cnn(flat)
       output = output.reshape(feat.shape[:-1] + output.shape[1:])
       split_indices = np.cumsum([v[-1] for v in self.cnn_shapes.values()][:-1])
       means = jnp.split(output, split_indices, -1)
@@ -762,6 +787,137 @@ class ImageDecoderStyle(nj.Module):
       x = jax.nn.sigmoid(x)
     else:
       x = x + 0.5
+    return x
+
+
+class ImageEncoderSimple(nj.Module):
+
+  def __init__(self, depth=64, mults=(2, 3, 4, 4), kernel=5,
+               outer=False, strided=False, **kw):
+    self.depth = depth
+    self.mults = tuple(mults)
+    self.kernel = kernel
+    self.outer = outer
+    self.strided = strided
+    self.act = kw.pop('act', 'silu')
+    self.norm = kw.pop('norm', 'layer')
+    self._kw = kw
+
+  def __call__(self, x):
+    K = self.kernel
+    act = get_act(self.act)
+    x = cast(x) - 0.5
+    for i, mult in enumerate(self.mults):
+      depth = self.depth * mult
+      if self.outer and i == 0:
+        x = self.get(f'cnn{i}', Conv2D, depth, K)(x)
+      elif self.strided:
+        x = self.get(f'cnn{i}', Conv2D, depth, K, 2)(x)
+      else:
+        x = self.get(f'cnn{i}', Conv2D, depth, K)(x)
+        B, H, W, C = x.shape
+        x = x.reshape((B, H // 2, 2, W // 2, 2, C)).max((2, 4))
+      x = act(self.get(f'cnn{i}n', Norm, self.norm)(x))
+    x = x.reshape((x.shape[0], -1))
+    return x
+
+
+class ImageDecoderSimple(nj.Module):
+
+  def __init__(self, shape, depth=64, units=1024, mults=(2, 3, 4, 4), kernel=5,
+               outer=False, strided=False, bspace=8, sigmoid=False, **kw):
+    self.shape = shape   
+    self.depth = depth
+    self.units = units
+    self.mults = tuple(mults)
+    self.kernel = kernel
+    self.outer = outer
+    self.strided = strided
+    self.bspace = bspace
+    self.sigmoid = sigmoid
+    self.outscale = kw.pop('outscale', 1.0)
+    self.act = kw.pop('act', 'silu')
+    self.norm = kw.pop('norm', 'layer')
+    self.kw = kw
+
+  def __call__(self, x, deter=None, stoch=None):
+    K = self.kernel
+    act = get_act(self.act)
+    depths = [self.depth * m for m in self.mults]
+    factor = 2 ** (len(depths) - int(bool(self.outer)))
+    imgres = self.shape[:-1]
+    minres = (imgres[0] // factor, imgres[1] // factor)
+    imgdep = self.shape[-1]
+    shape = (*minres, depths[-1])
+    x = cast(x)
+
+    if self.bspace and deter is not None and stoch is not None:
+      x0, x1 = cast((deter, stoch))
+      x1 = x1.reshape((*x1.shape[:-2], -1))
+      x0 = x0.reshape((-1, x0.shape[-1]))
+      x1 = x1.reshape((-1, x1.shape[-1]))
+      u, g = math.prod(shape), self.bspace
+      x0 = self.get('sp0', BlockLinear, u, g)(x0)
+      x0 = einops.rearrange(
+          x0, '... (g h w c) -> ... h w (g c)',
+          h=minres[0], w=minres[1], g=g)
+      x1 = self.get('sp1', Linear, 2 * self.units)(x1)
+      x1 = act(self.get('sp1norm', Norm, self.norm)(x1))
+      x1 = self.get('sp2', Linear, shape)(x1)
+      x1 = x1.reshape((-1, minres[0], minres[1], depths[-1]))
+      x = act(self.get('spnorm', Norm, self.norm)(x0 + x1))
+    else:
+      x = self.get('space', Linear, shape)(x)
+      x = x.reshape((-1, *minres, depths[-1]))
+      x = act(self.get('spacen', Norm, self.norm)(x))
+
+    for i, depth in reversed(list(enumerate(depths[:-1]))):
+      if self.strided:
+        x = self.get(f'conv{i}', Conv2D, depth, K, 2, transp=True)(x)
+      else:
+        x = x.repeat(2, -2).repeat(2, -3)
+        x = self.get(f'conv{i}', Conv2D, depth, K)(x)
+      x = act(self.get(f'conv{i}n', Norm, self.norm)(x))
+
+    kw = dict(**self.kw, outscale=self.outscale)
+    if self.outer:
+      x = self.get('imgout', Conv2D, imgdep, K, **kw)(x)
+    elif self.strided:
+      x = self.get('imgout', Conv2D, imgdep, K, 2, transp=True, **kw)(x)
+    else:
+      x = x.repeat(2, -2).repeat(2, -3)
+      x = self.get('imgout', Conv2D, imgdep, K, **kw)(x)
+
+    if self.sigmoid:
+      x = jax.nn.sigmoid(x)
+    else:
+      x = x + 0.5
+    return x
+
+
+class BlockLinear(nj.Module):
+
+  def __init__(self, units, blocks, outscale=1.0, winit='normal', fan='avg'):
+    assert isinstance(units, int), units
+    assert blocks <= units and units % blocks == 0, (blocks, units)
+    self.units = units
+    self.blocks = blocks
+    self.outscale = outscale
+    self.winit = winit
+    self.fan = fan
+
+  def __call__(self, x):
+    x = cast(x)
+    assert x.shape[-1] % self.blocks == 0, (x.shape, self.blocks)
+    insize = x.shape[-1]
+    shape = (self.blocks, insize // self.blocks, self.units // self.blocks)
+    kernel = self.get('kernel', Initializer(self.winit, self.outscale, fan=self.fan), shape)
+    kernel = cast(kernel)
+    x = x.reshape((*x.shape[:-1], self.blocks, insize // self.blocks))
+    x = jnp.einsum('...ki,kio->...ko', x, kernel)
+    x = x.reshape((*x.shape[:-2], self.units))
+    bias = self.get('bias', jnp.zeros, self.units, np.float32)
+    x += cast(bias)
     return x
 
 
@@ -981,7 +1137,8 @@ class Conv2D(nj.Module):
 
   def __init__(
       self, depth, kernel, stride=1, transp=False, act='none', norm='none',
-      pad='same', bias=True, preact=False, winit='uniform', fan='avg'):
+      pad='same', bias=True, preact=False, outscale=1.0,
+      winit='uniform', fan='avg'):
     self._depth = depth
     self._kernel = kernel
     self._stride = stride
@@ -991,6 +1148,7 @@ class Conv2D(nj.Module):
     self._pad = pad.upper()
     self._bias = bias and (preact or norm == 'none')
     self._preact = preact
+    self._outscale = outscale
     self._winit = winit
     self._fan = fan
 
@@ -1009,7 +1167,7 @@ class Conv2D(nj.Module):
     if self._transp:
       shape = (self._kernel, self._kernel, self._depth, x.shape[-1])
       kernel = self.get('kernel', Initializer(
-          self._winit, fan=self._fan), shape)
+        self._winit, self._outscale, fan=self._fan), shape)
       kernel = jaxutils.cast_to_compute(kernel)
       x = jax.lax.conv_transpose(
           x, kernel, (self._stride, self._stride), self._pad,
@@ -1017,7 +1175,7 @@ class Conv2D(nj.Module):
     else:
       shape = (self._kernel, self._kernel, x.shape[-1], self._depth)
       kernel = self.get('kernel', Initializer(
-          self._winit, fan=self._fan), shape)
+        self._winit, self._outscale, fan=self._fan), shape)
       kernel = jaxutils.cast_to_compute(kernel)
       x = jax.lax.conv_general_dilated(
           x, kernel, (self._stride, self._stride), self._pad,
