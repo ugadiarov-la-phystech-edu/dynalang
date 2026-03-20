@@ -470,7 +470,7 @@ class EarlyRSSM(nj.Module):
 class MultiEncoder(nj.Module):
 
   def __init__(
-      self, shapes, cnn_keys=r'.*', mlp_keys=r'.*', mlp_layers=4,
+      self, shapes, cnn_keys=r'.*', mlp_keys=r'.*', layers=4,
       mlp_units=512, cnn='resnet', cnn_depth=48,
       cnn_blocks=2, resize='stride', minres=4,
       cnn_mults=(2, 3, 4, 4), cnn_kernel=5, cnn_outer=False, cnn_strided=False,
@@ -499,7 +499,7 @@ class MultiEncoder(nj.Module):
     else:
       raise NotImplementedError(cnn)
     if self.mlp_shapes:
-      self._mlp = MLP(None, mlp_layers, mlp_units, dist='none', **mlp_kw)
+      self._mlp = MLP(None, layers, mlp_units, dist='none', **mlp_kw)
     self.preprocessors = {}
 
   def __call__(self, data, zero_mlp=False, zero_cnn=False):
@@ -535,7 +535,7 @@ class MultiDecoder(nj.Module):
 
   def __init__(
       self, shapes, inputs=['tensor'], cnn_keys=r'.*', mlp_keys=r'.*',
-      mlp_layers=4, mlp_units=512, cnn='resnet', cnn_depth=48, cnn_blocks=2,
+      layers=4, mlp_units=512, cnn='resnet', cnn_depth=48, cnn_blocks=2,
       image_dist='mse', vector_dist='mse', resize='stride', bins=255,
       outscale=1.0, minres=4, cnn_sigmoid=False,
       cnn_mults=(2, 3, 4, 4), cnn_kernel=5, cnn_outer=False, cnn_strided=False,
@@ -572,7 +572,7 @@ class MultiDecoder(nj.Module):
         raise NotImplementedError(cnn)
     if self.mlp_shapes:
       self._mlp = MLP(
-          self.mlp_shapes, mlp_layers, mlp_units, **mlp_kw, name='mlp')
+          self.mlp_shapes, layers, mlp_units, **mlp_kw, name='mlp')
     self._inputs = Input(inputs, dims='deter')
     self._image_dist = image_dist
 
@@ -1230,6 +1230,16 @@ class Norm(nj.Module):
     elif self._impl == 'layer':
       x = x.astype(f32)
       x = jax.nn.standardize(x, axis=-1, epsilon=1e-3)
+      if style is None:
+        x *= self.get('scale', jnp.ones, x.shape[-1], f32)
+        x += self.get('bias', jnp.zeros, x.shape[-1], f32)
+      else:
+        x *= style[0]
+        x += style[1]
+      return x.astype(dtype)
+    elif self._impl == 'rms':
+      x = x.astype(f32)
+      x = x * jax.lax.rsqrt(jnp.mean(x ** 2, axis=-1, keepdims=True) + 1e-3)
       if style is None:
         x *= self.get('scale', jnp.ones, x.shape[-1], f32)
         x += self.get('bias', jnp.zeros, x.shape[-1], f32)

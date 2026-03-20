@@ -117,8 +117,8 @@ defaults:
   rssm: {impl: softmax, deter: 4096, units: 1024, stoch: 32, classes: 32, act: silu, norm: layer, unimix: 0.01, unroll: False, action_clip: 1.0, bottleneck: -1, winit: normal, fan: avg, maskgit: {embed: 256, layers: 4, heads: 4, ffwdim: 256, steps: 4}}
   early_rssm: {deter: 4096, units: 1024, stoch: 32, classes: 32, act: silu, norm: layer, unimix: 0.01, unroll: False, action_clip: 1.0, bottleneck: -1, winit: normal, fan: avg, prior_layers: 3}
   token_rssm: {deter: 4096, units: 1024, stoch: 32, classes: 32, vocab: 32100, act: silu, norm: layer, unimix: 0.01, unroll: False, action_clip: 1.0, bottleneck: -1, winit: normal, fan: avg, prior_layers: 3}
-  encoder: {mlp_keys: '.*', cnn_keys: '.*', act: silu, norm: layer, mlp_layers: 5, mlp_units: 1024, cnn: resnet, cnn_depth: 96, cnn_blocks: 0, resize: stride, winit: normal, fan: avg, cnn_mults: [2, 3], cnn_kernel: 5, cnn_outer: False, cnn_strided: False}
-  decoder: {mlp_keys: '.*', cnn_keys: '.*', act: silu, norm: layer, mlp_layers: 5, mlp_units: 1024, cnn: resnet, cnn_depth: 96, cnn_blocks: 0, image_dist: mse, vector_dist: symlog_mse, inputs: [deter, stoch], resize: stride, winit: normal, fan: avg, outscale: 1.0, minres: 4, cnn_sigmoid: False, cnn_mults: [2, 3], cnn_kernel: 5, cnn_outer: False, cnn_strided: False, cnn_bspace: 8}
+  encoder: {mlp_keys: '.*', cnn_keys: '.*', act: silu, norm: rms, layers: 3, mlp_units: 1024, cnn: simple, cnn_depth: 64, cnn_blocks: 0, resize: stride, winit: normal, fan: in, cnn_mults: [2, 3], cnn_kernel: 5, cnn_outer: False, cnn_strided: False}
+  decoder: {mlp_keys: '.*', cnn_keys: '.*', act: silu, norm: rms, layers: 3, mlp_units: 1024, cnn: simple, cnn_depth: 64, cnn_blocks: 0, image_dist: mse, vector_dist: symlog_mse, inputs: [deter, stoch], resize: stride, winit: normal, fan: in, outscale: 1.0, minres: 4, cnn_sigmoid: False, cnn_mults: [2, 3], cnn_kernel: 5, cnn_outer: False, cnn_strided: False, cnn_bspace: 8}
   reward_head: {layers: 5, units: 1024, act: silu, norm: layer, dist: symexp_twohot, outscale: 0.0, outnorm: False, inputs: [deter, stoch], winit: normal, fan: avg, bins: 255}
   cont_head: {layers: 5, units: 1024, act: silu, norm: layer, dist: binary, outscale: 1.0, outnorm: False, inputs: [deter, stoch], winit: normal, fan: avg}
   loss_scales: {image: 1.0, vector: 1.0, reward: 1.0, cont: 1.0, dyn: 0.5, rep: 0.1, actor: 1.0, critic: 1.0, slowreg: 1.0, token: 1.0, lm: 0.0}
@@ -323,6 +323,43 @@ xlarge:
   .*\.cnn_depth: 96
   .*\.units: 1024
   .*\.layers: 5
+
+simple_enc:
+  encoder.cnn: simple
+  encoder.norm: rms
+  encoder.winit: normal
+  encoder.fan: in
+  encoder.cnn_depth: 64
+  encoder.cnn_mults: [2, 3]
+  encoder.cnn_kernel: 5
+  encoder.cnn_outer: False
+  encoder.cnn_strided: False
+  decoder.cnn: simple
+  decoder.norm: rms
+  decoder.winit: normal
+  decoder.fan: in
+  decoder.cnn_depth: 64
+  decoder.cnn_mults: [2, 3]
+  decoder.cnn_kernel: 5
+  decoder.cnn_outer: False
+  decoder.cnn_strided: False
+  decoder.cnn_bspace: 8
+
+resnet_enc:
+  encoder.cnn: resnet
+  encoder.norm: layer
+  encoder.winit: normal
+  encoder.fan: avg
+  encoder.cnn_depth: 96
+  encoder.cnn_blocks: 0
+  encoder.resize: stride
+  decoder.cnn: resnet
+  decoder.norm: layer
+  decoder.winit: normal
+  decoder.fan: avg
+  decoder.cnn_depth: 96
+  decoder.cnn_blocks: 0
+  decoder.resize: stride
 
 multicpu:
 
