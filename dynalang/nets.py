@@ -810,14 +810,16 @@ class ImageEncoderSimple(nj.Module):
     for i, mult in enumerate(self.mults):
       depth = self.depth * mult
       if self.outer and i == 0:
-        x = self.get(f'cnn{i}', Conv2D, depth, K)(x)
+        x = self.get(f'cnn{i}', Conv2D, depth, K, **self._kw)(x)
       elif self.strided:
-        x = self.get(f'cnn{i}', Conv2D, depth, K, 2)(x)
+        x = self.get(f'cnn{i}', Conv2D, depth, K, 2, **self._kw)(x)
       else:
-        x = self.get(f'cnn{i}', Conv2D, depth, K)(x)
+        x = self.get(f'cnn{i}', Conv2D, depth, K, **self._kw)(x)
         B, H, W, C = x.shape
         x = x.reshape((B, H // 2, 2, W // 2, 2, C)).max((2, 4))
       x = act(self.get(f'cnn{i}n', Norm, self.norm)(x))
+    assert 3 <= x.shape[-3] <= 16, x.shape
+    assert 3 <= x.shape[-2] <= 16, x.shape
     x = x.reshape((x.shape[0], -1))
     return x
 
