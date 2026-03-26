@@ -24,6 +24,7 @@ defaults:
     transfer_guard: True
     assert_num_devices: -1
     policy_thread: False
+    mem_fraction: 0.8
 
   run:
     script: train
@@ -59,7 +60,7 @@ defaults:
     timer: True  # A bit slow but useful.
     batch_size: 16
 
-  envs: {amount: 4, parallel: process, length: 0, reset: True, restarts: False, discretize: 0}
+  envs: {amount: 4, parallel: process, length: 0, reset: True, restarts: False, discretize: 0, eval_amount: 4}
   wrapper: {length: 0, reset: True, discretize: 0, checks: False}
   env:
     atari: {size: [64, 64], repeat: 4, sticky: True, gray: True, actions: all, lives: unused, noops: 0, pooling: 2, aggregate: max, resize: pillow}

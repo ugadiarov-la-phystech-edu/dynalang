@@ -3,7 +3,6 @@ import os
 import pathlib
 import sys
 import warnings
-import wandb
 from functools import partial as bind
 
 # def warn_with_traceback(
@@ -194,11 +193,12 @@ def make_logger(parsed, logdir, step, config):
   logger = embodied.Logger(step, [
       embodied.logger.TerminalOutput(config.filter, 'Agent'),
       embodied.logger.JSONLOutput(logdir, 'metrics.jsonl'),
-      embodied.logger.JSONLOutput(logdir, 'scores.jsonl', 'episode/score'),
-      embodied.logger.TensorBoardOutput(
-          logdir, config.run.log_video_fps, videos=config.tensorboard_videos),
+      embodied.logger.JSONLOutput(logdir, 'scores.jsonl',
+                                  '(episode/score|episode/.*length|real_step)', log_multivalue=True),
+      embodied.logger.CometOutput(config.logdir, config, config.run.log_video_fps)
   ], multiplier)
   if config.use_wandb:
+    import wandb
     wandb_id_file = f"{str(logdir)}/wandb_id.txt"
     wandb_pa = embodied.Path(wandb_id_file)
     if wandb_pa.exists():
@@ -243,10 +243,10 @@ def make_replay(config, directory=None, is_eval=False, rate_limit=False):
   return replay
 
 
-def wrapped_env(config, batch, **overrides):
+def wrapped_env(config, batch, is_eval=False, **overrides):
   if batch:
     envs = []
-    for index in range(config.envs.amount):
+    for index in range(config.envs.eval_amount if is_eval else config.envs.amount):
       ctor = bind(make_env, config, index, **overrides)
       if batch and config.envs.parallel != 'none':
         ctor = bind(embodied.Parallel, ctor, config.envs.parallel)
