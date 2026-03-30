@@ -14,7 +14,8 @@ defaults:
   replay_online: False
   dataset_excluded_keys: ["info", "language_info"]
   eval_dir: ''
-  filter: '.*'
+  loggers: ["terminal", "comet"]
+  logger: {terminal: {filter: '.*'}, comet: {filter: '.*'}}
   text_dataset: ''
 
   jax:

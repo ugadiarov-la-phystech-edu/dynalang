@@ -182,13 +182,18 @@ def main(argv=None):
 
 def make_logger(parsed, logdir, step, config):
   multiplier = config.env.get(config.task.split('_')[0], {}).get('repeat', 1)
-  logger = embodied.Logger(step, [
-      embodied.logger.TerminalOutput(config.filter),
+  outputs = [
       embodied.logger.JSONLOutput(logdir, 'metrics.jsonl'),
       embodied.logger.JSONLOutput(logdir, 'scores.jsonl',
                                   '(episode/score|episode/.*length|real_step)', log_multivalue=True),
-      embodied.logger.CometOutput(config.logdir, config, config.run.log_fps)
-  ], multiplier)
+  ]
+  if 'terminal' in config.loggers:
+    outputs.append(embodied.logger.TerminalOutput(config.logger.terminal.filter))
+
+  if 'comet' in config.loggers:
+    outputs.append(embodied.logger.CometOutput(config.logdir, config, config.run.log_fps, config.logger.comet.filter))
+
+  logger = embodied.Logger(step, outputs, multiplier)
   if config.use_wandb:
     import wandb
     wandb_id_file = f"{str(logdir)}/wandb_id.txt"
