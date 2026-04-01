@@ -59,23 +59,35 @@ class RSSM(nj.Module):
     return cast(state)
 
   def observe(self, embed, action, is_first, state=None):
-    state = state or self.initial(action.shape[0])
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
+    if isinstance(action, dict):
+      batch_size = list(action.values())[0].shape[0]
+      action = tree_map(swap, action)
+    else:
+      batch_size = action.shape[0]
+      action = swap(action)
+    state = state or self.initial(batch_size)
     step = lambda prev, inputs: self.obs_step(prev, *inputs)
-    inputs = swap(action), swap(embed), swap(is_first)
+    inputs = action, swap(embed), swap(is_first)
     post = jaxutils.scan(step, inputs, state, self._unroll)
     post = {k: swap(v) for k, v in post.items()}
     return post
 
   def imagine(self, action, state=None):
-    state = state or self.initial(action.shape[0])
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
-    action = swap(action)
+    if isinstance(action, dict):
+      batch_size = list(action.values())[0].shape[0]
+      action = tree_map(swap, action)
+    else:
+      batch_size = action.shape[0]
+      action = swap(action)
+    state = state or self.initial(batch_size)
     prior = jaxutils.scan(self.img_step, action, state, self._unroll)
     prior = {k: swap(v) for k, v in prior.items()}
     return prior
 
   def obs_step(self, prev_state, prev_action, embed, is_first):
+    prev_action = jaxutils.concat_dict(prev_action)
     deter = self._gru(prev_state, prev_action, is_first)
     x = jnp.concatenate([deter, embed], -1)
     x = self.get('obs_out', Linear, **self._kw)(x)
@@ -85,6 +97,7 @@ class RSSM(nj.Module):
     return cast(post)
 
   def img_step(self, prev_state, prev_action):
+    prev_action = jaxutils.concat_dict(prev_action)
     deter = self._gru(prev_state, prev_action)
     return self._prior(deter, sample=True)
 
@@ -229,23 +242,35 @@ class TokenRSSM(nj.Module):
     return cast(state)
 
   def observe(self, action, embed, token, is_first, state=None):
-    state = state or self.initial(action.shape[0])
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
+    if isinstance(action, dict):
+      batch_size = list(action.values())[0].shape[0]
+      action_sw = tree_map(swap, action)
+    else:
+      batch_size = action.shape[0]
+      action_sw = swap(action)
+    state = state or self.initial(batch_size)
     step = lambda prev, inputs: self.obs_step(prev, *inputs)
-    inputs = tree_map(swap, (action, embed, token, is_first))
+    inputs = (action_sw, swap(embed), swap(token), swap(is_first))
     post = jaxutils.scan(step, inputs, state, self._unroll)
     post = {k: swap(v) for k, v in post.items()}
     return post
 
   def imagine(self, action, state=None):
-    state = state or self.initial(action.shape[0])
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
-    action = swap(action)
+    if isinstance(action, dict):
+      batch_size = list(action.values())[0].shape[0]
+      action = tree_map(swap, action)
+    else:
+      batch_size = action.shape[0]
+      action = swap(action)
+    state = state or self.initial(batch_size)
     prior = jaxutils.scan(self.img_step, action, state, self._unroll)
     prior = {k: swap(v) for k, v in prior.items()}
     return prior
 
   def obs_step(self, prev_state, prev_action, embed, token, is_first):
+    prev_action = jaxutils.concat_dict(prev_action)
     prev_state, prev_action = tree_map(
         lambda prev, init: jaxutils.switch(is_first, init, prev),
         (prev_state, prev_action),
@@ -256,6 +281,7 @@ class TokenRSSM(nj.Module):
     return cast({**rep, 'deter': deter})
 
   def img_step(self, prev_state, prev_action):
+    prev_action = jaxutils.concat_dict(prev_action)
     pred = self._pred(prev_state['deter'], prev_action, sample=True)
     inp = self._inps(pred['z_stoch'], pred['l_stoch'], prev_action)
     deter = self._core(prev_state['deter'], inp)
@@ -272,6 +298,7 @@ class TokenRSSM(nj.Module):
     return jaxutils.OneHotDist(stats['l_logit'].astype(f32))
 
   def loss(self, post, prev_state, prev_action, token, free=1.0):
+    prev_action = jaxutils.concat_dict(prev_action)
     prev_deter = jnp.concatenate([
         prev_state['deter'][:, None], post['deter'][:, :-1]], 1)
     pred = self._pred(prev_deter, prev_action, sample=False)
@@ -768,7 +795,7 @@ class ImageDecoderStyle(nj.Module):
 class MLP(nj.Module):
 
   def __init__(
-      self, shape, layers, units, inputs=['tensor'], dims=None,
+      self, shape, layers, units, dist='mse', inputs=['tensor'], dims=None,
       symlog_inputs=False, **kw):
     assert shape is None or isinstance(shape, (int, tuple, dict)), shape
     if isinstance(shape, int):
@@ -778,10 +805,13 @@ class MLP(nj.Module):
     self._units = units
     self._inputs = Input(inputs, dims=dims)
     self._symlog_inputs = symlog_inputs
-    distkeys = (
-        'dist', 'outscale', 'minstd', 'maxstd', 'outnorm', 'unimix', 'bins')
+    if isinstance(shape, dict) and isinstance(dist, str):
+      dist = {k: dist for k in shape}
+    assert isinstance(dist, (str, dict)), dist
+    self._dist = dist
+    distkeys = ('outscale', 'minstd', 'maxstd', 'outnorm', 'unimix', 'bins')
     self._dense = {k: v for k, v in kw.items() if k not in distkeys}
-    self._dist = {k: v for k, v in kw.items() if k in distkeys}
+    self._distkw = {k: v for k, v in kw.items() if k in distkeys}
 
   def __call__(self, inputs):
     feat = self._inputs(inputs)
@@ -794,15 +824,16 @@ class MLP(nj.Module):
     x = x.reshape(feat.shape[:-1] + (x.shape[-1],))
     if self._shape is None:
       return x
-    elif isinstance(self._shape, tuple):
-      return self._out('out', self._shape, x)
     elif isinstance(self._shape, dict):
-      return {k: self._out(k, v, x) for k, v in self._shape.items()}
+      return {k: self._out(k, v, self._dist[k], x)
+              for k, v in self._shape.items()}
+    elif isinstance(self._shape, tuple):
+      return self._out('out', self._shape, self._dist, x)
     else:
       raise ValueError(self._shape)
 
-  def _out(self, name, shape, x):
-    return self.get(f'dist_{name}', Dist, shape, **self._dist)(x)
+  def _out(self, name, shape, dist, x):
+    return self.get(f'dist_{name}', Dist, shape, dist=dist, **self._distkw)(x)
 
 
 class Dist(nj.Module):

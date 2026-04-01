@@ -307,11 +307,11 @@ def wrap_env(env, config):
   for name, space in env.act_space.items():
     if name == 'reset':
       continue
-    elif space.discrete:
-      env = wrappers.OneHotAction(env, name)
+    if  space.discrete:
+      continue #we do one-hot in preprocess function in nets.py
     elif args.discretize:
       env = wrappers.DiscretizeAction(env, name, args.discretize)
-    else:
+    elif not space.discrete:
       env = wrappers.NormalizeAction(env, name)
   env = wrappers.ExpandScalars(env)
   if args.length:

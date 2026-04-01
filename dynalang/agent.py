@@ -32,14 +32,15 @@ class Agent(nj.Module):
   def __init__(self, obs_space, act_space, step, config):
     self.config = config
     self.obs_space = obs_space
-    self.act_space = act_space['action']
+    self.act_space = {
+        k: v for k, v in act_space.items() if k != 'reset'}
     self.step = step
     with jax.transfer_guard("allow"):
       dummy_preproc = self.preprocess(
         {k: jnp.ones(v.shape) for k, v in self.obs_space.items()}) 
       preproc_shapes = {k: tuple(v.shape) for k, v in dummy_preproc.items() \
                         if not k.startswith("log_")}
-    self.wm = WorldModel(obs_space, act_space, config, preproc_shapes, name='wm')
+    self.wm = WorldModel(obs_space, self.act_space, config, preproc_shapes, name='wm')
     self.preprocessors = {k: v() for k, v in
                           self.wm.encoder.preprocessors.items()}
     if self.config.run.pretrain_wm_only:
@@ -76,8 +77,12 @@ class Agent(nj.Module):
     task_outs, task_state = self.task_behavior.policy(latent, task_state)
     expl_outs, expl_state = self.expl_behavior.policy(latent, expl_state)
     outs = {'eval': task_outs, 'explore': expl_outs, 'train': task_outs}[mode]
-    state = ((latent, outs['action']), task_state, expl_state)
-    return outs, state
+    act = {k: v for k, v in outs.items() if k in self.act_space}
+    state = ((latent, act), task_state, expl_state)
+    act = {
+        k: jnp.argmax(act[k], -1).astype(jnp.int32) if s.discrete else act[k]
+        for k, s in self.act_space.items()}
+    return act, state
 
   def train(self, data, state):
     self.config.jax.jit and print('Tracing train function.')
@@ -134,11 +139,15 @@ class Agent(nj.Module):
     self.state = jax.tree_util.tree_flatten(self.state)[1].unflatten(state)
 
   def preprocess(self, obs):
+    spaces = {**self.obs_space, **self.act_space}
     obs = obs.copy()
     for key, value in obs.items():
-      if key.startswith('log_') or key in ('key',):
+      if key.startswith('log_') or key in ('key', 'reset'):
         continue
-      if key == "token":
+      space = spaces.get(key)
+      if key in self.act_space and space.discrete:
+        value = jax.nn.one_hot(value, int(space.high))
+      elif key == "token":
         value = jax.nn.one_hot(value, self.obs_space[key].high)
       elif len(value.shape) > 3 and value.dtype == jnp.uint8:
         value = jaxutils.cast_to_compute(value) / 255.0
@@ -153,7 +162,7 @@ class WorldModel(nj.Module):
 
   def __init__(self, obs_space, act_space, config, shapes):
     self.obs_space = obs_space
-    self.act_space = act_space['action']
+    self.act_space = act_space
     self.config = config
 #    shapes = {k: tuple(v.shape) for k, v in obs_space.items()}
 #    shapes = {k: v for k, v in shapes.items() if not k.startswith('log_')}
@@ -179,7 +188,10 @@ class WorldModel(nj.Module):
 
   def initial(self, batch_size):
     prev_latent = self.rssm.initial(batch_size)
-    prev_action = jnp.zeros((batch_size, *self.act_space.shape))
+    prev_action = {
+        k: jnp.zeros(
+            (batch_size, *v.shape, int(v.high)) if v.discrete else (batch_size, *v.shape))
+        for k, v in self.act_space.items()}
     return prev_latent, prev_action
 
   def train(self, data, state):
@@ -211,8 +223,9 @@ class WorldModel(nj.Module):
       zero_mlp=self.config.zero_mlp,
       zero_cnn=self.config.zero_cnn)
     prev_latent, prev_action = state
-    prev_actions = jnp.concatenate([
-        prev_action[:, None], data['action'][:, :-1]], 1)
+    prev_actions = {
+        k: jnp.concatenate([prev_action[k][:, None], data[k][:, :-1]], 1)
+        for k in self.act_space}
     if self.config.rssm_type == "token":
       post = self.rssm.observe(
           prev_actions, embed, data["token"], data['is_first'], prev_latent)
@@ -243,7 +256,8 @@ class WorldModel(nj.Module):
     # LM loss
     if self.scales["lm"] > 0:
       print("Adding LM loss")
-      next_ac = data["action"][:, :-1].reshape((-1, 1, *data["action"].shape[2:]))
+      next_ac = {k: data[k][:, :-1].reshape((-1, 1, *data[k].shape[2:]))
+                 for k in self.act_space}
       context = {k: v[:, :-1].reshape((-1, *v.shape[2:]))
                  for k, v in post.items()}
       one_step_openl = self.heads["decoder"](
@@ -266,7 +280,7 @@ class WorldModel(nj.Module):
     out = {'embed':  embed, 'post': post, 'prior': prior}
     out.update({f'{k}_loss': v for k, v in losses.items()})
     last_latent = {k: v[:, -1] for k, v in post.items()}
-    last_action = data['action'][:, -1]
+    last_action = {k: data[k][:, -1] for k in self.act_space}
     state = last_latent, last_action
     metrics = self._metrics(data, dists, post, prior, losses, model_loss)
     return model_loss.mean() + lm_loss, (state, out, metrics)
@@ -282,7 +296,7 @@ class WorldModel(nj.Module):
     assert len(set(keys)) == len(keys), ('Colliding keys', keys)
     def step(prev, _):
       state, action, carry = prev
-      state = self.rssm.img_step(state, action['action'])
+      state = self.rssm.img_step(state, action)
       action, carry = policy(state, carry)
       return state, action, carry
     states, actions, carries = jaxutils.scan(
@@ -309,15 +323,17 @@ class WorldModel(nj.Module):
     state = self.initial(len(data['is_first']))
     report = {}
     report.update(self.loss(data, state)[-1][-1])
+    act_keys = list(self.act_space.keys())
     if self.config.rssm_type == "token":
       context = self.rssm.observe(
-          data['action'][:6, :5],
+          {k: data[k][:6, :5] for k in act_keys},
           self.encoder(data)[:6, :5],
           data['token'][:6, :5],
           data['is_first'][:6, :5])
     else:
       context = self.rssm.observe(
-          self.encoder(data)[:6, :5], data['action'][:6, :5],
+          self.encoder(data)[:6, :5],
+          {k: data[k][:6, :5] for k in act_keys},
           data['is_first'][:6, :5])
     # context:
     # - deter (batch, prefix_len, rssm.deter)
@@ -325,7 +341,7 @@ class WorldModel(nj.Module):
     start = {k: v[:, -1] for k, v in context.items()}
     recon = self.heads['decoder'](context)
     openl = self.heads['decoder'](
-        self.rssm.imagine(data['action'][:6, 5:], start),
+        self.rssm.imagine({k: data[k][:6, 5:] for k in act_keys}, start),
     )
     for key in self.heads['decoder'].cnn_shapes.keys():
       truth = data[key][:6].astype(jnp.float32)
@@ -339,14 +355,17 @@ class WorldModel(nj.Module):
     # data["action"] is action we took out of this state
     # prev_actions is action we took into this state
     if self.config.run.pretrain_wm_only and "token" in data: 
-      prev_actions = jnp.concatenate([
-        jnp.zeros_like(data["action"][:, 0:1]), # dummy first action
-        data["action"][:, :-1]], 1)
+      prev_actions = {
+          k: jnp.concatenate([
+              jnp.zeros_like(data[k][:, 0:1]),
+              data[k][:, :-1]], 1)
+          for k in act_keys}
       context = self.rssm.observe(
         self.encoder(data), prev_actions, data["is_first"])
       # a_t is action out of o_t, cut off last timestep since we don't have truth
       context = {k: v[:, :-1].reshape((-1, *v.shape[2:])) for k, v in context.items()}
-      next_ac = data["action"][:, :-1].reshape((-1, 1, *data["action"].shape[2:]))
+      next_ac = {k: data[k][:, :-1].reshape((-1, 1, *data[k].shape[2:]))
+                 for k in act_keys}
       one_step_openl = self.heads["decoder"](
         self.rssm.imagine(next_ac, context),
       )
@@ -363,24 +382,27 @@ class WorldModel(nj.Module):
     return report
 
   def vis(self, data, num_obs, num_imagine):
-    assert data["action"].shape[0] == 1
+    act_keys = list(self.act_space.keys())
     state = self.initial(len(data["is_first"]))
-    prev_actions = jnp.concatenate([
-      jnp.zeros_like(data["action"][:, 0:1]), # dummy first action
-      data["action"][:, :-1]], 1)
+    prev_actions = {
+        k: jnp.concatenate([
+            jnp.zeros_like(data[k][:, 0:1]),
+            data[k][:, :-1]], 1)
+        for k in act_keys}
     context = self.rssm.observe(
       embed=self.encoder(data)[:, :num_obs],
-      action=prev_actions[:, :num_obs],#data["action"][:, :num_obs],
+      action={k: v[:, :num_obs] for k, v in prev_actions.items()},
       is_first=data["is_first"][:, :num_obs])
     start = {k: v[:, -1] for k, v in context.items()}
     recon = self.heads['decoder'](context)
     end = num_obs + num_imagine
     openl = self.heads['decoder'](
-      # note the last start state is index num_obs-1
-      self.rssm.imagine(data['action'][:, num_obs-1:end], start),
+      self.rssm.imagine(
+          {k: data[k][:, num_obs-1:end] for k in act_keys}, start),
     )
     reward = self.heads['reward'](
-      self.rssm.imagine(data['action'][:, num_obs-1:end], start),
+      self.rssm.imagine(
+          {k: data[k][:, num_obs-1:end] for k in act_keys}, start),
     )
     return recon, openl, reward
   
@@ -414,11 +436,20 @@ class ImagActorCritic(nj.Module):
     self.scales = scales
     self.act_space = act_space
     self.config = config
-    disc = act_space.discrete
-    self.grad = config.actor_grad_disc if disc else config.actor_grad_cont
+    if len(act_space) == 1 and list(act_space.values())[0].discrete:
+      self.grad = config.actor_grad_disc
+    elif len(act_space) == 1:
+      self.grad = config.actor_grad_cont
+    else:
+      self.grad = 'reinforce'
+    dist1, dist2 = config.actor_dist_disc, config.actor_dist_cont
+    shapes = {
+        k: (*s.shape, int(s.high)) if s.discrete else s.shape
+        for k, s in act_space.items()}
+    dists = {k: dist1 if v.discrete else dist2 for k, v in act_space.items()}
     self.actor = nets.MLP(
-        name='actor', dims='deter', shape=act_space.shape, **config.actor,
-        dist=config.actor_dist_disc if disc else config.actor_dist_cont)
+        name='actor', dims='deter', shape=shapes, **config.actor,
+        dist=dists)
     self.retnorms = {
         k: jaxutils.Moments(**config.retnorm, name=f'retnorm_{k}')
         for k in critics}
@@ -429,8 +460,11 @@ class ImagActorCritic(nj.Module):
 
   def policy(self, state, carry, sample=True):
     dist = self.actor(sg(state))
-    action = dist.sample(seed=nj.rng()) if sample else dist.mode()
-    return {'action': action}, carry
+    if sample:
+      action = {k: v.sample(seed=nj.rng()) for k, v in dist.items()}
+    else:
+      action = {k: v.mode() for k, v in dist.items()}
+    return action, carry
 
   def train(self, imagine, start, context):
     carry = self.initial(len(start['deter']))
@@ -461,10 +495,16 @@ class ImagActorCritic(nj.Module):
       metrics[f'{key}_return_rate'] = (jnp.abs(ret) >= 0.5).mean()
     adv = jnp.stack(advs).sum(0)
     policy = self.actor(sg(traj))
-    logpi = policy.log_prob(sg(traj['action']))[:-1]
-    loss = {'backprop': -adv, 'reinforce': -logpi * sg(adv)}[self.grad]
-    ent = policy.entropy()[:-1]
-    loss -= self.config.actent * ent
+    logpi = {k: v.log_prob(sg(traj[k]))[:-1] for k, v in policy.items()}
+    loss = {
+        'backprop': -adv, 'reinforce': -sum(logpi.values()) * sg(adv),
+    }[self.grad]
+    ent = {k: v.entropy()[:-1] for k, v in policy.items()}
+    actent = self.config.actent
+    if isinstance(actent, (int, float)):
+      loss -= actent * sum(ent.values())
+    else:
+      loss -= sum(actent[k] * v for k, v in ent.items())
     loss *= sg(traj['weight'])[:-1]
     loss *= self.config.loss_scales.actor
     metrics.update(self._metrics(traj, policy, logpi, ent, adv))
@@ -472,15 +512,15 @@ class ImagActorCritic(nj.Module):
 
   def _metrics(self, traj, policy, logpi, ent, adv):
     metrics = {}
-    ent = policy.entropy()[:-1]
-    rand = (ent - policy.minent) / (policy.maxent - policy.minent)
-    rand = rand.mean(range(2, len(rand.shape)))
-    act = traj['action']
-    act = jnp.argmax(act, -1) if self.act_space.discrete else act
-    metrics.update(jaxutils.tensorstats(act, 'action'))
-    metrics.update(jaxutils.tensorstats(rand, 'policy_randomness'))
-    metrics.update(jaxutils.tensorstats(ent, 'policy_entropy'))
-    metrics.update(jaxutils.tensorstats(logpi, 'policy_logprob'))
+    for key, space in self.act_space.items():
+      act = jnp.argmax(traj[key], -1) if space.discrete else traj[key]
+      metrics.update(jaxutils.tensorstats(act.astype(jnp.float32), f'{key}_action'))
+      rand = (ent[key] - policy[key].minent) / (
+          policy[key].maxent - policy[key].minent)
+      rand = rand.mean(range(2, len(rand.shape)))
+      metrics.update(jaxutils.tensorstats(rand, f'{key}_policy_randomness'))
+      metrics.update(jaxutils.tensorstats(ent[key], f'{key}_policy_entropy'))
+      metrics.update(jaxutils.tensorstats(logpi[key], f'{key}_policy_logprob'))
     metrics.update(jaxutils.tensorstats(adv, 'adv'))
     metrics['imag_weight_dist'] = jaxutils.subsample(traj['weight'])
     return metrics
@@ -528,7 +568,7 @@ class VFunction(nj.Module):
 
   def score(self, traj, actor=None, slow=False):
     rew = self.rewfn(traj)
-    assert len(rew) == len(traj['action']) - 1, (
+    assert len(rew) == len(traj['deter']) - 1, (
         'should provide rewards for all but last action')
     discount = 1 - 1 / self.config.horizon
     disc = traj['cont'][1:] * discount

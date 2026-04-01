@@ -16,7 +16,7 @@ CONVERSION = {
     np.signedinteger: np.int64,
     np.uint8: np.uint8,
     bool: bool,
-    np.unicode_: np.dtype("object"),
+    np.str_: np.dtype("object"),
     str: str,
 }
 
