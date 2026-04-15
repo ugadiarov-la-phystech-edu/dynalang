@@ -1,7 +1,5 @@
 """
 JAX Transformer implementation mirroring the torch.nn.Transformer API.
-Uses jax.nn.dot_product_attention (JAX ≥ 0.4.20) for the attention kernel,
-which enables Flash Attention on compatible accelerators automatically.
 
 Classes
 -------
@@ -117,7 +115,7 @@ def _init_layer_norm(dim: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Scaled dot-product attention — backed by jax.nn.dot_product_attention
+# Scaled dot-product attention
 # ---------------------------------------------------------------------------
 
 def scaled_dot_product_attention(
@@ -131,8 +129,6 @@ def scaled_dot_product_attention(
     training: bool = False,
 ) -> jnp.ndarray:
     """
-    Thin wrapper around jax.nn.dot_product_attention (JAX ≥ 0.4.20).
-
     Parameters
     ----------
     q, k, v : (batch, nhead, seq, head_dim)
@@ -149,11 +145,6 @@ def scaled_dot_product_attention(
     (batch, nhead, tgt_seq, head_dim)
     """
     # --- Build a single boolean mask (True = attend) for JAX ----------
-    # jax.nn.dot_product_attention uses a *boolean* mask where
-    #   True  → keep / attend to this position
-    #   False → block this position
-    # PyTorch uses the opposite convention for key_padding_mask and uses
-    # additive -inf floats for attn_mask, so we reconcile both here.
 
     bool_mask: Optional[jnp.ndarray] = None
 
@@ -168,9 +159,6 @@ def scaled_dot_product_attention(
         kpm = ~key_padding_mask[:, None, None, :]   # flip: True = attend
         bool_mask = kpm if bool_mask is None else (bool_mask & kpm)
 
-    # Manual scaled dot-product attention. Older JAX versions of
-    # jax.nn.dot_product_attention don't accept `dropout_rate`, so we
-    # implement attention-weight dropout ourselves for portability.
     head_dim = q.shape[-1]
     scale = 1.0 / math.sqrt(head_dim)
     # (batch, nhead, tgt, src)
