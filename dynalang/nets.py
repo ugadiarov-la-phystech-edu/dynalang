@@ -202,6 +202,128 @@ class RSSM(nj.Module):
       mask = jnp.ones((x.shape[0], self._stoch), bool)
       return {'logit': logit, 'mask': mask}
 
+class TSSM(nj.Module):
+
+  def __init__(
+      self, deter=512, units=512, stoch=32, classes=32, context=16,
+      tf_layers=4, tf_heads=8, ffup=4, tf_norm='layer', glu=False, rope=True,
+      qknorm='none', unroll=False, unimix=0.01, action_clip=1.0,
+      winit='normal', **kw):
+    assert deter == units, (deter, units)
+    from .transformer import Transformer
+    self._deter = deter
+    self._units = units
+    self._stoch = stoch
+    self._classes = classes
+    self._context = context
+    self._unroll = unroll
+    self._unimix = unimix
+    self._action_clip = action_clip
+    self._kw = {'units': units, 'winit': winit, **kw}
+    self._transformer = Transformer(
+        units=units, layers=tf_layers, heads=tf_heads, ffup=ffup,
+        norm=tf_norm, glu=glu, rope=rope, qknorm=qknorm, winit=winit,
+        name='transformer')
+
+  def initial(self, batch_size):
+    state = dict(
+        deter=jnp.zeros([batch_size, self._deter], f32),
+        logit=jnp.zeros([batch_size, self._stoch, self._classes], f32),
+        stoch=jnp.zeros([batch_size, self._stoch, self._classes], f32),
+        tokens=jnp.zeros([batch_size, self._context, self._units], f32),
+        valid=jnp.zeros([batch_size, self._context], f32))
+    deter = self.get('initial', jnp.zeros, state['deter'][0].shape, f32)
+    state['deter'] = jnp.repeat(jnp.tanh(deter)[None], batch_size, 0)
+    state['stoch'] = self._prior(cast(state['deter']), sample=True)['stoch']
+    return cast(state)
+
+  def observe(self, embed, action, is_first, state=None):
+    state = state or self.initial(action.shape[0])
+    swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
+    step = lambda prev, inputs: self.obs_step(prev, *inputs)
+    inputs = swap(action), swap(embed), swap(is_first)
+    post = jaxutils.scan(step, inputs, state, self._unroll)
+    post = {k: swap(v) for k, v in post.items()}
+    return post
+
+  def imagine(self, action, state=None):
+    state = state or self.initial(action.shape[0])
+    swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
+    action = swap(action)
+    prior = jaxutils.scan(self.img_step, action, state, self._unroll)
+    prior = {k: swap(v) for k, v in prior.items()}
+    return prior
+
+  def obs_step(self, prev_state, prev_action, embed, is_first):
+    prev_state, prev_action = tree_map(
+        lambda prev, init: jaxutils.switch(is_first, init, prev),
+        (prev_state, prev_action),
+        (self.initial(len(is_first)), jnp.zeros_like(prev_action)))
+    deter, tokens, valid = self._step(prev_state, prev_action)
+    x = jnp.concatenate([deter, embed], -1)
+    x = self.get('obs_out', Linear, **self._kw)(x)
+    stats = self._stats('obs_stats', x)
+    stoch = self.get_dist(stats).sample(seed=nj.rng())
+    post = {'deter': deter, 'stoch': stoch,
+            'tokens': tokens, 'valid': valid, **stats}
+    return cast(post)
+
+  def img_step(self, prev_state, prev_action):
+    deter, tokens, valid = self._step(prev_state, prev_action)
+    prior = self._prior(deter, sample=True)
+    return cast({**prior, 'tokens': tokens, 'valid': valid})
+
+  def _step(self, prev_state, prev_action):
+    prev_action = cast(prev_action)
+    if self._action_clip > 0.0:
+      prev_action *= sg(self._action_clip / jnp.maximum(
+          self._action_clip, jnp.abs(prev_action)))
+    batch_shape = prev_state['deter'].shape[:-1]
+    stoch_flat = prev_state['stoch'].reshape((*batch_shape, -1))
+    x = jnp.concatenate([stoch_flat, prev_action.reshape((*batch_shape, -1))], -1)
+    new_token = self.get('token_in', Linear, **self._kw)(x)
+    tokens = jnp.concatenate(
+        [prev_state['tokens'][:, 1:], new_token[:, None, :]], axis=1)
+    new_valid = jnp.ones((*batch_shape, 1), prev_state['valid'].dtype)
+    valid = jnp.concatenate(
+        [prev_state['valid'][:, 1:], new_valid], axis=1)
+    L = self._context
+    causal = jnp.tril(jnp.ones((L, L), bool))[None]
+    mask = causal & (valid[:, None, :] > 0.5)
+    out = self._transformer(cast(tokens), mask=mask)
+    deter = out[:, -1]
+    return cast(deter), cast(tokens), valid
+
+  def get_dist(self, stats):
+    logit = stats['logit'].astype(f32)
+    return tfd.Independent(jaxutils.OneHotDist(logit), 1)
+
+  def loss(self, post, free=1.0):
+    prior = self._prior(post['deter'], sample=False, post=post)
+    dyn = self.get_dist(sg(post)).kl_divergence(self.get_dist(prior))
+    rep = self.get_dist(post).kl_divergence(self.get_dist(sg(prior)))
+    if free:
+      dyn = jnp.maximum(dyn, free)
+      rep = jnp.maximum(rep, free)
+    return {'dyn': dyn, 'rep': rep}, prior
+
+  def _prior(self, deter, sample, post=None):
+    x = self.get('img_out', Linear, **self._kw)(deter)
+    stats = self._stats('img_stats', x)
+    stoch = self.get_dist(stats).sample(seed=nj.rng()) if sample else None
+    return cast({'deter': deter, 'stoch': stoch, **stats})
+
+  def _stats(self, name, x):
+    x = self.get(name, Linear, self._stoch * self._classes)(x)
+    logit = x.reshape(x.shape[:-1] + (self._stoch, self._classes))
+    if self._unimix:
+      probs = jax.nn.softmax(logit, -1)
+      uniform = jnp.ones_like(probs) / probs.shape[-1]
+      probs = (1 - self._unimix) * probs + self._unimix * uniform
+      logit = jnp.log(probs)
+    return {'logit': logit}
+
+
 class TokenRSSM(nj.Module):
 
   def __init__(

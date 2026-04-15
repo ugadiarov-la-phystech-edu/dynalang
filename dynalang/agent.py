@@ -164,6 +164,8 @@ class WorldModel(nj.Module):
       self.rssm = nets.EarlyRSSM(**config.early_rssm, name='rssm')
     elif self.config.rssm_type == 'token':
       self.rssm = nets.TokenRSSM(**config.token_rssm, name='rssm')
+    elif self.config.rssm_type == 'tssm':
+      self.rssm = nets.TSSM(**config.tssm, name='rssm')
     else:
       raise NotImplementedError(self.config.rssm_type)
     self.heads = {
