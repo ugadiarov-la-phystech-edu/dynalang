@@ -1,187 +1,323 @@
-import einops
+"""
+Ninjax Transformer modules mirroring the torch.nn.Transformer API.
+
+Re-implements Transformer components as nj.Module subclasses so the
+parameters live in ninjax's CONTEXT and can be used inside the Dynalang
+agent alongside the existing modules in dynalang/nets.py.
+
+Tensor layout matches torch.nn.Transformer:
+    src : (src_len, batch, d_model)
+    tgt : (tgt_len, batch, d_model)
+    out : (tgt_len, batch, d_model)
+
+Masks follow PyTorch conventions:
+    attn_mask        — additive float mask, -inf blocks a position.
+    key_padding_mask — bool array (batch, src_len), True = ignore that key.
+"""
+
+import math
+from typing import Optional
+
 import jax
-import jax.ad_checkpoint as adc
 import jax.numpy as jnp
-import numpy as np
 
 from . import ninjax as nj
-from .nets import Linear, get_act
-
-f32 = jnp.float32
+from .nets import Linear, Norm
 
 
-class Norm(nj.Module):
+def _split_heads(x: jnp.ndarray, nhead: int) -> jnp.ndarray:
+  """(seq, batch, d_model) -> (batch, nhead, seq, head_dim)"""
+  seq, batch, d_model = x.shape
+  head_dim = d_model // nhead
+  x = x.reshape(seq, batch, nhead, head_dim)
+  return x.transpose(1, 2, 0, 3)
 
-  def __init__(self, impl, axis: tuple = (-1,), eps: float = 1e-4, scale: bool = True, shift: bool = True):
-    self.axis = axis
-    self.eps = eps
-    self.scale = scale
-    self.shift = shift
-    self.impl = impl
 
-  def __call__(self, x):
-    # ensure_dtypes(x)
-    dtype = x.dtype
-    x = f32(x)
-    axis = [a % x.ndim for a in self.axis]
-    shape = [x.shape[i] if i in axis else 1 for i in range(min(axis), x.ndim)]
-    if self.impl == 'none':
-      pass
-    elif self.impl == 'rms':
-      mean2 = jnp.square(x).mean(axis, keepdims=True)
-      mean2 = adc.checkpoint_name(mean2, 'small')
-      scale = self._scale(shape, x.dtype)
-      x = x * (jax.lax.rsqrt(mean2 + self.eps) * scale)
-    elif self.impl == 'layer':
-      mean = x.mean(axis, keepdims=True)
-      mean2 = jnp.square(x).mean(axis, keepdims=True)
-      mean2 = adc.checkpoint_name(mean2, 'small')
-      var = jnp.maximum(0, mean2 - jnp.square(mean))
-      var = adc.checkpoint_name(var, 'small')
-      scale = self._scale(shape, x.dtype)
-      shift = self._shift(shape, x.dtype)
-      x = (x - mean) * (jax.lax.rsqrt(var + self.eps) * scale) + shift
+def _merge_heads(x: jnp.ndarray) -> jnp.ndarray:
+  """(batch, nhead, seq, head_dim) -> (seq, batch, d_model)"""
+  batch, nhead, seq, head_dim = x.shape
+  x = x.transpose(2, 0, 1, 3)
+  return x.reshape(seq, batch, nhead * head_dim)
+
+
+def _dropout(x: jnp.ndarray, rate: float, training: bool) -> jnp.ndarray:
+  if not training or rate == 0.0:
+    return x
+  keep_prob = 1.0 - rate
+  keep = jax.random.bernoulli(nj.rng(), keep_prob, x.shape)
+  return jnp.where(keep, x / keep_prob, 0.0)
+
+
+def scaled_dot_product_attention(
+    q: jnp.ndarray,
+    k: jnp.ndarray,
+    v: jnp.ndarray,
+    mask: Optional[jnp.ndarray] = None,
+    key_padding_mask: Optional[jnp.ndarray] = None,
+    dropout: float = 0.0,
+    training: bool = False,
+) -> jnp.ndarray:
+  """
+  q, k, v : (batch, nhead, seq, head_dim)
+  Returns : (batch, nhead, tgt_seq, head_dim)
+  """
+  bool_mask: Optional[jnp.ndarray] = None
+  if mask is not None:
+    bool_mask = jnp.isfinite(mask)
+  if key_padding_mask is not None:
+    kpm = ~key_padding_mask[:, None, None, :]
+    bool_mask = kpm if bool_mask is None else (bool_mask & kpm)
+
+  head_dim = q.shape[-1]
+  scale = 1.0 / math.sqrt(head_dim)
+  logits = jnp.einsum('bhtd,bhsd->bhts', q, k) * scale
+
+  if bool_mask is not None:
+    logits = jnp.where(bool_mask, logits, jnp.finfo(logits.dtype).min)
+
+  weights = jax.nn.softmax(logits, axis=-1)
+  weights = _dropout(weights, dropout, training)
+  return jnp.einsum('bhts,bhsd->bhtd', weights, v)
+
+
+class MultiHeadAttention(nj.Module):
+
+  def __init__(self, embed_dim, num_heads, dropout=0.0):
+    assert embed_dim % num_heads == 0, (embed_dim, num_heads)
+    self._embed_dim = embed_dim
+    self._num_heads = num_heads
+    self._dropout = dropout
+
+  def __call__(
+      self, query, key, value,
+      attn_mask=None, key_padding_mask=None, training=False):
+    q = self.get('q_proj', Linear, self._embed_dim)(query)
+    k = self.get('k_proj', Linear, self._embed_dim)(key)
+    v = self.get('v_proj', Linear, self._embed_dim)(value)
+
+    q = _split_heads(q, self._num_heads)
+    k = _split_heads(k, self._num_heads)
+    v = _split_heads(v, self._num_heads)
+
+    attn_out = scaled_dot_product_attention(
+        q, k, v,
+        mask=attn_mask,
+        key_padding_mask=key_padding_mask,
+        dropout=self._dropout,
+        training=training)
+
+    attn_out = _merge_heads(attn_out)
+    return self.get('out_proj', Linear, self._embed_dim)(attn_out)
+
+
+class TransformerEncoderLayer(nj.Module):
+
+  def __init__(
+      self, d_model, nhead, feedforward_units=1024,
+      dropout=0.1, norm_first=False):
+    self._d_model = d_model
+    self._nhead = nhead
+    self._feedforward_units = feedforward_units
+    self._dropout = dropout
+    self._norm_first = norm_first
+
+  def __call__(
+      self, src, src_mask=None, src_key_padding_mask=None, training=False):
+    attn = lambda x: self.get(
+        'self_attn', MultiHeadAttention,
+        self._d_model, self._nhead, self._dropout)(
+            x, x, x,
+            attn_mask=src_mask,
+            key_padding_mask=src_key_padding_mask,
+            training=training)
+
+    if self._norm_first:
+      normed = self.get('norm1', Norm, 'layer')(src)
+      src = src + _dropout(attn(normed), self._dropout, training)
+
+      normed = self.get('norm2', Norm, 'layer')(src)
+      ff = jax.nn.relu(
+          self.get('linear1', Linear, self._feedforward_units)(normed))
+      ff = _dropout(ff, self._dropout, training)
+      ff = self.get('linear2', Linear, self._d_model)(ff)
+      src = src + _dropout(ff, self._dropout, training)
     else:
-      raise NotImplementedError(self.impl)
-    x = x.astype(dtype)
+      attn_out = attn(src)
+      src = self.get('norm1', Norm, 'layer')(
+          src + _dropout(attn_out, self._dropout, training))
+
+      ff = jax.nn.relu(self.get('linear1', Linear, self._feedforward_units)(src))
+      ff = _dropout(ff, self._dropout, training)
+      ff = self.get('linear2', Linear, self._d_model)(ff)
+      src = self.get('norm2', Norm, 'layer')(
+          src + _dropout(ff, self._dropout, training))
+    return src
+
+
+class TransformerDecoderLayer(nj.Module):
+
+  def __init__(
+      self, d_model, nhead, feedforward_units=2048,
+      dropout=0.1, norm_first=False):
+    self._d_model = d_model
+    self._nhead = nhead
+    self._feedforward_units = feedforward_units
+    self._dropout = dropout
+    self._norm_first = norm_first
+
+  def __call__(
+      self, tgt, memory,
+      tgt_mask=None, memory_mask=None,
+      tgt_key_padding_mask=None, memory_key_padding_mask=None,
+      training=False):
+    self_attn = lambda x: self.get(
+        'self_attn', MultiHeadAttention,
+        self._d_model, self._nhead, self._dropout)(
+            x, x, x,
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_key_padding_mask,
+            training=training)
+    cross_attn = lambda x: self.get(
+        'cross_attn', MultiHeadAttention,
+        self._d_model, self._nhead, self._dropout)(
+            x, memory, memory,
+            attn_mask=memory_mask,
+            key_padding_mask=memory_key_padding_mask,
+            training=training)
+
+    if self._norm_first:
+      normed = self.get('norm1', Norm, 'layer')(tgt)
+      tgt = tgt + _dropout(self_attn(normed), self._dropout, training)
+
+      normed = self.get('norm2', Norm, 'layer')(tgt)
+      tgt = tgt + _dropout(cross_attn(normed), self._dropout, training)
+
+      normed = self.get('norm3', Norm, 'layer')(tgt)
+      ff = jax.nn.relu(
+          self.get('linear1', Linear, self._feedforward_units)(normed))
+      ff = _dropout(ff, self._dropout, training)
+      ff = self.get('linear2', Linear, self._d_model)(ff)
+      tgt = tgt + _dropout(ff, self._dropout, training)
+    else:
+      sa = self_attn(tgt)
+      tgt = self.get('norm1', Norm, 'layer')(
+          tgt + _dropout(sa, self._dropout, training))
+
+      ca = cross_attn(tgt)
+      tgt = self.get('norm2', Norm, 'layer')(
+          tgt + _dropout(ca, self._dropout, training))
+
+      ff = jax.nn.relu(self.get('linear1', Linear, self._feedforward_units)(tgt))
+      ff = _dropout(ff, self._dropout, training)
+      ff = self.get('linear2', Linear, self._d_model)(ff)
+      tgt = self.get('norm3', Norm, 'layer')(
+          tgt + _dropout(ff, self._dropout, training))
+    return tgt
+
+
+class TransformerEncoder(nj.Module):
+
+  def __init__(
+      self, num_layers, d_model, nhead, feedforward_units=1024,
+      dropout=0.1, norm_first=False, norm=False):
+    self._num_layers = num_layers
+    self._d_model = d_model
+    self._nhead = nhead
+    self._feedforward_units = feedforward_units
+    self._dropout = dropout
+    self._norm_first = norm_first
+    self._norm = norm
+
+  def __call__(
+      self, src, mask=None, src_key_padding_mask=None, training=False):
+    x = src
+    for i in range(self._num_layers):
+      x = self.get(
+          f'layer_{i}', TransformerEncoderLayer,
+          self._d_model, self._nhead, self._feedforward_units,
+          self._dropout, self._norm_first)(
+              x, src_mask=mask,
+              src_key_padding_mask=src_key_padding_mask,
+              training=training)
+    if self._norm:
+      x = self.get('norm', Norm, 'layer')(x)
     return x
 
-  def _scale(self, shape, dtype):
-    if not self.scale:
-      return jnp.ones(shape, dtype)
 
-    return self.get('scale', jnp.ones, shape[-1], f32).astype(dtype)
+class TransformerDecoder(nj.Module):
 
-  def _shift(self, shape, dtype):
-    if not self.shift:
-      return jnp.zeros(shape, dtype)
+  def __init__(
+      self, num_layers, d_model, nhead, feedforward_units=2048,
+      dropout=0.1, norm_first=False, norm=False):
+    self._num_layers = num_layers
+    self._d_model = d_model
+    self._nhead = nhead
+    self._feedforward_units = feedforward_units
+    self._dropout = dropout
+    self._norm_first = norm_first
+    self._norm = norm
 
-    return self.get('shift', jnp.zeros, shape[-1], f32).astype(dtype)
-
-
-def rope(x, ts=None, inverse=False, maxlen=4096):
-  B, T, _, D = x.shape
-  if ts is None:
-    ts = jnp.ones(B, jnp.int32)[:, None] * jnp.arange(T)[None, :]  # [B, T]
-  assert ts.shape == (B, T), (ts.shape, (B, T))
-  if inverse:
-    ts = -ts
-  freq_exponents = (2.0 / D) * jnp.arange(D // 2)  # [D/2]
-  timescale = maxlen ** freq_exponents
-  radians = ts[:, :, None] / timescale[None, None, :]  # [B, T, D/2]
-  radians = radians[..., None, :].astype(x.dtype)  # [B, T, 1, D/2]
-  sin, cos = jnp.sin(radians), jnp.cos(radians)
-  x1, x2 = jnp.split(x, 2, axis=-1)  # [B, T, H, D/2]
-  res = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
-  return res
-
-
-def dropout(x, prob, training):
-  if not prob or not training:
-    return x
-  keep = jax.random.bernoulli(nj.rng(), 1.0 - prob, x.shape)
-  return x * keep / (1.0 - prob)
-
-
-class Attention(nj.Module):
-
-  def __init__(self, heads: int = 8, kv_heads: int = 0, dropout: float = 0.0, rope: bool = True, qknorm: str = 'none',
-               bias: bool = True, winit: str = 'normal', outscale: float = 1.0):
-    self.heads = heads
-    self.kv_heads = kv_heads
-    self.dropout = dropout
-    self.rope = rope
-    self.qknorm = qknorm
-    self.bias = bias
-    self.winit = winit
-    self.outscale = outscale
-    self.kw_linear = dict(bias=self.bias, winit=self.winit)
-
-  def __call__(self, x, mask=None, ts=None, training=True):
-    B, T, D = x.shape
-    kv_heads = self.kv_heads or self.heads
-    assert self.heads % kv_heads == 0
-    head_ratio = self.heads // kv_heads
-    if head_ratio == 1:
-      qkv = self.get('qkv', Linear, 3 * D, **self.kw_linear)(x)
-      q, k, v = jnp.split(qkv, 3, -1)
-    else:
-      q = self.get('q', Linear, D, **self.kw_linear)(x)
-      k = self.get('k', Linear, D // head_ratio, **self.kw_linear)(x)
-      v = self.get('v', Linear, D // head_ratio, **self.kw_linear)(x)
-    q = einops.rearrange(q, 'b t (h d) -> b t h d', h=self.heads)
-    k = einops.rearrange(k, 'b t (h d) -> b t h d', h=kv_heads)
-    v = einops.rearrange(v, 'b t (h d) -> b t h d', h=kv_heads)
-
-    if self.qknorm != 'none':
-      q = self.get('normq', Norm, self.qknorm)(q)
-      k = self.get('normk', Norm, self.qknorm)(k)
-
-    if self.rope:
-      q = rope(q, ts)
-      k = rope(k, ts)
-
-    q = einops.rearrange(q, 'b t (h g) d -> b t h g d', h=kv_heads)
-    logits = einops.einsum(q, k, 'b tq h g d, b tk h d -> b h g tq tk')
-    logits = logits * (1.0 / np.sqrt(k.shape[-1]))
-    logits = f32(logits)
-    if mask is not None:
-      Tq, Tk = q.shape[1], k.shape[1]
-      assert mask.shape == (B, Tq, Tk), (mask.shape, (B, Tq, Tk))
-      mask = einops.rearrange(mask, 'b tq tk -> b 1 1 tq tk')
-      logits = jnp.where(mask, logits, -1e30)
-    weights = jax.nn.softmax(logits)
-    weights = weights.astype(x.dtype)
-    weights = dropout(weights, self.dropout, training)
-    x = einops.einsum(weights, v, 'b h g tq tk, b tk h d -> b tq h g d')
-    x = einops.rearrange(x, 'b t h g d -> b t (h g d)')
-    x = self.get('proj', Linear, D, **self.kw_linear, outscale=self.outscale)(x)
+  def __call__(
+      self, tgt, memory,
+      tgt_mask=None, memory_mask=None,
+      tgt_key_padding_mask=None, memory_key_padding_mask=None,
+      training=False):
+    x = tgt
+    for i in range(self._num_layers):
+      x = self.get(
+          f'layer_{i}', TransformerDecoderLayer,
+          self._d_model, self._nhead, self._feedforward_units,
+          self._dropout, self._norm_first)(
+              x, memory,
+              tgt_mask=tgt_mask,
+              memory_mask=memory_mask,
+              tgt_key_padding_mask=tgt_key_padding_mask,
+              memory_key_padding_mask=memory_key_padding_mask,
+              training=training)
+    if self._norm:
+      x = self.get('norm', Norm, 'layer')(x)
     return x
 
 
 class Transformer(nj.Module):
-  def __init__(self, units: int = 1024, layers: int = 12, heads: int = 8, ffup: int = 4, act: str = 'silu',
-               norm: str = 'layer', glu: bool = False, rope: bool = True, qknorm: str = 'none', dropout: float = 0.0,
-               bias: bool = True, winit: str = 'normal', outscale: float = 1.0):
-    self.units = units
-    self.layers = layers
-    self.heads = heads
-    self.ffup = ffup
-    self.act = act
-    self.norm = norm
-    self.glu = glu
-    self.rope = rope
-    self.qknorm = qknorm
-    self.dropout = dropout
-    self.bias = bias
-    self.winit = winit
-    self.outscale = outscale
+  """Full encoder-decoder Transformer, API-compatible with torch.nn.Transformer."""
 
-  def __call__(self, x, mask=None, ts=None, training=True):
-    kw = dict(bias=self.bias, winit=self.winit,)
-    ak = dict(heads=self.heads, rope=self.rope, qknorm=self.qknorm, outscale=self.outscale, dropout=self.dropout)
-    D = x.shape[-1]
-    assert D == self.units, (D, self.units)
-    for i in range(self.layers):
-      with nj.scope(f'layer{i}'):
-        skip = x
-        x = self.get('norm1', Norm, self.norm)(x)
-        x  = self.get('mha', Attention, **kw, **ak)(x, mask, ts, training)
-        x = dropout(x, self.dropout, training)
-        x += skip
-        skip = x
-        x = self.get('norm2', Norm, self.norm)(x)
-        if self.glu:
-          U = max(D, int((D * self.ffup * 2 / 3) // 32 * 32))
-          ff1 = self.get('ff1', Linear, U, **kw)
-          ff2 = self.get('ff2', Linear, U, **kw)
-          ff3 = self.get('ff3', Linear, D, **kw, outscale=self.outscale)
-          x = ff3(get_act(self.act)(ff1(x)) * ff2(x))
-        else:
-          ff1 = self.get('ff1', Linear, D * self.ffup, **kw)
-          ff2 = self.get('ff2', Linear, D, **kw, outscale=self.outscale)
-          x = ff2(get_act(self.act)(ff1(x)))
-        x = dropout(x, self.dropout, training)
-        x += skip
-    x = self.get('outnorm', Norm, self.norm)(x)
-    return x
+  def __init__(
+      self, d_model=512, nhead=8, num_encoder_layers=6, num_decoder_layers=6,
+      feedforward_units=2048, dropout=0.1, norm_first=False):
+    self._d_model = d_model
+    self._nhead = nhead
+    self._num_encoder_layers = num_encoder_layers
+    self._num_decoder_layers = num_decoder_layers
+    self._feedforward_units = feedforward_units
+    self._dropout = dropout
+    self._norm_first = norm_first
+
+  def __call__(
+      self, src, tgt,
+      src_mask=None, tgt_mask=None, memory_mask=None,
+      src_key_padding_mask=None, tgt_key_padding_mask=None,
+      memory_key_padding_mask=None, training=False):
+    memory = self.get(
+        'encoder', TransformerEncoder,
+        self._num_encoder_layers, self._d_model, self._nhead,
+        self._feedforward_units, self._dropout, self._norm_first, True)(
+            src, mask=src_mask,
+            src_key_padding_mask=src_key_padding_mask,
+            training=training)
+    output = self.get(
+        'decoder', TransformerDecoder,
+        self._num_decoder_layers, self._d_model, self._nhead,
+        self._feedforward_units, self._dropout, self._norm_first, True)(
+            tgt, memory,
+            tgt_mask=tgt_mask,
+            memory_mask=memory_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=memory_key_padding_mask,
+            training=training)
+    return output
+
+  @staticmethod
+  def generate_square_subsequent_mask(sz: int) -> jnp.ndarray:
+    """Causal additive mask of shape (sz, sz); upper-triangle = -inf."""
+    return jnp.triu(jnp.full((sz, sz), -jnp.inf), k=1)

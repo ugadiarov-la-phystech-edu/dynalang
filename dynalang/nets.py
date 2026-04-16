@@ -206,11 +206,11 @@ class TSSM(nj.Module):
 
   def __init__(
       self, deter=512, units=512, stoch=32, classes=32, context=16,
-      tf_layers=4, tf_heads=8, ffup=4, tf_norm='layer', glu=False, rope=True,
-      qknorm='none', dropout=0.0, unroll=False, unimix=0.01, action_clip=1.0,
+      tf_layers=4, tf_heads=8, feedforward_units=1024, dropout=0.0,
+      unroll=False, unimix=0.01, action_clip=1.0,
       winit='normal', **kw):
     assert deter == units, (deter, units)
-    from .transformer import Transformer
+    from .transformer import TransformerEncoder
     self._deter = deter
     self._units = units
     self._stoch = stoch
@@ -220,10 +220,10 @@ class TSSM(nj.Module):
     self._unimix = unimix
     self._action_clip = action_clip
     self._kw = {'units': units, 'winit': winit, **kw}
-    self._transformer = Transformer(
-        units=units, layers=tf_layers, heads=tf_heads, ffup=ffup,
-        norm=tf_norm, glu=glu, rope=rope, qknorm=qknorm, dropout=dropout, winit=winit,
-        name='transformer')
+    self._transformer = TransformerEncoder(
+        num_layers=tf_layers, d_model=units, nhead=tf_heads,
+        feedforward_units=feedforward_units, dropout=dropout,
+        norm_first=True, norm=True, name='transformer')
 
   def initial(self, batch_size):
     state = dict(
@@ -288,10 +288,12 @@ class TSSM(nj.Module):
     valid = jnp.concatenate(
         [prev_state['valid'][:, 1:], new_valid], axis=1)
     L = self._context
-    causal = jnp.tril(jnp.ones((L, L), bool))[None]
-    mask = causal & (valid[:, None, :] > 0.5)
-    out = self._transformer(cast(tokens), mask=mask, training=training)
-    deter = out[:, -1]
+    causal_mask = jnp.triu(jnp.full((L, L), -jnp.inf), k=1)
+    key_pad_mask = valid <= 0.5
+    src = cast(tokens).transpose(1, 0, 2)
+    out = self._transformer(src, mask=causal_mask,
+        src_key_padding_mask=key_pad_mask, training=training)
+    deter = out[-1]
     return cast(deter), cast(tokens), valid
 
   def get_dist(self, stats):
