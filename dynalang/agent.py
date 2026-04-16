@@ -70,6 +70,10 @@ class Agent(nj.Module):
     if self.config.rssm_type == "token":
       latent = self.wm.rssm.obs_step(
           prev_latent, prev_action, embed, obs["token"], obs['is_first'])
+    elif self.config.rssm_type == "tssm":
+      latent = self.wm.rssm.obs_step(
+          prev_latent, prev_action, embed, obs['is_first'],
+          training=(mode != 'eval'))
     else:
       latent = self.wm.rssm.obs_step(
           prev_latent, prev_action, embed, obs['is_first'])

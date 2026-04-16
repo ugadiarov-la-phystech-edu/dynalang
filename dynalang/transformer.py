@@ -141,8 +141,8 @@ class Attention(nj.Module):
 
 class Transformer(nj.Module):
   def __init__(self, units: int = 1024, layers: int = 12, heads: int = 8, ffup: int = 4, act: str = 'silu',
-               norm: str = 'layer', glu: bool = False, rope: bool = True, qknorm: str = 'none', bias: bool = True,
-               winit: str = 'normal', outscale: float = 1.0):
+               norm: str = 'layer', glu: bool = False, rope: bool = True, qknorm: str = 'none', dropout: float = 0.0,
+               bias: bool = True, winit: str = 'normal', outscale: float = 1.0):
     self.units = units
     self.layers = layers
     self.heads = heads
@@ -152,13 +152,14 @@ class Transformer(nj.Module):
     self.glu = glu
     self.rope = rope
     self.qknorm = qknorm
+    self.dropout = dropout
     self.bias = bias
     self.winit = winit
     self.outscale = outscale
 
   def __call__(self, x, mask=None, ts=None, training=True):
     kw = dict(bias=self.bias, winit=self.winit,)
-    ak = dict(heads=self.heads, rope=self.rope, qknorm=self.qknorm, outscale=self.outscale)
+    ak = dict(heads=self.heads, rope=self.rope, qknorm=self.qknorm, outscale=self.outscale, dropout=self.dropout)
     D = x.shape[-1]
     assert D == self.units, (D, self.units)
     for i in range(self.layers):

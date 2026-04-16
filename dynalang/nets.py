@@ -207,7 +207,7 @@ class TSSM(nj.Module):
   def __init__(
       self, deter=512, units=512, stoch=32, classes=32, context=16,
       tf_layers=4, tf_heads=8, ffup=4, tf_norm='layer', glu=False, rope=True,
-      qknorm='none', unroll=False, unimix=0.01, action_clip=1.0,
+      qknorm='none', dropout=0.0, unroll=False, unimix=0.01, action_clip=1.0,
       winit='normal', **kw):
     assert deter == units, (deter, units)
     from .transformer import Transformer
@@ -222,7 +222,7 @@ class TSSM(nj.Module):
     self._kw = {'units': units, 'winit': winit, **kw}
     self._transformer = Transformer(
         units=units, layers=tf_layers, heads=tf_heads, ffup=ffup,
-        norm=tf_norm, glu=glu, rope=rope, qknorm=qknorm, winit=winit,
+        norm=tf_norm, glu=glu, rope=rope, qknorm=qknorm, dropout=dropout, winit=winit,
         name='transformer')
 
   def initial(self, batch_size):
@@ -254,12 +254,12 @@ class TSSM(nj.Module):
     prior = {k: swap(v) for k, v in prior.items()}
     return prior
 
-  def obs_step(self, prev_state, prev_action, embed, is_first):
+  def obs_step(self, prev_state, prev_action, embed, is_first, training=True):
     prev_state, prev_action = tree_map(
         lambda prev, init: jaxutils.switch(is_first, init, prev),
         (prev_state, prev_action),
         (self.initial(len(is_first)), jnp.zeros_like(prev_action)))
-    deter, tokens, valid = self._step(prev_state, prev_action)
+    deter, tokens, valid = self._step(prev_state, prev_action, training=training)
     x = jnp.concatenate([deter, embed], -1)
     x = self.get('obs_out', Linear, **self._kw)(x)
     stats = self._stats('obs_stats', x)
@@ -273,7 +273,7 @@ class TSSM(nj.Module):
     prior = self._prior(deter, sample=True)
     return cast({**prior, 'tokens': tokens, 'valid': valid})
 
-  def _step(self, prev_state, prev_action):
+  def _step(self, prev_state, prev_action, training=True):
     prev_action = cast(prev_action)
     if self._action_clip > 0.0:
       prev_action *= sg(self._action_clip / jnp.maximum(
@@ -290,7 +290,7 @@ class TSSM(nj.Module):
     L = self._context
     causal = jnp.tril(jnp.ones((L, L), bool))[None]
     mask = causal & (valid[:, None, :] > 0.5)
-    out = self._transformer(cast(tokens), mask=mask)
+    out = self._transformer(cast(tokens), mask=mask, training=training)
     deter = out[:, -1]
     return cast(deter), cast(tokens), valid
 
