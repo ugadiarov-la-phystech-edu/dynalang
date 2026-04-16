@@ -167,6 +167,7 @@ class Transformer(nj.Module):
         skip = x
         x = self.get('norm1', Norm, self.norm)(x)
         x  = self.get('mha', Attention, **kw, **ak)(x, mask, ts, training)
+        x = dropout(x, self.dropout, training)
         x += skip
         skip = x
         x = self.get('norm2', Norm, self.norm)(x)
@@ -180,6 +181,7 @@ class Transformer(nj.Module):
           ff1 = self.get('ff1', Linear, D * self.ffup, **kw)
           ff2 = self.get('ff2', Linear, D, **kw, outscale=self.outscale)
           x = ff2(get_act(self.act)(ff1(x)))
+        x = dropout(x, self.dropout, training)
         x += skip
     x = self.get('outnorm', Norm, self.norm)(x)
     return x
