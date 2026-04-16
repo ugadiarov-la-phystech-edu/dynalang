@@ -290,10 +290,9 @@ class TSSM(nj.Module):
     L = self._context
     causal_mask = jnp.triu(jnp.full((L, L), -jnp.inf), k=1)
     key_pad_mask = valid <= 0.5
-    src = cast(tokens).transpose(1, 0, 2)
-    out = self._transformer(src, mask=causal_mask,
+    out = self._transformer(cast(tokens), mask=causal_mask,
         src_key_padding_mask=key_pad_mask, training=training)
-    deter = out[-1]
+    deter = out[:, -1]
     return cast(deter), cast(tokens), valid
 
   def get_dist(self, stats):

@@ -5,10 +5,10 @@ Re-implements Transformer components as nj.Module subclasses so the
 parameters live in ninjax's CONTEXT and can be used inside the Dynalang
 agent alongside the existing modules in dynalang/nets.py.
 
-Tensor layout matches torch.nn.Transformer:
-    src : (src_len, batch, d_model)
-    tgt : (tgt_len, batch, d_model)
-    out : (tgt_len, batch, d_model)
+Tensor layout (batch-first):
+    src : (batch, src_len, d_model)
+    tgt : (batch, tgt_len, d_model)
+    out : (batch, tgt_len, d_model)
 
 Masks follow PyTorch conventions:
     attn_mask        — additive float mask, -inf blocks a position.
@@ -23,21 +23,6 @@ import jax.numpy as jnp
 
 from . import ninjax as nj
 from .nets import Linear, Norm
-
-
-def _split_heads(x: jnp.ndarray, nhead: int) -> jnp.ndarray:
-  """(seq, batch, d_model) -> (batch, nhead, seq, head_dim)"""
-  seq, batch, d_model = x.shape
-  head_dim = d_model // nhead
-  x = x.reshape(seq, batch, nhead, head_dim)
-  return x.transpose(1, 2, 0, 3)
-
-
-def _merge_heads(x: jnp.ndarray) -> jnp.ndarray:
-  """(batch, nhead, seq, head_dim) -> (seq, batch, d_model)"""
-  batch, nhead, seq, head_dim = x.shape
-  x = x.transpose(2, 0, 1, 3)
-  return x.reshape(seq, batch, nhead * head_dim)
 
 
 def _dropout(x: jnp.ndarray, rate: float, training: bool) -> jnp.ndarray:
@@ -71,46 +56,53 @@ def scaled_dot_product_attention(
     training: bool = False,
 ) -> jnp.ndarray:
   """
-  q, k, v : (batch, nhead, seq, head_dim)
-  Returns : (batch, nhead, tgt_seq, head_dim)
+  q, k, v : (batch, seq, nhead, head_dim)
+  Returns : (batch, tgt_seq, nhead, head_dim)
   """
+  head_dim = q.shape[-1]
+  scale = 1.0 / math.sqrt(head_dim)
+  logits = jnp.einsum('btnh,bsnh->bnts', q, k) * scale  # (B, H, Tq, Tk)
+
   bool_mask: Optional[jnp.ndarray] = None
   if mask is not None:
     bool_mask = jnp.isfinite(mask)
   if key_padding_mask is not None:
-    kpm = ~key_padding_mask[:, None, None, :]
+    kpm = ~key_padding_mask[:, None, None, :]  # (B, 1, 1, Tk)
     bool_mask = kpm if bool_mask is None else (bool_mask & kpm)
-
-  head_dim = q.shape[-1]
-  scale = 1.0 / math.sqrt(head_dim)
-  logits = jnp.einsum('bhtd,bhsd->bhts', q, k) * scale
 
   if bool_mask is not None:
     logits = jnp.where(bool_mask, logits, jnp.finfo(logits.dtype).min)
 
   weights = jax.nn.softmax(logits, axis=-1)
   weights = _dropout(weights, dropout, training)
-  return jnp.einsum('bhts,bhsd->bhtd', weights, v)
+  return jnp.einsum('bnts,bsnh->btnh', weights, v)  # (B, Tq, H, D)
 
 
 class MultiHeadAttention(nj.Module):
 
-  def __init__(self, embed_dim, num_heads, dropout=0.0):
+  def __init__(self, embed_dim, num_heads, dropout=0.0, self_attn=True):
     assert embed_dim % num_heads == 0, (embed_dim, num_heads)
     self._embed_dim = embed_dim
     self._num_heads = num_heads
+    self._head_dim = embed_dim // num_heads
     self._dropout = dropout
+    self._self_attn = self_attn
 
   def __call__(
       self, query, key, value,
       attn_mask=None, key_padding_mask=None, training=False):
-    q = self.get('q_proj', Linear, self._embed_dim)(query)
-    k = self.get('k_proj', Linear, self._embed_dim)(key)
-    v = self.get('v_proj', Linear, self._embed_dim)(value)
+    D = self._embed_dim
+    H = self._num_heads
+    hd = self._head_dim
 
-    q = _split_heads(q, self._num_heads)
-    k = _split_heads(k, self._num_heads)
-    v = _split_heads(v, self._num_heads)
+    if self._self_attn:
+      qkv = self.get('in_proj', Linear, 3 * D)(query)  # (B, T, 3*D)
+      qkv = qkv.reshape(*qkv.shape[:-1], 3, H, hd)    # (B, T, 3, H, hd)
+      q, k, v = qkv[..., 0, :, :], qkv[..., 1, :, :], qkv[..., 2, :, :]
+    else:
+      q = self.get('q_proj', Linear, D)(query).reshape(*query.shape[:-1], H, hd)
+      k = self.get('k_proj', Linear, D)(key).reshape(*key.shape[:-1], H, hd)
+      v = self.get('v_proj', Linear, D)(value).reshape(*value.shape[:-1], H, hd)
 
     attn_out = scaled_dot_product_attention(
         q, k, v,
@@ -119,8 +111,8 @@ class MultiHeadAttention(nj.Module):
         dropout=self._dropout,
         training=training)
 
-    attn_out = _merge_heads(attn_out)
-    return self.get('out_proj', Linear, self._embed_dim)(attn_out)
+    attn_out = attn_out.reshape(*attn_out.shape[:-2], D)  # (B, T, D)
+    return self.get('out_proj', Linear, D)(attn_out)
 
 
 class TransformerEncoderLayer(nj.Module):
@@ -192,7 +184,7 @@ class TransformerDecoderLayer(nj.Module):
             training=training)
     cross_attn = lambda x: self.get(
         'cross_attn', MultiHeadAttention,
-        self._d_model, self._nhead, self._dropout)(
+        self._d_model, self._nhead, self._dropout, False)(
             x, memory, memory,
             attn_mask=memory_mask,
             key_padding_mask=memory_key_padding_mask,
@@ -243,9 +235,9 @@ class TransformerEncoder(nj.Module):
 
   def __call__(
       self, src, mask=None, src_key_padding_mask=None, training=False):
-    seq_len = src.shape[0]
+    seq_len = src.shape[1]
     pe = sinusoidal_positional_encoding(seq_len, self._d_model)
-    x = src + pe[:, None, :]
+    x = src + pe[None, :, :]
     x = _dropout(x, self._dropout, training)
     for i in range(self._num_layers):
       x = self.get(
