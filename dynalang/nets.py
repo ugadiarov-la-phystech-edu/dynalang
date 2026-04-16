@@ -205,7 +205,7 @@ class RSSM(nj.Module):
 class TSSM(nj.Module):
 
   def __init__(
-      self, deter=512, units=512, stoch=32, classes=32, context=16,
+      self, deter=512, units=512, stoch=32, classes=32, tf_context_length=16,
       tf_layers=4, tf_heads=8, feedforward_units=1024, dropout=0.0,
       unroll=False, unimix=0.01, action_clip=1.0,
       winit='normal', **kw):
@@ -215,7 +215,7 @@ class TSSM(nj.Module):
     self._units = units
     self._stoch = stoch
     self._classes = classes
-    self._context = context
+    self._tf_context_length = tf_context_length
     self._unroll = unroll
     self._unimix = unimix
     self._action_clip = action_clip
@@ -230,8 +230,8 @@ class TSSM(nj.Module):
         deter=jnp.zeros([batch_size, self._deter], f32),
         logit=jnp.zeros([batch_size, self._stoch, self._classes], f32),
         stoch=jnp.zeros([batch_size, self._stoch, self._classes], f32),
-        tokens=jnp.zeros([batch_size, self._context, self._units], f32),
-        valid=jnp.zeros([batch_size, self._context], f32))
+        tf_context=jnp.zeros([batch_size, self._tf_context_length, self._units], f32),
+        valid=jnp.zeros([batch_size, self._tf_context_length], f32))
     deter = self.get('initial', jnp.zeros, state['deter'][0].shape, f32)
     state['deter'] = jnp.repeat(jnp.tanh(deter)[None], batch_size, 0)
     state['stoch'] = self._prior(cast(state['deter']), sample=True)['stoch']
@@ -259,19 +259,19 @@ class TSSM(nj.Module):
         lambda prev, init: jaxutils.switch(is_first, init, prev),
         (prev_state, prev_action),
         (self.initial(len(is_first)), jnp.zeros_like(prev_action)))
-    deter, tokens, valid = self._step(prev_state, prev_action, training=training)
+    deter, tf_context, valid = self._step(prev_state, prev_action, training=training)
     x = jnp.concatenate([deter, embed], -1)
     x = self.get('obs_out', Linear, **self._kw)(x)
     stats = self._stats('obs_stats', x)
     stoch = self.get_dist(stats).sample(seed=nj.rng())
     post = {'deter': deter, 'stoch': stoch,
-            'tokens': tokens, 'valid': valid, **stats}
+            'tf_context': tf_context, 'valid': valid, **stats}
     return cast(post)
 
   def img_step(self, prev_state, prev_action):
-    deter, tokens, valid = self._step(prev_state, prev_action)
+    deter, tf_context, valid = self._step(prev_state, prev_action)
     prior = self._prior(deter, sample=True)
-    return cast({**prior, 'tokens': tokens, 'valid': valid})
+    return cast({**prior, 'tf_context': tf_context, 'valid': valid})
 
   def _step(self, prev_state, prev_action, training=True):
     prev_action = cast(prev_action)
@@ -281,19 +281,19 @@ class TSSM(nj.Module):
     batch_shape = prev_state['deter'].shape[:-1]
     stoch_flat = prev_state['stoch'].reshape((*batch_shape, -1))
     x = jnp.concatenate([stoch_flat, prev_action.reshape((*batch_shape, -1))], -1)
-    new_token = self.get('token_in', Linear, **self._kw)(x)
-    tokens = jnp.concatenate(
-        [prev_state['tokens'][:, 1:], new_token[:, None, :]], axis=1)
+    new_embedding = self.get('projection_layer', Linear, **self._kw)(x)
+    tf_context = jnp.concatenate(
+        [prev_state['tf_context'][:, 1:], new_embedding[:, None, :]], axis=1)
     new_valid = jnp.ones((*batch_shape, 1), prev_state['valid'].dtype)
     valid = jnp.concatenate(
         [prev_state['valid'][:, 1:], new_valid], axis=1)
-    L = self._context
+    L = self._tf_context_length
     causal_mask = jnp.triu(jnp.full((L, L), -jnp.inf), k=1)
     key_pad_mask = valid <= 0.5
-    out = self._transformer(cast(tokens), mask=causal_mask,
+    out = self._transformer(cast(tf_context), mask=causal_mask,
         src_key_padding_mask=key_pad_mask, training=training)
     deter = out[:, -1]
-    return cast(deter), cast(tokens), valid
+    return cast(deter), cast(tf_context), valid
 
   def get_dist(self, stats):
     logit = stats['logit'].astype(f32)
