@@ -48,6 +48,19 @@ def _dropout(x: jnp.ndarray, rate: float, training: bool) -> jnp.ndarray:
   return jnp.where(keep, x / keep_prob, 0.0)
 
 
+def sinusoidal_positional_encoding(
+    seq_len: int, d_model: int,
+) -> jnp.ndarray:
+  """Sinusoidal PE from 'Attention Is All You Need'. Returns (seq_len, d_model)."""
+  pos = jnp.arange(seq_len)[:, None]        # (seq_len, 1)
+  dim = jnp.arange(0, d_model, 2)[None, :]  # (1, d_model//2)
+  angle = pos / jnp.power(10000.0, dim / d_model)
+  pe = jnp.zeros((seq_len, d_model))
+  pe = pe.at[:, 0::2].set(jnp.sin(angle))
+  pe = pe.at[:, 1::2].set(jnp.cos(angle))
+  return pe
+
+
 def scaled_dot_product_attention(
     q: jnp.ndarray,
     k: jnp.ndarray,
@@ -230,7 +243,10 @@ class TransformerEncoder(nj.Module):
 
   def __call__(
       self, src, mask=None, src_key_padding_mask=None, training=False):
-    x = src
+    seq_len = src.shape[0]
+    pe = sinusoidal_positional_encoding(seq_len, self._d_model)
+    x = src + pe[:, None, :]
+    x = _dropout(x, self._dropout, training)
     for i in range(self._num_layers):
       x = self.get(
           f'layer_{i}', TransformerEncoderLayer,
