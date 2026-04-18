@@ -39,7 +39,7 @@ def train_custom_eval(
     score = float(ep['reward'].astype(np.float64).sum())
     sum_abs_reward = float(np.abs(ep['reward']).astype(np.float64).sum())
     logger.add({
-        'real_length': len(ep['is_read_step']) - sum(ep['is_read_step']),
+        'real_length': len(ep['is_read_step']) - sum(ep['is_read_step']) if 'is_read_step' in ep else length,
         'length': length,
         'score': score,
         'sum_abs_reward': sum_abs_reward,

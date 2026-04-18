@@ -147,7 +147,7 @@ class Agent(nj.Module):
       space = spaces.get(key)
       if key in self.act_space and space.discrete:
         value = jax.nn.one_hot(value, int(space.high))
-      elif key == "token":
+      elif key in ("token", "text"):
         value = jax.nn.one_hot(value, self.obs_space[key].high)
       elif len(value.shape) > 3 and value.dtype == jnp.uint8:
         value = jaxutils.cast_to_compute(value) / 255.0
