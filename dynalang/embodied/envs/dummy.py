@@ -58,3 +58,58 @@ class Dummy(embodied.Env):
         is_terminal=is_terminal,
         language_info="test string",
     )
+
+
+class DummySlot(embodied.Env):
+
+  def __init__(self, task, mode="train", num_slots=8, slot_dim=64, length=100):
+    assert task in ('cont', 'disc')
+    self._task = task
+    self._num_slots = num_slots
+    self._slot_dim = slot_dim
+    self._length = length
+    self._step = 0
+    self._done = False
+
+  @property
+  def obs_space(self):
+    return {
+        'slot': embodied.Space(np.float32, (self._num_slots, self._slot_dim)),
+        'step': embodied.Space(np.int32, (), 0, self._length),
+        'reward': embodied.Space(np.float32),
+        'is_first': embodied.Space(bool),
+        'is_last': embodied.Space(bool),
+        'is_terminal': embodied.Space(bool),
+    }
+
+  @property
+  def act_space(self):
+    if self._task == 'cont':
+      space = embodied.Space(np.float32, (6,))
+    else:
+      space = embodied.Space(np.int32, (), 0, 5)
+    return {'action': space, 'reset': embodied.Space(bool)}
+
+  def step(self, action):
+    if action['reset'] or self._done:
+      self._step = 0
+      self._done = False
+      return self._obs(0.0, is_first=True)
+    action = action['action']
+    if self._task == 'cont':
+      pass
+    else:
+      assert action in range(5), action
+    self._step += 1
+    self._done = (self._step >= self._length)
+    return self._obs(1.0, is_last=self._done, is_terminal=self._done)
+
+  def _obs(self, reward, is_first=False, is_last=False, is_terminal=False):
+    return dict(
+        slot=np.random.randn(self._num_slots, self._slot_dim).astype(np.float32),
+        step=self._step,
+        reward=reward,
+        is_first=is_first,
+        is_last=is_last,
+        is_terminal=is_terminal,
+    )

@@ -74,6 +74,10 @@ class Agent(nj.Module):
       latent = self.wm.rssm.obs_step(
           prev_latent, prev_action, embed, obs['is_first'],
           training=(mode != 'eval'))
+    elif self.config.rssm_type == "octssm":
+      latent = self.wm.rssm.obs_step(
+          prev_latent, prev_action, embed, obs['is_first'],
+          training=(mode != 'eval'))
     else:
       latent = self.wm.rssm.obs_step(
           prev_latent, prev_action, embed, obs['is_first'])
@@ -170,17 +174,21 @@ class WorldModel(nj.Module):
       self.rssm = nets.TokenRSSM(**config.token_rssm, name='rssm')
     elif self.config.rssm_type == 'tssm':
       self.rssm = nets.TSSM(**config.tssm, name='rssm')
+    elif self.config.rssm_type == 'octssm':
+      self.rssm = nets.ObjectCentricTSSM(**config.octssm, name='rssm')
     else:
       raise NotImplementedError(self.config.rssm_type)
+    head_dims = 3 if self.config.rssm_type == 'octssm' else 'deter'
     self.heads = {
         'decoder': nets.MultiDecoder(shapes, **config.decoder, name='dec'),
-        'reward': nets.MLP((), **config.reward_head, name='rew'),
-        'cont': nets.MLP((), **config.cont_head, name='cont')}
+        'reward': nets.MLP((), dims=head_dims, **config.reward_head, name='rew'),
+        'cont': nets.MLP((), dims=head_dims, **config.cont_head, name='cont')}
     self.opt = jaxutils.Optimizer(name='model_opt', **config.model_opt)
     scales = self.config.loss_scales.copy()
     image, vector = scales.pop('image'), scales.pop('vector')
     scales.update({k: image for k in self.heads['decoder'].cnn_shapes})
     scales.update({k: vector for k in self.heads['decoder'].mlp_shapes})
+    scales.update({k: vector for k in self.heads['decoder'].slot_shapes})
     self.scales = scales
 
   def initial(self, batch_size):
@@ -422,8 +430,9 @@ class ImagActorCritic(nj.Module):
     self.config = config
     disc = act_space.discrete
     self.grad = config.actor_grad_disc if disc else config.actor_grad_cont
+    actor_dims = 3 if config.rssm_type == 'octssm' else 'deter'
     self.actor = nets.MLP(
-        name='actor', dims='deter', shape=act_space.shape, **config.actor,
+        name='actor', dims=actor_dims, shape=act_space.shape, **config.actor,
         dist=config.actor_dist_disc if disc else config.actor_dist_cont)
     self.retnorms = {
         k: jaxutils.Moments(**config.retnorm, name=f'retnorm_{k}')
@@ -497,8 +506,9 @@ class VFunction(nj.Module):
   def __init__(self, rewfn, config):
     self.rewfn = rewfn
     self.config = config
-    self.net = nets.MLP((), name='net', dims='deter', **self.config.critic)
-    self.slow = nets.MLP((), name='slow', dims='deter', **self.config.critic)
+    critic_dims = 3 if config.rssm_type == 'octssm' else 'deter'
+    self.net = nets.MLP((), name='net', dims=critic_dims, **self.config.critic)
+    self.slow = nets.MLP((), name='slow', dims=critic_dims, **self.config.critic)
     self.updater = jaxutils.SlowUpdater(
         self.net, self.slow,
         self.config.slow_critic_fraction,

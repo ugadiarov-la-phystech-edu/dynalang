@@ -66,6 +66,8 @@ def scaled_dot_product_attention(
   bool_mask: Optional[jnp.ndarray] = None
   if mask is not None:
     bool_mask = jnp.isfinite(mask)
+    if bool_mask.ndim == 3:
+      bool_mask = bool_mask[:, None, :, :]
   if key_padding_mask is not None:
     kpm = ~key_padding_mask[:, None, None, :]  # (B, 1, 1, Tk)
     bool_mask = kpm if bool_mask is None else (bool_mask & kpm)
@@ -329,3 +331,122 @@ class Transformer(nj.Module):
   def generate_square_subsequent_mask(sz: int) -> jnp.ndarray:
     """Causal additive mask of shape (sz, sz); upper-triangle = -inf."""
     return jnp.triu(jnp.full((sz, sz), -jnp.inf), k=1)
+
+
+class ObjectCentricDynamicsLayer(nj.Module):
+  """One layer of object-centric slot dynamics.
+
+  Args:
+    d_model: Hidden dimensionality (must match slot embedding dim).
+    nhead: Number of attention heads.
+    feedforward_units: Feedforward hidden width inside each sub-layer.
+    dropout: Dropout rate.
+    norm_first: Use pre-layer-norm (True) or post-layer-norm (False).
+  """
+
+  def __init__(
+      self, d_model, nhead, feedforward_units=1024,
+      dropout=0.0, norm_first=True):
+    self._d_model = d_model
+    self._nhead = nhead
+    self._feedforward_units = feedforward_units
+    self._dropout = dropout
+    self._norm_first = norm_first
+
+  def __call__(self, x, causal_mask=None, text_embeds=None, training=False):
+    """
+    Args:
+      x: (B, T, num_slots, d_model) — slot features over the context window.
+      causal_mask: (T, T) additive float mask for temporal self-attention.
+      text_embeds: (B, T, text_dim) — per-step conditioning signal, or None.
+      training: bool.
+
+    Returns:
+      x: (B, T, num_slots, d_model) — updated slot features.
+    """
+    B, T, num_slots, dim = x.shape
+    assert dim == self._d_model, (dim, self._d_model)
+
+    x_bt = x.reshape(B * T, num_slots, dim)
+
+    if text_embeds is not None:
+      text_bt = text_embeds.reshape(B * T, -1)[:, None, :] #(B*T, 1, text_dim)
+      # cross-attention with text conditioning: (B*T, num_slots, dim) attends to (B*T, 1, text_dim) and self-attention across slots
+      x_bt = self.get(
+          'slot_layer', TransformerDecoderLayer,
+          self._d_model, self._nhead, self._feedforward_units,
+          self._dropout, self._norm_first)(
+              x_bt, text_bt, training=training)
+    else:
+      # self-attention across slots
+      x_bt = self.get(
+          'slot_layer', TransformerEncoderLayer,
+          self._d_model, self._nhead, self._feedforward_units,
+          self._dropout, self._norm_first)(
+              x_bt, training=training)
+
+    x = x_bt.reshape(B, T, num_slots, dim)
+
+    x_bs = x.transpose((0, 2, 1, 3)).reshape(B * num_slots, T, dim)
+
+    if text_embeds is not None:
+      text_bs = jnp.repeat(text_embeds[:, None, :, :], num_slots, axis=1).reshape(
+          B * num_slots, T, text_embeds.shape[-1]) #(B*num_slots, T, text_dim)
+      mask_bs = jnp.repeat(causal_mask[None], B * num_slots, axis=0) if causal_mask is not None else None
+      x_bs = self.get(
+          'time_layer', TransformerDecoderLayer,
+          self._d_model, self._nhead, self._feedforward_units,
+          self._dropout, self._norm_first)(
+              x_bs, text_bs, tgt_mask=mask_bs, training=training)
+    else:
+      mask_bs = jnp.repeat(causal_mask[None], B * num_slots, axis=0) if causal_mask is not None else None
+      x_bs = self.get(
+          'time_layer', TransformerEncoderLayer,
+          self._d_model, self._nhead, self._feedforward_units,
+          self._dropout, self._norm_first)(
+              x_bs, src_mask=mask_bs, training=training)
+
+    x = x_bs.reshape(B, num_slots, T, dim).transpose((0, 2, 1, 3)) #back to (B, T, num_slots, dim)
+    return x
+
+
+class ObjectCentricDynamicsTransformer(nj.Module):
+
+  def __init__(
+      self, num_layers, d_model, nhead, feedforward_units=1024,
+      dropout=0.0, norm_first=True, norm=True):
+    self._num_layers = num_layers
+    self._d_model = d_model
+    self._nhead = nhead
+    self._feedforward_units = feedforward_units
+    self._dropout = dropout
+    self._norm_first = norm_first
+    self._norm = norm
+
+  def __call__(self, x, causal_mask=None, text_embeds=None, training=False):
+    """
+    Args:
+      x: (B, T, num_slots, d_model)
+      causal_mask: (T, T) additive float causal mask, or None.
+      text_embeds: (B, T, text_dim), or None.
+      training: bool.
+
+    Returns:
+      x: (B, T, num_slots, d_model)
+    """
+    T = x.shape[1]
+    pe = sinusoidal_positional_encoding(T, self._d_model)  # (T, d_model)
+    x = x + pe[None, :, None, :]  
+    x = _dropout(x, self._dropout, training)
+
+    for i in range(self._num_layers):
+      x = self.get(
+          f'layer_{i}', ObjectCentricDynamicsLayer,
+          self._d_model, self._nhead, self._feedforward_units,
+          self._dropout, self._norm_first)(
+              x, causal_mask=causal_mask, text_embeds=text_embeds,
+              training=training)
+    if self._norm:
+      x = self.get('norm', Norm, 'layer')(x)
+
+    return x

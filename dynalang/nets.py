@@ -269,7 +269,7 @@ class TSSM(nj.Module):
     return cast(post)
 
   def img_step(self, prev_state, prev_action):
-    deter, tf_context, valid = self._step(prev_state, prev_action)
+    deter, tf_context, valid = self._step(prev_state, prev_action, training=False)
     prior = self._prior(deter, sample=True)
     return cast({**prior, 'tf_context': tf_context, 'valid': valid})
 
@@ -323,6 +323,90 @@ class TSSM(nj.Module):
       probs = (1 - self._unimix) * probs + self._unimix * uniform
       logit = jnp.log(probs)
     return {'logit': logit}
+
+
+class ObjectCentricTSSM(TSSM):
+
+  def __init__(
+      self, num_slots, deter=512, units=512, stoch=32, classes=32,
+      tf_context_length=16, tf_layers=4, tf_heads=8, feedforward_units=1024,
+      dropout=0.0, unroll=False, unimix=0.01, action_clip=1.0,
+      action_as_slot=False, winit='normal', **kw):
+    
+    super().__init__(
+        deter=deter, units=units, stoch=stoch, classes=classes,
+        tf_context_length=tf_context_length, tf_layers=tf_layers,
+        tf_heads=tf_heads, feedforward_units=feedforward_units,
+        dropout=dropout, unroll=unroll, unimix=unimix,
+        action_clip=action_clip, winit=winit, **kw)
+    from .transformer import ObjectCentricDynamicsTransformer
+    self._num_slots = num_slots
+    self._action_as_slot = action_as_slot
+    self._oc_transformer = ObjectCentricDynamicsTransformer(
+        num_layers=tf_layers, d_model=units, nhead=tf_heads,
+        feedforward_units=feedforward_units, dropout=dropout,
+        norm_first=True, norm=True, name='oc_transformer')
+
+  def initial(self, batch_size):
+    state = dict(
+        deter=jnp.zeros([batch_size, self._num_slots, self._deter], f32),
+        logit=jnp.zeros(
+            [batch_size, self._num_slots, self._stoch, self._classes], f32),
+        stoch=jnp.zeros(
+            [batch_size, self._num_slots, self._stoch, self._classes], f32),
+        tf_context=jnp.zeros(
+            [batch_size, self._tf_context_length,
+             self._num_slots, self._units], f32),
+        valid=jnp.zeros([batch_size, self._tf_context_length], f32))
+    init_deter = self.get(
+        'initial', jnp.zeros, state['deter'][0].shape, f32)
+    state['deter'] = jnp.repeat(jnp.tanh(init_deter)[None], batch_size, 0)
+    state['stoch'] = self._prior(cast(state['deter']), sample=True)['stoch']
+    return cast(state)
+
+  def _step(self, prev_state, prev_action, training=True):
+    prev_action = cast(prev_action)
+    if self._action_clip > 0.0:
+      prev_action = prev_action * sg(self._action_clip / jnp.maximum(
+          self._action_clip, jnp.abs(prev_action)))
+    batch_shape = prev_state['deter'].shape[:-2]  
+    stoch_flat = prev_state['stoch'].reshape(
+        (*batch_shape, self._num_slots, -1))  # (B, num_slots, stoch*classes)
+    new_slot_embed = self.get('projection_layer', Linear, **self._kw)(
+        stoch_flat)  # (B, num_slots, units)
+    
+    # Add action as slot if enabled
+    if self._action_as_slot:
+      action_embedding = self.get('actin', Linear, **self._kw)(prev_action)  # (B, units)
+      new_slot_embed = jnp.concatenate(
+          [new_slot_embed, action_embedding[:, None, :]], axis=-2)
+    
+    tf_context = jnp.concatenate(
+        [prev_state['tf_context'][:, 1:], new_slot_embed[:, None, :, :]], axis=1)
+    new_valid = jnp.ones((*batch_shape, 1), prev_state['valid'].dtype)
+    valid = jnp.concatenate(
+      [prev_state['valid'][:, 1:], new_valid], axis=1)
+    L = self._tf_context_length
+    causal_mask = jnp.triu(jnp.full((L, L), -jnp.inf), k=1)
+
+    out = self._oc_transformer(cast(tf_context), causal_mask=causal_mask,
+        text_embeds=None, training=training)
+
+    deter = out[:, -1]  # (B, num_slots, units)
+    if self._action_as_slot:
+      deter = deter[:, :-1]  # drop action slot
+    return cast(deter), cast(tf_context), valid
+
+  def loss(self, post, free=1.0):
+    prior = self._prior(post['deter'], sample=False, post=post)
+    dyn = self.get_dist(sg(post)).kl_divergence(self.get_dist(prior))
+    rep = self.get_dist(post).kl_divergence(self.get_dist(sg(prior)))
+    dyn = dyn.mean(-1)  # (B,)
+    rep = rep.mean(-1)  # (B,)
+    if free:
+      dyn = jnp.maximum(dyn, free)
+      rep = jnp.maximum(rep, free)
+    return {'dyn': dyn, 'rep': rep}, prior
 
 
 class TokenRSSM(nj.Module):
@@ -598,16 +682,18 @@ class MultiEncoder(nj.Module):
     excluded = ('is_first', 'is_last')
     shapes = {k: v for k, v in shapes.items() if (
         k not in excluded and not k.startswith('log_'))}
+    self.slot_shapes = {k: v for k, v in shapes.items() if k == 'slot'}
     self.cnn_shapes = {k: v for k, v in shapes.items() if (
-        len(v) == 3 and re.match(cnn_keys, k))}
+        len(v) == 3 and re.match(cnn_keys, k) and k != 'slot')}
     self.mlp_shapes = {k: v for k, v in shapes.items() if (
-        len(v) in (1, 2) and re.match(mlp_keys, k))}
+        len(v) in (1, 2) and re.match(mlp_keys, k) and k != 'slot')}
     assert not ("token" in self.mlp_shapes and \
                 "token_embed" in self.mlp_shapes), \
       "Probably shouldn't have both token and token_embed, use token$?"
-    self.shapes = {**self.cnn_shapes, **self.mlp_shapes}
+    self.shapes = {**self.cnn_shapes, **self.mlp_shapes, **self.slot_shapes}
     print('Encoder CNN shapes:', self.cnn_shapes)
     print('Encoder MLP shapes:', self.mlp_shapes)
+    print('Encoder Slot shapes:', self.slot_shapes)
     cnn_kw = {**kw, 'minres': minres, 'name': 'cnn'}
     mlp_kw = {**kw, 'symlog_inputs': symlog_inputs, 'name': 'mlp'}
     if cnn == 'resnet':
@@ -625,6 +711,10 @@ class MultiEncoder(nj.Module):
         k: v.reshape((-1,) + v.shape[len(batch_dims):])
         for k, v in data.items()}
     outputs = []
+
+    if 'slot' in data:
+      outputs.append(data['slot'])
+      
     if self.cnn_shapes:
       inputs = jnp.concatenate([data[k] for k in self.cnn_shapes], -1)
       output = self._cnn(inputs)
@@ -632,6 +722,7 @@ class MultiEncoder(nj.Module):
       if zero_cnn:
         output = jnp.zeros_like(output)
       outputs.append(output)
+
     if self.mlp_shapes:
       inputs = [
           data[k][..., None] if len(self.shapes[k]) == 0 else data[k]
@@ -656,15 +747,17 @@ class MultiDecoder(nj.Module):
       outscale=1.0, minres=4, cnn_sigmoid=False, **kw):
     excluded = ('is_first', 'is_last', 'is_terminal', 'reward')
     shapes = {k: v for k, v in shapes.items() if k not in excluded}
+    self.slot_shapes = {k: v for k, v in shapes.items() if k == 'slot'}
     self.cnn_shapes = {
         k: v for k, v in shapes.items()
-        if re.match(cnn_keys, k) and len(v) == 3}
+        if re.match(cnn_keys, k) and len(v) == 3 and k != 'slot'}
     self.mlp_shapes = {
         k: v for k, v in shapes.items()
-        if re.match(mlp_keys, k) and len(v) == 1}
-    self.shapes = {**self.cnn_shapes, **self.mlp_shapes}
+        if re.match(mlp_keys, k) and len(v) == 1 and k != 'slot'}
+    self.shapes = {**self.cnn_shapes, **self.mlp_shapes, **self.slot_shapes}
     print('Decoder CNN shapes:', self.cnn_shapes)
     print('Decoder MLP shapes:', self.mlp_shapes)
+    print('Decoder Slot shapes:', self.slot_shapes)
     cnn_kw = {**kw, 'minres': minres, 'sigmoid': cnn_sigmoid}
     mlp_kw = {**kw, 'dist': vector_dist, 'outscale': outscale, 'bins': bins}
     if self.cnn_shapes:
@@ -688,6 +781,14 @@ class MultiDecoder(nj.Module):
   def __call__(self, inputs, drop_loss_indices=None):
     features = self._inputs(inputs)
     dists = {}
+    
+    if self.slot_shapes:
+      shape = self.slot_shapes['slot']
+      projector = self.get('slot_proj', Linear, shape[-1], act='none')
+      slot_mean = projector(features)
+      dists['slot'] = jaxutils.MSEDist(slot_mean, 2, 'sum')
+      return dists
+    
     if self.cnn_shapes:
       feat = features
       if drop_loss_indices is not None:
@@ -1207,6 +1308,18 @@ class Norm(nj.Module):
 
 
 class Input:
+  """Extract and concatenate specified keys from input dict, handling dimension flattening.
+  
+  Two modes:
+  
+  1. STRING MODE (when dims=None in __init__):
+     - Used in: Decoder (dims='deter')
+     - Example: deter (B,T,slots,D): 4 dims → stoch (B,T,slots,S,C): 5 dims → flatten to (B,T,slots,S*C)
+  
+  2. INTEGER MODE (dims=3 in __init__):
+     - Used in: Heads (reward, cont, critic, actor) with dims=3
+     - Example: deter (B,T,slots,D) + stoch (B,T,slots,S,C) → (B,T,features) 
+  """
 
   def __init__(self, keys=['tensor'], dims=None):
     assert isinstance(keys, (list, tuple)), keys
@@ -1225,13 +1338,37 @@ class Input:
       found = f'{{{", ".join(inputs.keys())}}}'
       raise KeyError(f'Cannot find keys {needs} among inputs {found}.')
     values = [inputs[k] for k in self._keys]
-    dims = len(inputs[self._dims].shape)
+    dtype = values[0].dtype
+    if isinstance(self._dims, int):
+      dims = self._dims
+      min_ndims = min(len(v.shape) for v in values)
+      if min_ndims <= dims:
+        # Flatten mode (batch*time): preserve only first dimension
+        preserve_dims = 1
+      else:
+        # Normal mode (batch, time separate): preserve first (dims-1) dimensions
+        preserve_dims = dims - 1
+    else:
+      # String mode: use reference key shape
+      dims = len(inputs[self._dims].shape)
+      preserve_dims = None
+    
     for i, value in enumerate(values):
-      if len(value.shape) > dims:
-        values[i] = value.reshape(
-            value.shape[:dims - 1] + (np.prod(value.shape[dims - 1:]),))
-    values = [x.astype(inputs[self._dims].dtype) for x in values]
-    return jnp.concatenate(values, -1)
+      if preserve_dims is not None:
+        if len(value.shape) >= preserve_dims + 1:
+          old_shape = value.shape
+          values[i] = value.reshape(
+              value.shape[:preserve_dims] + (np.prod(value.shape[preserve_dims:]),))
+      else:
+        # String mode: flatten if ndim > dims
+        if len(value.shape) > dims:
+          old_shape = value.shape
+          values[i] = value.reshape(
+              value.shape[:dims - 1] + (np.prod(value.shape[dims - 1:]),))
+    
+    values = [x.astype(dtype) for x in values]
+    result = jnp.concatenate(values, -1)
+    return result
 
 
 class Initializer:

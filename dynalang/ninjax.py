@@ -162,7 +162,7 @@ def grad(fun, keys, has_aux=False):
     strs = [x for x in keys if isinstance(x, str)]
     mods = [x for x in keys if isinstance(x, Module)]
     for mod in mods:
-      strs += mod.getm()
+      strs += mod.getm(allow_empty=True)
     x1 = {k: v for k, v in context().items() if k in strs}
     x2 = {k: v for k, v in context().items() if k not in strs}
     (y, (aux, state)), dx = backward(x1, x2, rng(), *args, **kwargs)
