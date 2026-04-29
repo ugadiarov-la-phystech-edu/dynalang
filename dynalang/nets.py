@@ -1082,14 +1082,14 @@ class MLP(nj.Module):
 
   def __init__(
       self, shape, layers, units, inputs=['tensor'], dims=None,
-      symlog_inputs=False, **kw):
+      symlog_inputs=False, slot_agg='concat', **kw):
     assert shape is None or isinstance(shape, (int, tuple, dict)), shape
     if isinstance(shape, int):
       shape = (shape,)
     self._shape = shape
     self._layers = layers
     self._units = units
-    self._inputs = Input(inputs, dims=dims)
+    self._inputs = Input(inputs, dims=dims, slot_agg=slot_agg)
     self._symlog_inputs = symlog_inputs
     distkeys = (
         'dist', 'outscale', 'minstd', 'maxstd', 'outnorm', 'unimix', 'bins')
@@ -1407,13 +1407,17 @@ class Input:
   
   2. INTEGER MODE (dims=3 in __init__):
      - Used in: Heads (reward, cont, critic, actor) with dims=3
-     - Example: deter (B,T,slots,D) + stoch (B,T,slots,S,C) → (B,T,features) 
+     - Example: deter (B,T,slots,D) + stoch (B,T,slots,S,C) → (B,T,features)
+     - slot_agg='concat': flatten slots into features (B,T,slots*features)
+     - slot_agg='mean': average over slots (B,T,features)
   """
 
-  def __init__(self, keys=['tensor'], dims=None):
+  def __init__(self, keys=['tensor'], dims=None, slot_agg='concat'):
     assert isinstance(keys, (list, tuple)), keys
+    assert slot_agg in ('concat', 'mean'), f"slot_agg must be 'concat' or 'mean', got {slot_agg}"
     self._keys = tuple(keys)
     self._dims = dims or self._keys[0]
+    self._slot_agg = slot_agg
 
   def __call__(self, inputs):
     if not isinstance(inputs, dict):
@@ -1454,6 +1458,15 @@ class Input:
       preserve_dims = None
     
     for i, value in enumerate(values):
+      if self._slot_agg == 'mean' and preserve_dims is not None:
+        # Check if we have slots dimension: preserve_dims batch dims + slots + features
+        # Example: (B, T, slots, features) with preserve_dims=2 → shape has 4 dims
+        if len(value.shape) == preserve_dims + 2:
+          # Mean over slots dimension 
+          value = value.mean(axis=preserve_dims)
+          values[i] = value
+          continue  
+      
       if preserve_dims is not None:
         # Integer mode with explicit preserve_dims
         # Use >= because we want to flatten even if shape matches preserve_dims + 1
