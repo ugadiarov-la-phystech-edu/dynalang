@@ -178,11 +178,37 @@ class WorldModel(nj.Module):
       self.rssm = nets.ObjectCentricTSSM(**config.octssm, name='rssm')
     else:
       raise NotImplementedError(self.config.rssm_type)
-    head_dims = 3 if self.config.rssm_type == 'octssm' else 'deter'
+    head_dims = 4 if self.config.rssm_type == 'octssm' else 'deter'
+    head_bdims = 2 if self.config.rssm_type == 'octssm' else None
+ 
+    if self.config.reward_head.typ == 'mlp':
+      mlp_dims = 3 if self.config.rssm_type == 'octssm' else 'deter'
+      reward_head = nets.MLP((), dims=mlp_dims, **self.config.reward_head.mlp, name='rew')
+    elif self.config.reward_head.typ == 'transformer':
+      from .embodied.core.space import Space
+      reward_space = Space(np.float32, ())
+      reward_head = nets.AggregationTransformerHead(
+          reward_space, inputs=['deter', 'stoch'], dims=head_dims, bdims=head_bdims,
+          **self.config.reward_head.transformer, name='rew')
+    else:
+      raise NotImplementedError(f'reward_head.typ: {self.config.reward_head.typ}')
+    
+    if self.config.cont_head.typ == 'mlp':
+      mlp_dims = 3 if self.config.rssm_type == 'octssm' else 'deter'
+      cont_head = nets.MLP((), dims=mlp_dims, **self.config.cont_head.mlp, name='cont')
+    elif self.config.cont_head.typ == 'transformer':
+      from .embodied.core.space import Space
+      cont_space = Space(np.float32, ())
+      cont_head = nets.AggregationTransformerHead(
+          cont_space, inputs=['deter', 'stoch'], dims=head_dims, bdims=head_bdims,
+          **self.config.cont_head.transformer, name='cont')
+    else:
+      raise NotImplementedError(f'cont_head.typ: {self.config.cont_head.typ}')
+    
     self.heads = {
         'decoder': nets.MultiDecoder(shapes, **config.decoder, name='dec'),
-        'reward': nets.MLP((), dims=head_dims, **config.reward_head, name='rew'),
-        'cont': nets.MLP((), dims=head_dims, **config.cont_head, name='cont')}
+        'reward': reward_head,
+        'cont': cont_head}
     self.opt = jaxutils.Optimizer(name='model_opt', **config.model_opt)
     scales = self.config.loss_scales.copy()
     image, vector = scales.pop('image'), scales.pop('vector')
@@ -430,10 +456,25 @@ class ImagActorCritic(nj.Module):
     self.config = config
     disc = act_space.discrete
     self.grad = config.actor_grad_disc if disc else config.actor_grad_cont
-    actor_dims = 3 if config.rssm_type == 'octssm' else 'deter'
-    self.actor = nets.MLP(
-        name='actor', dims=actor_dims, shape=act_space.shape, **config.actor,
-        dist=config.actor_dist_disc if disc else config.actor_dist_cont)
+    actor_dims = 4 if config.rssm_type == 'octssm' else 'deter'
+    actor_bdims = None  # Auto-detect based on input shape
+    
+    if config.actor.typ == 'mlp':
+      mlp_dims = 3 if config.rssm_type == 'octssm' else 'deter'
+      self.actor = nets.MLP(
+          name='actor', dims=mlp_dims, shape=act_space.shape, **config.actor.mlp,
+          dist=config.actor_dist_disc if disc else config.actor_dist_cont)
+    elif config.actor.typ == 'transformer':
+      from .embodied.core.space import Space
+      actor_space = Space(np.float32, act_space.shape)
+      dist_type = config.actor_dist_disc if disc else config.actor_dist_cont
+      output = dist_type
+      self.actor = nets.AggregationTransformerHead(
+          actor_space, output, inputs=['deter', 'stoch'], dims=actor_dims, bdims=actor_bdims,
+          **config.actor.transformer, name='actor')
+    else:
+      raise NotImplementedError(f'actor.typ: {config.actor.typ}')
+    
     self.retnorms = {
         k: jaxutils.Moments(**config.retnorm, name=f'retnorm_{k}')
         for k in critics}
@@ -506,9 +547,25 @@ class VFunction(nj.Module):
   def __init__(self, rewfn, config):
     self.rewfn = rewfn
     self.config = config
-    critic_dims = 3 if config.rssm_type == 'octssm' else 'deter'
-    self.net = nets.MLP((), name='net', dims=critic_dims, **self.config.critic)
-    self.slow = nets.MLP((), name='slow', dims=critic_dims, **self.config.critic)
+    critic_dims = 4 if config.rssm_type == 'octssm' else 'deter'
+    critic_bdims = None  # Auto-detect based on input shape
+
+    if config.critic.typ == 'mlp':
+      mlp_dims = 3 if config.rssm_type == 'octssm' else 'deter'
+      self.net = nets.MLP((), name='net', dims=mlp_dims, **config.critic.mlp)
+      self.slow = nets.MLP((), name='slow', dims=mlp_dims, **config.critic.mlp)
+    elif config.critic.typ == 'transformer':
+      from .embodied.core.space import Space
+      critic_space = Space(np.float32, ())
+      self.net = nets.AggregationTransformerHead(
+          critic_space, inputs=['deter', 'stoch'], dims=critic_dims, bdims=critic_bdims,
+          **config.critic.transformer, name='net')
+      self.slow = nets.AggregationTransformerHead(
+          critic_space, inputs=['deter', 'stoch'], dims=critic_dims, bdims=critic_bdims,
+          **config.critic.transformer, name='slow')
+    else:
+      raise NotImplementedError(f'critic.typ: {config.critic.typ}')
+    
     self.updater = jaxutils.SlowUpdater(
         self.net, self.slow,
         self.config.slow_critic_fraction,

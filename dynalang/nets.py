@@ -989,6 +989,95 @@ class ImageDecoderStyle(nj.Module):
     return x
 
 
+class AggregationTransformerHead(nj.Module):
+  """
+  Transformer-based head that aggregates over sequence dimension.
+  """
+
+  def __init__(
+      self, space, output='mse', layers=2, units=512, heads=8, ffup=4,
+      act='silu', norm='layer', dropout=0.1,
+      inputs=['tensor'], dims=None, bdims=None,
+      aggregation_method='last',
+      **kw):
+    from .transformer import TransformerEncoder
+    
+    self._space = space
+    self._shape = space.shape
+    self._output = output
+    self._layers = layers
+    self._units = units
+    self._heads = heads
+    self._ffup = ffup
+    self._dropout = dropout
+    self._aggregation_method = aggregation_method
+    self._bdims = bdims 
+    
+    self._inputs = Input(inputs, dims=dims)
+    
+    feedforward_units = units * ffup
+    self._transformer = TransformerEncoder(
+        num_layers=layers,
+        d_model=units,
+        nhead=heads,
+        feedforward_units=feedforward_units,
+        dropout=dropout,
+        norm_first=True,
+        norm=True,
+        name='transformer')
+    
+    self._dist_kw = {k: v for k, v in kw.items() if k in (
+        'outscale', 'outnorm', 'minstd', 'maxstd', 'unimix', 'bins')}
+    self._dist_kw['dist'] = output
+
+  def __call__(self, inputs, training=False, bdims=None):
+    feat = self._inputs(inputs)
+    
+    orig_shape = feat.shape
+
+    if self._bdims is not None:
+      bdims = self._bdims
+    elif len(orig_shape) == 4:
+      # [horizon, batch, slots, features] or [B, T, slots, features]
+      bdims = 2
+    elif len(orig_shape) == 3:
+      # [batch, slots, features] or [horizon, batch, features] 
+      bdims = 1
+    elif len(orig_shape) == 2:
+      # [batch, features]
+      bdims = 1
+    else:
+      raise ValueError(f'Unexpected feat shape: {orig_shape}')
+    
+    bshape = feat.shape[:bdims]
+    
+    x = feat.reshape((int(np.prod(bshape)), *feat.shape[bdims:]))
+
+    if len(x.shape) == 2:
+      # No sequence dimension, add dummy: [B*T, features] → [B*T, 1, features]
+      x = x[:, None, :]
+    
+    if x.shape[-1] != self._units:
+      x = self.get('in_proj', Linear, self._units)(x)
+    
+    x = jaxutils.cast_to_compute(x)
+    
+    x = self._transformer(x, mask=None, src_key_padding_mask=None, training=training)
+    
+    if self._aggregation_method == 'mean':
+      x = x.mean(axis=1)  # [B*T, units]
+    elif self._aggregation_method == 'last':
+      x = x[:, -1]  # [B*T, units]
+    elif self._aggregation_method == 'cls':
+      x = x[:, 0]  # [B*T, units]
+    else:
+      raise NotImplementedError(f'aggregation_method: {self._aggregation_method}')
+    
+    x = x.reshape((*bshape, x.shape[-1])) #[B*T, units] → [B, T, units]
+    dist = self.get('dist', Dist, self._shape, **self._dist_kw)(x)
+    return dist
+
+
 class MLP(nj.Module):
 
   def __init__(
@@ -1341,8 +1430,19 @@ class Input:
     dtype = values[0].dtype
     if isinstance(self._dims, int):
       dims = self._dims
+      # Detect flatten mode: if min ndims < dims, batch and time are already merged
       min_ndims = min(len(v.shape) for v in values)
-      if min_ndims <= dims:
+      
+      # For octssm with slots:
+      # dims=3: flatten slots into features → preserve (min_ndims - 2) batch dims
+      # dims=4: keep slots separate → preserve (min_ndims - 1) batch+time+slots dims
+      # General formula: preserve_dims = min_ndims + dims - 5
+      if dims >= 3:
+        preserve_dims = min_ndims + dims - 5
+        # dims=3, min_ndims=3 (single state): preserve 1 → (B, slots*feat)
+        # dims=3, min_ndims=4 (trajectory): preserve 2 → (T, B, slots*feat)
+        # dims=4, min_ndims=4 (trajectory): preserve 3 → (T, B, slots, feat)
+      elif min_ndims < dims:
         # Flatten mode (batch*time): preserve only first dimension
         preserve_dims = 1
       else:
@@ -1355,14 +1455,14 @@ class Input:
     
     for i, value in enumerate(values):
       if preserve_dims is not None:
+        # Integer mode with explicit preserve_dims
+        # Use >= because we want to flatten even if shape matches preserve_dims + 1
         if len(value.shape) >= preserve_dims + 1:
-          old_shape = value.shape
           values[i] = value.reshape(
               value.shape[:preserve_dims] + (np.prod(value.shape[preserve_dims:]),))
       else:
         # String mode: flatten if ndim > dims
         if len(value.shape) > dims:
-          old_shape = value.shape
           values[i] = value.reshape(
               value.shape[:dims - 1] + (np.prod(value.shape[dims - 1:]),))
     
