@@ -66,18 +66,24 @@ class Agent(nj.Module):
     self.config.jax.jit and print('Tracing policy function.')
     obs = self.preprocess(obs)
     (prev_latent, prev_action), task_state, expl_state = state
-    embed = self.wm.encoder(obs)
+    encoder_out = self.wm.encoder(obs)
+    embed = encoder_out['slot'] if 'slot' in encoder_out else encoder_out['image']
+    text_embed = encoder_out.get('text', None)
+
+    if self.config.rssm_type not in ('tssm', 'octssm') and text_embed is not None:
+      embed = jnp.concatenate([embed, text_embed], axis=-1)
+      text_embed = None
     if self.config.rssm_type == "token":
       latent = self.wm.rssm.obs_step(
           prev_latent, prev_action, embed, obs["token"], obs['is_first'])
     elif self.config.rssm_type == "tssm":
       latent = self.wm.rssm.obs_step(
           prev_latent, prev_action, embed, obs['is_first'],
-          training=(mode != 'eval'))
+          training=(mode != 'eval'), text_embed=text_embed)
     elif self.config.rssm_type == "octssm":
       latent = self.wm.rssm.obs_step(
           prev_latent, prev_action, embed, obs['is_first'],
-          training=(mode != 'eval'))
+          training=(mode != 'eval'), text_embed=text_embed)
     else:
       latent = self.wm.rssm.obs_step(
           prev_latent, prev_action, embed, obs['is_first'])
@@ -178,6 +184,17 @@ class WorldModel(nj.Module):
       self.rssm = nets.ObjectCentricTSSM(**config.octssm, name='rssm')
     else:
       raise NotImplementedError(self.config.rssm_type)
+    
+    if self.config.rssm_type in ('tssm', 'octssm'):
+      rssm_config = config.tssm if self.config.rssm_type == 'tssm' else config.octssm
+      if rssm_config.get('text_mode', 'none') != 'none':
+        encoder_mlp_units = config.encoder['mlp_units']
+        tssm_text_dim = rssm_config['text_dim']
+        assert encoder_mlp_units == tssm_text_dim, (
+            f"Text dimension mismatch: encoder.mlp_units ({encoder_mlp_units}) "
+            f"must equal {self.config.rssm_type}.text_dim ({tssm_text_dim}) "
+            f"when using text_mode != 'none'")
+    
     head_dims = 4 if self.config.rssm_type == 'octssm' else 'deter'
     head_bdims = 2 if self.config.rssm_type == 'octssm' else None
  
@@ -246,16 +263,27 @@ class WorldModel(nj.Module):
     return state, outs, metrics
 
   def loss(self, data, state):
-    embed = self.encoder(
+    encoder_out = self.encoder(
       data,
       zero_mlp=self.config.zero_mlp,
       zero_cnn=self.config.zero_cnn)
+    
+    embed = encoder_out['slot'] if 'slot' in encoder_out else encoder_out['image']
+    text_embed = encoder_out.get('text', None)
+
+    if self.config.rssm_type not in ('tssm', 'octssm') and text_embed is not None:
+      embed = jnp.concatenate([embed, text_embed], axis=-1)
+      text_embed = None
+  
     prev_latent, prev_action = state
     prev_actions = jnp.concatenate([
         prev_action[:, None], data['action'][:, :-1]], 1)
     if self.config.rssm_type == "token":
       post = self.rssm.observe(
           prev_actions, embed, data["token"], data['is_first'], prev_latent)
+    elif self.config.rssm_type == "tssm":
+      post = self.rssm.observe(
+          embed, prev_actions, data['is_first'], prev_latent, text_embeds=text_embed)
     else:
       post = self.rssm.observe(
           embed, prev_actions, data['is_first'], prev_latent)
@@ -349,15 +377,31 @@ class WorldModel(nj.Module):
     state = self.initial(len(data['is_first']))
     report = {}
     report.update(self.loss(data, state)[-1][-1])
+    
+    encoder_out = self.encoder(data)
+    embed = encoder_out['slot'] if 'slot' in encoder_out else encoder_out['image']
+    text_embed = encoder_out.get('text', None)
+
+    if self.config.rssm_type not in ('tssm', 'octssm') and text_embed is not None:
+      embed = jnp.concatenate([embed, text_embed], axis=-1)
+      text_embed = None
+    
     if self.config.rssm_type == "token":
       context = self.rssm.observe(
           data['action'][:6, :5],
-          self.encoder(data)[:6, :5],
+          embed[:6, :5],
           data['token'][:6, :5],
           data['is_first'][:6, :5])
+    elif self.config.rssm_type == "tssm":
+      context = self.rssm.observe(
+          embed[:6, :5], 
+          data['action'][:6, :5],
+          data['is_first'][:6, :5], 
+          text_embeds=text_embed[:6, :5] if text_embed is not None else None)
     else:
       context = self.rssm.observe(
-          self.encoder(data)[:6, :5], data['action'][:6, :5],
+          embed[:6, :5], 
+          data['action'][:6, :5],
           data['is_first'][:6, :5])
     # context:
     # - deter (batch, prefix_len, rssm.deter)
@@ -382,8 +426,19 @@ class WorldModel(nj.Module):
       prev_actions = jnp.concatenate([
         jnp.zeros_like(data["action"][:, 0:1]), # dummy first action
         data["action"][:, :-1]], 1)
-      context = self.rssm.observe(
-        self.encoder(data), prev_actions, data["is_first"])
+      encoder_out = self.encoder(data)
+      if isinstance(encoder_out, dict):
+        embed = encoder_out['slot'] if 'slot' in encoder_out else encoder_out['image']
+        text_embed = encoder_out.get('text', None)
+      else:
+        embed = encoder_out
+        text_embed = None
+      if self.config.rssm_type == "tssm":
+        context = self.rssm.observe(
+          embed, prev_actions, data["is_first"], text_embeds=text_embed)
+      else:
+        context = self.rssm.observe(
+          embed, prev_actions, data["is_first"])
       # a_t is action out of o_t, cut off last timestep since we don't have truth
       context = {k: v[:, :-1].reshape((-1, *v.shape[2:])) for k, v in context.items()}
       next_ac = data["action"][:, :-1].reshape((-1, 1, *data["action"].shape[2:]))
@@ -408,10 +463,19 @@ class WorldModel(nj.Module):
     prev_actions = jnp.concatenate([
       jnp.zeros_like(data["action"][:, 0:1]), # dummy first action
       data["action"][:, :-1]], 1)
+    encoder_out = self.encoder(data)
+    embed = encoder_out['slot'] if 'slot' in encoder_out else encoder_out['image']
+    text_embed = encoder_out.get('text', None)
+
+    if self.config.rssm_type not in ('tssm', 'octssm') and text_embed is not None:
+      embed = jnp.concatenate([embed, text_embed], axis=-1)
+      text_embed = None
+    
     context = self.rssm.observe(
-      embed=self.encoder(data)[:, :num_obs],
-      action=prev_actions[:, :num_obs],#data["action"][:, :num_obs],
-      is_first=data["is_first"][:, :num_obs])
+      embed=embed[:, :num_obs],
+      action=prev_actions[:, :num_obs],
+      is_first=data["is_first"][:, :num_obs],
+      text_embeds=text_embed[:, :num_obs] if text_embed is not None else None)
     start = {k: v[:, -1] for k, v in context.items()}
     recon = self.heads['decoder'](context)
     end = num_obs + num_imagine

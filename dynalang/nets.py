@@ -208,9 +208,12 @@ class TSSM(nj.Module):
       self, deter=512, units=512, stoch=32, classes=32, tf_context_length=16,
       tf_layers=4, tf_heads=8, feedforward_units=1024, dropout=0.0,
       unroll=False, unimix=0.01, action_clip=1.0,
+      text_mode='none', text_dim=768, text_forget_mode='freeze',
       winit='normal', **kw):
     assert deter == units, (deter, units)
-    from .transformer import TransformerEncoder
+    assert text_mode in ('none', 'cross_attn', 'concat'), f"Invalid text_mode: {text_mode}"
+    assert text_forget_mode in ('freeze', 'decay', 'zero'), f"Invalid text_forget_mode: {text_forget_mode}"
+    from .transformer import TransformerEncoder, TransformerDecoder
     self._deter = deter
     self._units = units
     self._stoch = stoch
@@ -219,11 +222,28 @@ class TSSM(nj.Module):
     self._unroll = unroll
     self._unimix = unimix
     self._action_clip = action_clip
-    self._kw = {'units': units, 'winit': winit, **kw}
-    self._transformer = TransformerEncoder(
-        num_layers=tf_layers, d_model=units, nhead=tf_heads,
-        feedforward_units=feedforward_units, dropout=dropout,
-        norm_first=True, norm=True, name='transformer')
+    self._text_mode = text_mode
+    self._text_dim = text_dim if text_mode != 'none' else 0
+    self._text_forget_mode = text_forget_mode
+
+    filtered_kw = {k: v for k, v in kw.items() if k not in ('text_mode', 'text_dim', 'text_forget_mode')}
+    self._kw = {'units': units, 'winit': winit, **filtered_kw}
+    
+    if text_mode == 'cross_attn':
+      self._decoder = TransformerDecoder(
+          num_layers=tf_layers, d_model=units, nhead=tf_heads,
+          feedforward_units=feedforward_units, dropout=dropout,
+          norm_first=True, norm=True, name='decoder')
+    elif text_mode == 'concat':
+      self._encoder = TransformerEncoder(
+          num_layers=tf_layers, d_model=2*units, nhead=tf_heads,
+          feedforward_units=feedforward_units, dropout=dropout,
+          norm_first=True, norm=True, name='encoder')
+    else: 
+      self._encoder = TransformerEncoder(
+          num_layers=tf_layers, d_model=units, nhead=tf_heads,
+          feedforward_units=feedforward_units, dropout=dropout,
+          norm_first=True, norm=True, name='encoder')
 
   def initial(self, batch_size):
     state = dict(
@@ -232,48 +252,75 @@ class TSSM(nj.Module):
         stoch=jnp.zeros([batch_size, self._stoch, self._classes], f32),
         tf_context=jnp.zeros([batch_size, self._tf_context_length, self._units], f32),
         valid=jnp.zeros([batch_size, self._tf_context_length], f32))
+  
+    if self._text_mode != 'none':
+      state['text_context'] = jnp.zeros([batch_size, self._tf_context_length, self._units], f32)
+      state['text_valid'] = jnp.zeros([batch_size, self._tf_context_length], f32)
+    
     deter = self.get('initial', jnp.zeros, state['deter'][0].shape, f32)
     state['deter'] = jnp.repeat(jnp.tanh(deter)[None], batch_size, 0)
     state['stoch'] = self._prior(cast(state['deter']), sample=True)['stoch']
     return cast(state)
 
-  def observe(self, embed, action, is_first, state=None):
+  def observe(self, embed, action, is_first, state=None, text_embeds=None):
     state = state or self.initial(action.shape[0])
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
     step = lambda prev, inputs: self.obs_step(prev, *inputs)
-    inputs = swap(action), swap(embed), swap(is_first)
+    
+    if self._text_mode == 'none':
+      inputs = swap(action), swap(embed), swap(is_first)
+    else:
+      if text_embeds is not None:
+        text_embeds = swap(text_embeds)
+      else:
+        B, T = action.shape[:2]
+        text_embeds = jnp.zeros((T, B, self._text_dim), action.dtype)
+      inputs = swap(action), swap(embed), swap(is_first), text_embeds
     post = jaxutils.scan(step, inputs, state, self._unroll)
     post = {k: swap(v) for k, v in post.items()}
     return post
 
-  def imagine(self, action, state=None):
+  def imagine(self, action, state=None, text_embeds=None):
     state = state or self.initial(action.shape[0])
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
     action = swap(action)
-    prior = jaxutils.scan(self.img_step, action, state, self._unroll)
+    
+    if self._text_mode != 'none':
+      if text_embeds is not None:
+        text_embeds = swap(text_embeds)
+      else:
+        T, B = action.shape[:2]
+        text_embeds = jnp.zeros((T, B, self._text_dim), action.dtype)
+      inputs = (action, text_embeds)
+      step = lambda prev, inp: self.img_step(prev, *inp)
+    else:
+      inputs = action
+      step = self.img_step
+    
+    prior = jaxutils.scan(step, inputs, state, self._unroll)
     prior = {k: swap(v) for k, v in prior.items()}
     return prior
 
-  def obs_step(self, prev_state, prev_action, embed, is_first, training=True):
+  def obs_step(self, prev_state, prev_action, embed, is_first, text_embed=None, training=True):
     prev_state, prev_action = tree_map(
         lambda prev, init: jaxutils.switch(is_first, init, prev),
         (prev_state, prev_action),
         (self.initial(len(is_first)), jnp.zeros_like(prev_action)))
-    deter, tf_context, valid = self._step(prev_state, prev_action, training=training)
+    next_state = self._step(prev_state, prev_action, text_embed=text_embed, training=training)
+    deter = next_state['deter']
     x = jnp.concatenate([deter, embed], -1)
     x = self.get('obs_out', Linear, **self._kw)(x)
     stats = self._stats('obs_stats', x)
     stoch = self.get_dist(stats).sample(seed=nj.rng())
-    post = {'deter': deter, 'stoch': stoch,
-            'tf_context': tf_context, 'valid': valid, **stats}
+    post = {'stoch': stoch, **next_state, **stats}
     return cast(post)
+  
+  def img_step(self, prev_state, prev_action, text_embed=None):
+    next_state = self._step(prev_state, prev_action, text_embed=text_embed, training=False)
+    prior = self._prior(next_state['deter'], sample=True)
+    return cast({**prior, **next_state})
 
-  def img_step(self, prev_state, prev_action):
-    deter, tf_context, valid = self._step(prev_state, prev_action, training=False)
-    prior = self._prior(deter, sample=True)
-    return cast({**prior, 'tf_context': tf_context, 'valid': valid})
-
-  def _step(self, prev_state, prev_action, training=True):
+  def _step(self, prev_state, prev_action, text_embed=None, training=True):
     prev_action = cast(prev_action)
     if self._action_clip > 0.0:
       prev_action *= sg(self._action_clip / jnp.maximum(
@@ -287,13 +334,73 @@ class TSSM(nj.Module):
     new_valid = jnp.ones((*batch_shape, 1), prev_state['valid'].dtype)
     valid = jnp.concatenate(
         [prev_state['valid'][:, 1:], new_valid], axis=1)
+
+    if self._text_mode != 'none':
+      if training:
+        # Project text_embed and add to context window
+        text_proj = self.get('text_proj', Linear, self._units, winit=self._kw.get('winit', 'normal'))(text_embed)
+        text_context = jnp.concatenate(
+            [prev_state['text_context'][:, 1:], text_proj[:, None, :]], axis=1)
+        text_valid = jnp.concatenate(
+            [prev_state['text_valid'][:, 1:], jnp.ones((*batch_shape, 1), f32)], axis=1)
+      else:
+        if text_embed is None:
+          text_embed = jnp.zeros((*batch_shape, self._text_dim), f32)
+    
+        if self._text_forget_mode == 'freeze':
+          text_context = prev_state['text_context']
+          text_valid = prev_state['text_valid']
+        elif self._text_forget_mode == 'decay':
+          zero_proj = jnp.zeros((*batch_shape, self._units), f32)
+          text_context = jnp.concatenate(
+              [prev_state['text_context'][:, 1:], zero_proj[:, None, :]], axis=1)
+          text_valid = jnp.concatenate(
+              [prev_state['text_valid'][:, 1:], jnp.zeros((*batch_shape, 1), f32)], axis=1)
+        elif self._text_forget_mode == 'zero':
+          text_context = jnp.zeros_like(prev_state['text_context'])
+          text_valid = jnp.zeros_like(prev_state['text_valid'])
+    else:
+      text_context = None
+      text_valid = None
+
     L = self._tf_context_length
     causal_mask = jnp.triu(jnp.full((L, L), -jnp.inf), k=1)
     key_pad_mask = valid <= 0.5
-    out = self._transformer(cast(tf_context), mask=causal_mask,
-        src_key_padding_mask=key_pad_mask, training=training)
+    
+    if self._text_mode == 'cross_attn':
+      text_key_pad_mask = text_valid <= 0.5
+      out = self._decoder(
+          cast(tf_context),
+          cast(text_context),
+          tgt_mask=causal_mask,
+          tgt_key_padding_mask=key_pad_mask,
+          memory_key_padding_mask=text_key_pad_mask,
+          training=training)
+    elif self._text_mode == 'concat':
+      combined = jnp.concatenate([tf_context, text_context], axis=-1)  # (B, L, 2*units)
+      combined_valid = jnp.logical_and(valid > 0.5, text_valid > 0.5)
+      combined_key_pad_mask = combined_valid <= 0.5
+      out = self._encoder(
+          cast(combined),
+          mask=causal_mask,
+          src_key_padding_mask=combined_key_pad_mask,
+          training=training)
+      out = self.get('concat_proj', Linear, self._units)(out)
+    else:
+      out = self._encoder(
+          cast(tf_context),
+          mask=causal_mask,
+          src_key_padding_mask=key_pad_mask,
+          training=training)
+    
     deter = out[:, -1]
-    return cast(deter), cast(tf_context), valid
+    
+    next_state = {'deter': cast(deter), 'tf_context': cast(tf_context), 'valid': valid}
+    if self._text_mode != 'none':
+      next_state['text_context'] = cast(text_context)
+      next_state['text_valid'] = text_valid
+    
+    return next_state
 
   def get_dist(self, stats):
     logit = stats['logit'].astype(f32)
@@ -710,10 +817,10 @@ class MultiEncoder(nj.Module):
     data = {
         k: v.reshape((-1,) + v.shape[len(batch_dims):])
         for k, v in data.items()}
-    outputs = []
+    result = {}
 
     if 'slot' in data:
-      outputs.append(data['slot'])
+      result['slot'] = data['slot'].reshape(batch_dims + data['slot'].shape[1:])
       
     if self.cnn_shapes:
       inputs = jnp.concatenate([data[k] for k in self.cnn_shapes], -1)
@@ -721,7 +828,7 @@ class MultiEncoder(nj.Module):
       output = output.reshape((output.shape[0], -1))
       if zero_cnn:
         output = jnp.zeros_like(output)
-      outputs.append(output)
+      result['image'] = output.reshape(batch_dims + output.shape[1:])
 
     if self.mlp_shapes:
       inputs = [
@@ -732,10 +839,10 @@ class MultiEncoder(nj.Module):
       output = self._mlp(inputs)
       if zero_mlp:
         output = jnp.zeros_like(output)
-      outputs.append(output)
-    outputs = jnp.concatenate(outputs, -1)
-    outputs = outputs.reshape(batch_dims + outputs.shape[1:])
-    return outputs
+      result['text'] = output.reshape(batch_dims + output.shape[1:])
+
+    return result
+
 
 
 class MultiDecoder(nj.Module):

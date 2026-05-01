@@ -15,6 +15,7 @@ CONVERSION = {
     np.floating: np.float32,
     np.signedinteger: np.int64,
     np.uint8: np.uint8,
+    np.uint32: np.uint32,
     bool: bool,
     np.unicode_: np.dtype("object"),
     str: str,
