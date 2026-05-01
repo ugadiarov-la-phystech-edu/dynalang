@@ -194,6 +194,10 @@ class WorldModel(nj.Module):
             f"Text dimension mismatch: encoder.mlp_units ({encoder_mlp_units}) "
             f"must equal {self.config.rssm_type}.text_dim ({tssm_text_dim}) "
             f"when using text_mode != 'none'")
+        if self.config.rssm_type == 'octssm':
+          assert rssm_config.get('text_mode') != 'concat', (
+              "ObjectCentricTSSM doesn't support text_mode='concat'. "
+              "Use 'cross_attn' instead.")
     
     head_dims = 4 if self.config.rssm_type == 'octssm' else 'deter'
     head_bdims = 2 if self.config.rssm_type == 'octssm' else None

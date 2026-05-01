@@ -106,7 +106,7 @@ class Dummy(embodied.Env):
 
 class DummySlot(embodied.Env):
 
-  def __init__(self, task, mode="train", num_slots=8, slot_dim=64, length=100):
+  def __init__(self, task, mode="train", num_slots=8, slot_dim=64, length=100, with_text=False):
     assert task in ('cont', 'disc')
     self._task = task
     self._num_slots = num_slots
@@ -114,10 +114,14 @@ class DummySlot(embodied.Env):
     self._length = length
     self._step = 0
     self._done = False
+    self._with_text = with_text
+    if self._with_text:
+      self._text_dim = 512
+      self._text_embed = np.random.randn(self._text_dim).astype(np.float32)
 
   @property
   def obs_space(self):
-    return {
+    spaces = {
         'slot': embodied.Space(np.float32, (self._num_slots, self._slot_dim)),
         'step': embodied.Space(np.int32, (), 0, self._length),
         'reward': embodied.Space(np.float32),
@@ -125,6 +129,9 @@ class DummySlot(embodied.Env):
         'is_last': embodied.Space(bool),
         'is_terminal': embodied.Space(bool),
     }
+    if self._with_text:
+      spaces['text_embed'] = embodied.Space(np.float32, (self._text_dim,))
+    return spaces
 
   @property
   def act_space(self):
@@ -149,7 +156,7 @@ class DummySlot(embodied.Env):
     return self._obs(1.0, is_last=self._done, is_terminal=self._done)
 
   def _obs(self, reward, is_first=False, is_last=False, is_terminal=False):
-    return dict(
+    obs = dict(
         slot=np.random.randn(self._num_slots, self._slot_dim).astype(np.float32),
         step=self._step,
         reward=reward,
@@ -157,3 +164,6 @@ class DummySlot(embodied.Env):
         is_last=is_last,
         is_terminal=is_terminal,
     )
+    if self._with_text:
+      obs['text_embed'] = self._text_embed
+    return obs

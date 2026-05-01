@@ -346,19 +346,22 @@ class ObjectCentricDynamicsLayer(nj.Module):
 
   def __init__(
       self, d_model, nhead, feedforward_units=1024,
-      dropout=0.0, norm_first=True):
+      dropout=0.0, norm_first=True, use_text=False):
     self._d_model = d_model
     self._nhead = nhead
     self._feedforward_units = feedforward_units
     self._dropout = dropout
     self._norm_first = norm_first
+    self._use_text = use_text
 
-  def __call__(self, x, causal_mask=None, text_embeds=None, training=False):
+  def __call__(self, x, causal_mask=None, text_embeds=None, text_key_padding_mask=None, text_mask=None, training=False):
     """
     Args:
       x: (B, T, num_slots, d_model) — slot features over the context window.
       causal_mask: (T, T) additive float mask for temporal self-attention.
       text_embeds: (B, T, text_dim) — per-step conditioning signal, or None.
+      text_key_padding_mask: (B, T) bool mask for text padding, or None.
+      text_mask: (T, T) additive float causal mask for text, or None.
       training: bool.
 
     Returns:
@@ -369,14 +372,17 @@ class ObjectCentricDynamicsLayer(nj.Module):
 
     x_bt = x.reshape(B * T, num_slots, dim)
 
-    if text_embeds is not None:
+    if self._use_text:
+      assert text_embeds is not None, "Text conditioning enabled but text_embeds is None"
       text_bt = text_embeds.reshape(B * T, -1)[:, None, :] #(B*T, 1, text_dim)
+      text_mask_bt = text_key_padding_mask.reshape(B * T, 1) if text_key_padding_mask is not None else None # (B*T, 1)
+      
       # cross-attention with text conditioning: (B*T, num_slots, dim) attends to (B*T, 1, text_dim) and self-attention across slots
       x_bt = self.get(
           'slot_layer', TransformerDecoderLayer,
           self._d_model, self._nhead, self._feedforward_units,
           self._dropout, self._norm_first)(
-              x_bt, text_bt, training=training)
+              x_bt, text_bt, memory_key_padding_mask=text_mask_bt, training=training)
     else:
       # self-attention across slots
       x_bt = self.get(
@@ -389,15 +395,22 @@ class ObjectCentricDynamicsLayer(nj.Module):
 
     x_bs = x.transpose((0, 2, 1, 3)).reshape(B * num_slots, T, dim)
 
-    if text_embeds is not None:
+    if self._use_text:
+      assert text_embeds is not None, "Text conditioning enabled but text_embeds is None"
       text_bs = jnp.repeat(text_embeds[:, None, :, :], num_slots, axis=1).reshape(
-          B * num_slots, T, text_embeds.shape[-1]) #(B*num_slots, T, text_dim)
+          B * num_slots, T, text_embeds.shape[-1])  #(B*num_slots, T, text_dim)
+      text_mask_bs_padding = jnp.repeat(text_key_padding_mask[:, None, :], num_slots, axis=1).reshape(
+            B * num_slots, T) if text_key_padding_mask is not None else None  # (B*num_slots, T)
       mask_bs = jnp.repeat(causal_mask[None], B * num_slots, axis=0) if causal_mask is not None else None
+      # Expand text_mask: (T, T) -> (B*num_slots, T, T) for memory_mask
+      text_mask_bs = jnp.repeat(text_mask[None], B * num_slots, axis=0) if text_mask is not None else None
+      
       x_bs = self.get(
           'time_layer', TransformerDecoderLayer,
           self._d_model, self._nhead, self._feedforward_units,
           self._dropout, self._norm_first)(
-              x_bs, text_bs, tgt_mask=mask_bs, training=training)
+              x_bs, text_bs, tgt_mask=mask_bs, memory_mask=text_mask_bs,
+              memory_key_padding_mask=text_mask_bs_padding, training=training)
     else:
       mask_bs = jnp.repeat(causal_mask[None], B * num_slots, axis=0) if causal_mask is not None else None
       x_bs = self.get(
@@ -414,7 +427,7 @@ class ObjectCentricDynamicsTransformer(nj.Module):
 
   def __init__(
       self, num_layers, d_model, nhead, feedforward_units=1024,
-      dropout=0.0, norm_first=True, norm=True):
+      dropout=0.0, norm_first=True, norm=True, use_text=False):
     self._num_layers = num_layers
     self._d_model = d_model
     self._nhead = nhead
@@ -422,13 +435,16 @@ class ObjectCentricDynamicsTransformer(nj.Module):
     self._dropout = dropout
     self._norm_first = norm_first
     self._norm = norm
+    self._use_text = use_text
 
-  def __call__(self, x, causal_mask=None, text_embeds=None, training=False):
+  def __call__(self, x, causal_mask=None, text_embeds=None, text_key_padding_mask=None, text_mask=None, training=False):
     """
     Args:
       x: (B, T, num_slots, d_model)
       causal_mask: (T, T) additive float causal mask, or None.
       text_embeds: (B, T, text_dim), or None.
+      text_key_padding_mask: (B, T) bool mask for text padding, or None.
+      text_mask: (T, T) additive float causal mask for text, or None.
       training: bool.
 
     Returns:
@@ -443,8 +459,9 @@ class ObjectCentricDynamicsTransformer(nj.Module):
       x = self.get(
           f'layer_{i}', ObjectCentricDynamicsLayer,
           self._d_model, self._nhead, self._feedforward_units,
-          self._dropout, self._norm_first)(
+          self._dropout, self._norm_first, self._use_text)(
               x, causal_mask=causal_mask, text_embeds=text_embeds,
+              text_key_padding_mask=text_key_padding_mask, text_mask=text_mask,
               training=training)
     if self._norm:
       x = self.get('norm', Norm, 'layer')(x)
