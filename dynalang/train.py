@@ -246,6 +246,38 @@ def make_replay(
   return replay
 
 
+def make_slot_extractor(config):
+  """Create slot extractor from config."""
+  slot_config = config.slot_extractor
+  typ = slot_config.type
+  
+  if typ == 'slotcontrast':
+    from embodied.torch.ocr.slotcontrast.slotcontrast_extractor import SlotContrastExtractor
+    cls = SlotContrastExtractor
+  elif typ == 'dinov2saur':
+    raise NotImplementedError("DINOv2-Saur extractor not implemented yet")
+  elif typ == 'slate':
+    raise NotImplementedError("SLATE extractor not implemented yet")
+  else:
+    raise ValueError(f'Unknown slot extractor type: {typ}')
+  
+  # Get image size from environment config
+  suite, task = config.task.split('_', 1)
+  image_size = config.env.get(suite, {}).get('size', (64, 64))
+  if isinstance(image_size, (list, tuple)):
+    image_size = image_size[0]  # Assume square images
+  
+  extractor = cls(
+      config_path=slot_config.config_path,
+      checkpoint_path=slot_config.checkpoint_path,
+      image_size=image_size,
+      device=slot_config.get('device', 'cuda'),
+      backbone_input_size=slot_config.get('backbone_input_size', 0)
+  )
+  
+  return extractor
+
+
 def wrapped_env(config, batch, is_eval=False, **overrides):
   ctor = bind(make_env, config, **overrides)
   if batch and config.envs.parallel != 'none':
@@ -255,7 +287,21 @@ def wrapped_env(config, batch, is_eval=False, **overrides):
   if batch:
     amount = config.envs.eval_amount if is_eval else config.envs.amount
     envs = [ctor() for _ in range(amount)]
-    return embodied.BatchEnv(envs, (config.envs.parallel != 'none'))
+    
+    use_slots = config.get('use_slot_extractor', False)
+    if use_slots:
+      slot_extractor = make_slot_extractor(config)
+      return embodied.BatchSlotExtractorEnv(
+          envs=envs,
+          parallel=(config.envs.parallel != 'none'),
+          slot_extractor=slot_extractor,
+          image_key=config.slot_extractor.get('image_key', 'image'),
+          use_previous_slots=config.slot_extractor.get('use_previous_slots', True),
+          initialize_twice=config.slot_extractor.get('initialize_twice', True),
+          flatten_slots=config.slot_extractor.get('flatten_slots', False)
+      )
+    else:
+      return embodied.BatchEnv(envs, (config.envs.parallel != 'none'))
   else:
     return ctor()
 

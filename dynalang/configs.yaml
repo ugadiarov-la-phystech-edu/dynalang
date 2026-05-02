@@ -18,6 +18,19 @@ defaults:
   logger: {terminal: {filter: '.*'}, comet: {filter: '.*'}}
   text_dataset: ''
 
+  # Slot Extractor
+  use_slot_extractor: False
+  slot_extractor:
+    type: slotcontrast 
+    config_path: ''
+    checkpoint_path: ''
+    device: cuda
+    backbone_input_size: 0
+    image_key: image
+    use_previous_slots: True
+    initialize_twice: True
+    flatten_slots: False
+
   jax:
     platform: gpu
     jit: True
@@ -481,3 +494,165 @@ min_debug:
   .*unroll: False
   .*\.layers: 2
   .*\.units: 64
+
+slotcontrast:
+  use_slot_extractor: True
+  slot_extractor:
+    type: slotcontrast
+    config_path: /path/to/slotcontrast/config.yaml
+    checkpoint_path: /path/to/slotcontrast/checkpoint.ckpt
+    device: cuda
+    backbone_input_size: 0
+    image_key: image
+    use_previous_slots: True
+    initialize_twice: True
+    flatten_slots: False
+  
+  encoder: {mlp_keys: 'slot', cnn_keys: '$^'}
+  decoder: {mlp_keys: 'slot', cnn_keys: '$^'}
+  
+  envs.amount: 8
+  run.train_ratio: 32
+
+slotcontrast_debug:
+
+  use_wandb: False
+  use_slot_extractor: True
+  
+  slot_extractor:
+    type: slotcontrast
+    config_path: /path/to/config.yaml
+    checkpoint_path: /path/to/checkpoint.ckpt
+    device: cuda
+    use_previous_slots: True
+    initialize_twice: True
+    flatten_slots: False
+  
+  jax: {jit: True, prealloc: False, debug: True, platform: cpu, profiler: False}
+  envs: {restart: False, amount: 2, parallel: none}
+  data_loaders: 1
+  wrapper: {length: 100, checks: True}
+  
+  run:
+    eval_every: 1000
+    log_every: 5
+    save_every: 10
+    train_ratio: 32
+    actor_batch: 2
+  
+  batch_size: 4
+  batch_length: 12
+  replay_size: 1e5
+
+  encoder: {mlp_keys: 'slot', cnn_keys: '$^', mlp_layers: 2, mlp_units: 64}
+  decoder: {mlp_keys: 'slot', cnn_keys: '$^', mlp_layers: 2, mlp_units: 64}
+  
+  encoder.cnn_depth: 8
+  decoder.cnn_depth: 8
+  rssm: {deter: 32, units: 16, stoch: 4, classes: 4}
+  .*unroll: False
+  .*\.layers: 2
+  .*\.units: 16
+  .*\.wd$: 0.0
+
+homegrid_octssm_slots:
+  task: homegrid_task
+  use_slot_extractor: True
+
+  slot_extractor:
+    type: slotcontrast
+    device: cuda
+    backbone_input_size: 224
+    image_key: image
+    use_previous_slots: True
+    initialize_twice: True
+    flatten_slots: False
+  
+  rssm_type: octssm
+  octssm: {num_slots: 7, deter: 1024, units: 1024, stoch: 32, classes: 32, tf_context_length: 16, tf_layers: 4, tf_heads: 8, feedforward_units: 1536, dropout: 0.0}
+  
+  encoder: {mlp_keys: 'slot|text_embed', cnn_keys: '$^', mlp_layers: 4, mlp_units: 512}
+  decoder: {mlp_keys: 'slot|text_embed', cnn_keys: '$^', mlp_layers: 4, mlp_units: 512}
+  
+  reward_head:
+    typ: transformer
+    transformer: {layers: 3, heads: 8, ffup: 4, act: silu, norm: layer, dropout: 0.1, output: symexp_twohot, bins: 255}
+  
+  cont_head:
+    typ: transformer
+    transformer: {layers: 2, heads: 8, ffup: 4, act: silu, norm: layer, dropout: 0.1, output: binary}
+  
+  actor:
+    typ: transformer
+    transformer: {layers: 3, heads: 8, ffup: 4, act: silu, norm: layer, dropout: 0.1, minstd: 0.1, maxstd: 1.0, unimix: 0.01}
+  
+  critic:
+    typ: transformer
+    transformer: {layers: 3, heads: 8, ffup: 4, act: silu, norm: layer, dropout: 0.1, output: symexp_twohot, bins: 255}
+  
+  envs: {amount: 8, parallel: thread}
+  batch_size: 16
+  batch_length: 64
+  replay_size: 1e6
+  
+  run:
+    train_ratio: 32
+    log_every: 300
+    eval_every: 10000
+    save_every: 5000
+    log_keys_video: [image]
+
+homegrid_octssm_slots_debug:
+
+  task: homegrid_task
+  use_wandb: False
+  use_slot_extractor: True
+  
+  slot_extractor:
+    type: slotcontrast
+    device: cpu
+    backbone_input_size: 224
+    use_previous_slots: True
+    initialize_twice: True
+    flatten_slots: False
+  
+  rssm_type: octssm
+  octssm: {num_slots: 7, deter: 256, units: 256, stoch: 16, classes: 16, tf_context_length: 16, tf_layers: 2, tf_heads: 4, feedforward_units: 512, dropout: 0.0}
+  
+  encoder: {mlp_keys: 'slot|text_embed', cnn_keys: '$^', mlp_layers: 2, mlp_units: 128}
+  decoder: {mlp_keys: 'slot|text_embed', cnn_keys: '$^', mlp_layers: 2, mlp_units: 128}
+  
+  reward_head:
+    typ: transformer
+    transformer: {layers: 2, heads: 4, ffup: 4, act: silu, norm: layer, dropout: 0.1, output: symexp_twohot, bins: 255}
+  
+  cont_head:
+    typ: transformer
+    transformer: {layers: 2, heads: 4, ffup: 4, act: silu, norm: layer, dropout: 0.1, output: binary}
+  
+  actor:
+    typ: transformer
+    transformer: {layers: 2, heads: 4, ffup: 4, act: silu, norm: layer, dropout: 0.1, minstd: 0.1, maxstd: 1.0, unimix: 0.01}
+  
+  critic:
+    typ: transformer
+    transformer: {layers: 2, heads: 4, ffup: 4, act: silu, norm: layer, dropout: 0.1, output: symexp_twohot, bins: 255}
+  
+  jax: {jit: True, prealloc: False, debug: True, platform: cpu, profiler: False}
+  envs: {restart: False, amount: 2, parallel: none}
+  data_loaders: 1
+  wrapper: {length: 100, checks: True}
+  
+  run:
+    eval_every: 1000
+    log_every: 50
+    save_every: 500
+    train_ratio: 32
+    actor_batch: 2
+  
+  batch_size: 4
+  batch_length: 16
+  replay_size: 1e5
+  
+  .*unroll: False
+  .*\.wd$: 0.0
