@@ -469,6 +469,9 @@ class ObjectCentricTSSM(TSSM):
              self._num_slots, self._units], f32),
         valid=jnp.zeros([batch_size, self._tf_context_length], f32))
     
+    if self._action_as_slot:
+      state['action_context'] = jnp.zeros([batch_size, self._tf_context_length, self._units], f32)
+    
     if self._text_mode != 'none':
       state['text_context'] = jnp.zeros([batch_size, self._tf_context_length, self._units], f32)
       state['text_valid'] = jnp.zeros([batch_size, self._tf_context_length], f32)
@@ -490,22 +493,24 @@ class ObjectCentricTSSM(TSSM):
     new_slot_embed = self.get('projection_layer', Linear, **self._kw)(
         stoch_flat)  # (B, num_slots, units)
     
-    # Add action as slot if enabled
-    if self._action_as_slot:
-      action_embedding = self.get('actin', Linear, **self._kw)(prev_action)  # (B, units)
-      new_slot_embed = jnp.concatenate(
-          [new_slot_embed, action_embedding[:, None, :]], axis=-2)
-    
     tf_context = jnp.concatenate(
         [prev_state['tf_context'][:, 1:], new_slot_embed[:, None, :, :]], axis=1)
     new_valid = jnp.ones((*batch_shape, 1), prev_state['valid'].dtype)
     valid = jnp.concatenate(
       [prev_state['valid'][:, 1:], new_valid], axis=1)
     
+    if self._action_as_slot:
+      action_embedding = self.get('actin', Linear, **self._kw)(prev_action)  # (B, units)
+      action_context = jnp.concatenate(
+          [prev_state['action_context'][:, 1:], action_embedding[:, None, :]], axis=1)
+    
     if self._text_mode != 'none':
       if text_embed is None:
         text_embed = jnp.zeros((*batch_shape, self._text_dim), f32)
       if training:
+        if not self._action_as_slot:
+          action_proj = self.get('action_proj', Linear, self._text_dim, winit=self._kw.get('winit', 'normal'))(prev_action)
+          text_embed = jnp.concatenate([text_embed, action_proj], axis=-1)
         text_proj = self.get('text_proj', Linear, self._units, winit=self._kw.get('winit', 'normal'))(text_embed)
         text_context = jnp.concatenate(
             [prev_state['text_context'][:, 1:], text_proj[:, None, :]], axis=1)
@@ -531,6 +536,12 @@ class ObjectCentricTSSM(TSSM):
     L = self._tf_context_length
     causal_mask = jnp.triu(jnp.full((L, L), -jnp.inf), k=1)
 
+    tf_context_for_state = tf_context
+    
+    if self._action_as_slot:
+      action_slots = action_context[:, :, None, :]  # (B, L, 1, units)
+      tf_context = jnp.concatenate([tf_context, action_slots], axis=2)  # (B, L, num_slots+1, units)
+
     if self._text_mode == 'cross_attn':
       text_key_pad_mask = text_valid <= 0.5 if text_valid is not None else None
       out = self._oc_transformer(
@@ -551,7 +562,9 @@ class ObjectCentricTSSM(TSSM):
     if self._action_as_slot:
       deter = deter[:, :-1]  # drop action slot
     
-    next_state = {'deter': cast(deter), 'tf_context': cast(tf_context), 'valid': valid}
+    next_state = {'deter': cast(deter), 'tf_context': cast(tf_context_for_state), 'valid': valid}
+    if self._action_as_slot:
+      next_state['action_context'] = cast(action_context)
     if self._text_mode != 'none':
       next_state['text_context'] = cast(text_context)
       next_state['text_valid'] = text_valid
