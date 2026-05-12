@@ -854,8 +854,12 @@ class MultiDecoder(nj.Module):
     
     if self.slot_shapes:
       shape = self.slot_shapes['slot']
+      n_obj_slots = shape[0]
+      # features may have more slots than the ground truth (e.g. +1 text slot);
+      # reconstruct only the first n_obj_slots entries.
+      obj_features = features[..., :n_obj_slots, :]
       projector = self.get('slot_proj', Linear, shape[-1], act='none')
-      slot_mean = projector(features)
+      slot_mean = projector(obj_features)       # (..., n_obj_slots, slot_dim)
       dists['slot'] = jaxutils.MSEDist(slot_mean, 2, 'sum')
       return dists
     
