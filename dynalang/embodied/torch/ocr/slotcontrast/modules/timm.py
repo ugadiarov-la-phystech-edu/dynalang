@@ -522,6 +522,27 @@ def patch_timm_for_fx_tracing():
     # Monkey patch method in vision transformer
     timm.models.vision_transformer.resample_abs_pos_embed = resample_abs_pos_embed
 
+    # Patch _assert in timm.layers.patch_embed so that PatchEmbed size checks
+    # (e.g. "H % patch_size == 0") become leaf nodes during torch.fx tracing
+    # instead of raising AssertionError with Proxy arguments.
+    def _assert_traceable(condition: bool, error_str: str):
+        """torch.fx-safe replacement for timm's internal _assert helper."""
+        assert condition, error_str
+
+    torch.fx.wrap(_assert_traceable)
+
+    try:
+        import timm.layers.patch_embed as _patch_embed_mod
+        _patch_embed_mod._assert = _assert_traceable
+    except (ImportError, AttributeError):
+        pass
+
+    try:
+        import timm.models.layers.helpers as _helpers_mod
+        _helpers_mod._assert = _assert_traceable
+    except (ImportError, AttributeError):
+        pass
+
 
 torch.fx.wrap("int")  # Needed to allow tracing with int()
 patch_timm_for_fx_tracing()
