@@ -207,9 +207,11 @@ class TSSM(nj.Module):
   def __init__(
       self, deter=512, units=512, stoch=32, classes=32, tf_context_length=16,
       tf_layers=4, tf_heads=8, feedforward_units=1024, dropout=0.0,
-      unroll=False, unimix=0.01, action_clip=1.0, winit='normal', **kw):
+      unroll=False, unimix=0.01, action_clip=1.0, action_mode='concat',
+      winit='normal', **kw):
     assert deter == units, (deter, units)
-    from .transformer import TransformerEncoder
+    assert action_mode in ('none', 'concat', 'cross_attn'), action_mode
+    from .transformer import TransformerEncoder, TransformerDecoder
     self._deter = deter
     self._units = units
     self._stoch = stoch
@@ -218,11 +220,18 @@ class TSSM(nj.Module):
     self._unroll = unroll
     self._unimix = unimix
     self._action_clip = action_clip
+    self._action_mode = action_mode
     self._kw = {'units': units, 'winit': winit, **kw}
-    self._encoder = TransformerEncoder(
-        num_layers=tf_layers, d_model=units, nhead=tf_heads,
-        feedforward_units=feedforward_units, dropout=dropout,
-        norm_first=True, norm=True, name='encoder')
+    if action_mode == 'cross_attn':
+      self._decoder = TransformerDecoder(
+          num_layers=tf_layers, d_model=units, nhead=tf_heads,
+          feedforward_units=feedforward_units, dropout=dropout,
+          norm_first=True, norm=True, name='decoder')
+    else:
+      self._encoder = TransformerEncoder(
+          num_layers=tf_layers, d_model=units, nhead=tf_heads,
+          feedforward_units=feedforward_units, dropout=dropout,
+          norm_first=True, norm=True, name='encoder')
 
   def initial(self, batch_size):
     state = dict(
@@ -231,6 +240,9 @@ class TSSM(nj.Module):
         stoch=jnp.zeros([batch_size, self._stoch, self._classes], f32),
         tf_context=jnp.zeros([batch_size, self._tf_context_length, self._units], f32),
         valid=jnp.zeros([batch_size, self._tf_context_length], f32))
+    if self._action_mode == 'cross_attn':
+      state['action_context'] = jnp.zeros(
+          [batch_size, self._tf_context_length, self._units], f32)
     deter = self.get('initial', jnp.zeros, state['deter'][0].shape, f32)
     state['deter'] = jnp.repeat(jnp.tanh(deter)[None], batch_size, 0)
     state['stoch'] = self._prior(cast(state['deter']), sample=True)['stoch']
@@ -278,7 +290,11 @@ class TSSM(nj.Module):
           self._action_clip, jnp.abs(prev_action)))
     batch_shape = prev_state['deter'].shape[:-1]
     stoch_flat = prev_state['stoch'].reshape((*batch_shape, -1))
-    x = jnp.concatenate([stoch_flat, prev_action.reshape((*batch_shape, -1))], -1)
+
+    if self._action_mode == 'concat':
+      x = jnp.concatenate([stoch_flat, prev_action.reshape((*batch_shape, -1))], -1)
+    else:
+      x = stoch_flat
     new_embedding = self.get('projection_layer', Linear, **self._kw)(x)
     tf_context = jnp.concatenate(
         [prev_state['tf_context'][:, 1:], new_embedding[:, None, :]], axis=1)
@@ -287,14 +303,26 @@ class TSSM(nj.Module):
         [prev_state['valid'][:, 1:], new_valid], axis=1)
     L = self._tf_context_length
     causal_mask = jnp.triu(jnp.full((L, L), -jnp.inf), k=1)
-    key_pad_mask = valid <= 0.5
-    out = self._encoder(
-        cast(tf_context),
-        mask=causal_mask,
-        src_key_padding_mask=key_pad_mask,
-        training=training)
-    deter = out[:, -1]
-    return {'deter': cast(deter), 'tf_context': cast(tf_context), 'valid': valid}
+
+    if self._action_mode == 'cross_attn':
+      action_embed = self.get('action_proj', Linear, **self._kw)(prev_action)
+      action_context = jnp.concatenate(
+          [prev_state['action_context'][:, 1:], action_embed[:, None, :]], axis=1)
+      out = self._decoder(
+          cast(tf_context), cast(action_context),
+          tgt_mask=causal_mask, memory_mask=causal_mask,
+          training=training)
+      deter = out[:, -1]
+      return {
+          'deter': cast(deter), 'tf_context': cast(tf_context),
+          'valid': valid, 'action_context': cast(action_context)}
+    else:
+      key_pad_mask = valid <= 0.5
+      out = self._encoder(
+          cast(tf_context), mask=causal_mask,
+          src_key_padding_mask=key_pad_mask, training=training)
+      deter = out[:, -1]
+      return {'deter': cast(deter), 'tf_context': cast(tf_context), 'valid': valid}
 
   def get_dist(self, stats):
     logit = stats['logit'].astype(f32)
@@ -332,7 +360,8 @@ class ObjectCentricTSSM(TSSM):
       self, num_slots, deter=512, units=512, stoch=32, classes=32,
       tf_context_length=16, tf_layers=4, tf_heads=8, feedforward_units=1024,
       dropout=0.0, unroll=False, unimix=0.01, action_clip=1.0,
-      action_as_slot=False, winit='normal', **kw):
+      action_mode='none', winit='normal', **kw):
+    assert action_mode in ('none', 'slot', 'cross_attn'), action_mode
     super().__init__(
         deter=deter, units=units, stoch=stoch, classes=classes,
         tf_context_length=tf_context_length, tf_layers=tf_layers,
@@ -341,11 +370,12 @@ class ObjectCentricTSSM(TSSM):
         action_clip=action_clip, winit=winit, **kw)
     from .transformer import ObjectCentricDynamicsTransformer
     self._num_slots = num_slots
-    self._action_as_slot = action_as_slot
+    self._action_mode = action_mode
     self._oc_transformer = ObjectCentricDynamicsTransformer(
         num_layers=tf_layers, d_model=units, nhead=tf_heads,
         feedforward_units=feedforward_units, dropout=dropout,
-        norm_first=True, norm=True, use_text=False, name='oc_transformer')
+        norm_first=True, norm=True, action_mode=action_mode,
+        name='oc_transformer')
 
   def initial(self, batch_size):
     state = dict(
@@ -358,8 +388,9 @@ class ObjectCentricTSSM(TSSM):
             [batch_size, self._tf_context_length,
              self._num_slots, self._units], f32),
         valid=jnp.zeros([batch_size, self._tf_context_length], f32))
-    if self._action_as_slot:
-      state['action_context'] = jnp.zeros([batch_size, self._tf_context_length, self._units], f32)
+    if self._action_mode in ('slot', 'cross_attn'):
+      state['action_context'] = jnp.zeros(
+          [batch_size, self._tf_context_length, self._units], f32)
     init_deter = self.get(
         'initial', jnp.zeros, state['deter'][0].shape, f32)
     state['deter'] = jnp.repeat(jnp.tanh(init_deter)[None], batch_size, 0)
@@ -395,18 +426,19 @@ class ObjectCentricTSSM(TSSM):
         [prev_state['tf_context'][:, 1:], new_slot_embed[:, None, :, :]], axis=1)
     new_valid = jnp.ones((*batch_shape, 1), prev_state['valid'].dtype)
     valid = jnp.concatenate(
-      [prev_state['valid'][:, 1:], new_valid], axis=1)
-
-    if self._action_as_slot:
-      action_embedding = self.get('actin', Linear, **self._kw)(prev_action)  # (B, units)
-      action_context = jnp.concatenate(
-          [prev_state['action_context'][:, 1:], action_embedding[:, None, :]], axis=1)
+        [prev_state['valid'][:, 1:], new_valid], axis=1)
 
     L = self._tf_context_length
     causal_mask = jnp.triu(jnp.full((L, L), -jnp.inf), k=1)
 
-    if self._action_as_slot:
-      action_slots = action_context[:, :, None, :]  # (B, L, 1, units)
+    if self._action_mode in ('slot', 'cross_attn'):
+      action_embedding = self.get('action_proj', Linear, **self._kw)(prev_action)  # (B, units)
+      action_context = jnp.concatenate(
+          [prev_state['action_context'][:, 1:], action_embedding[:, None, :]], axis=1)
+
+    if self._action_mode == 'slot':
+      # Append action as an extra slot: (B, L, num_slots+1, units)
+      action_slots = action_context[:, :, None, :]
       tf_input = jnp.concatenate([tf_context, action_slots], axis=2)
     else:
       tf_input = tf_context
@@ -414,15 +446,15 @@ class ObjectCentricTSSM(TSSM):
     out = self._oc_transformer(
         cast(tf_input),
         causal_mask=causal_mask,
-        text_embeds=None,
+        action_embeds=cast(action_context) if self._action_mode == 'cross_attn' else None,
         training=training)
 
     deter = out[:, -1]  # (B, num_slots[+1], units)
-    if self._action_as_slot:
+    if self._action_mode == 'slot':
       deter = deter[:, :-1]  # drop action slot
 
     next_state = {'deter': cast(deter), 'tf_context': cast(tf_context), 'valid': valid}
-    if self._action_as_slot:
+    if self._action_mode in ('slot', 'cross_attn'):
       next_state['action_context'] = cast(action_context)
     return next_state
 
