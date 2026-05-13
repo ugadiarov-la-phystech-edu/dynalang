@@ -915,7 +915,14 @@ class MultiDecoder(nj.Module):
           key: self._make_image_dist(key, mean)
           for (key, shape), mean in zip(self.cnn_shapes.items(), means)})
     if self.mlp_shapes:
-      dists.update(self._mlp(features))
+      if self.slot_shapes:
+        # Text observations are encoded as the last slot
+        n_obj_slots = self.slot_shapes['slot'][0]
+        mlp_features = features[..., n_obj_slots:, :].reshape(
+            features.shape[:-2] + (-1,))
+      else:
+        mlp_features = features
+      dists.update(self._mlp(mlp_features))
     return dists
 
   def _make_image_dist(self, name, mean):
