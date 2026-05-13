@@ -899,10 +899,9 @@ class MultiDecoder(nj.Module):
       # reconstruct only the first n_obj_slots entries.
       obj_features = features[..., :n_obj_slots, :]
       projector = self.get('slot_proj', Linear, shape[-1], act='none')
-      slot_mean = projector(obj_features)   
+      slot_mean = projector(obj_features)
       dists['slot'] = jaxutils.MSEDist(slot_mean, 2, 'sum')
-      return dists
-    
+
     if self.cnn_shapes:
       feat = features
       if drop_loss_indices is not None:
