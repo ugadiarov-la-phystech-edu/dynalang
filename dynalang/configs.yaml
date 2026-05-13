@@ -225,6 +225,12 @@ dmlab:
   decoder: {mlp_keys: '$^', cnn_keys: 'image'}
   run.train_ratio: 64
 
+homegrid:
+  task: homegrid_task
+  .*\.vec_keys: token$
+  .*\.img_keys: image
+  .*\.vec_dist: onehot
+
 atari:
 
   task: atari_pong

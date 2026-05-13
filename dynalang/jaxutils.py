@@ -58,6 +58,15 @@ def tensorstats(tensor, prefix=None):
   return metrics
 
 
+def concat_dict(mapping, batch_shape=None):
+  if not isinstance(mapping, dict):
+    return mapping
+  tensors = [v for _, v in sorted(mapping.items(), key=lambda x: x[0])]
+  if batch_shape is not None:
+    tensors = [x.reshape((*batch_shape, -1)) for x in tensors]
+  return jnp.concatenate(tensors, -1)
+
+
 def subsample(values, amount=1024):
   values = values.flatten()
   if len(values) > amount:

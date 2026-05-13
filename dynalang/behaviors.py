@@ -43,14 +43,16 @@ class Random(nj.Module):
 
   def policy(self, latent, state):
     batch_size = len(state)
-    shape = (batch_size,) + self.act_space.shape
-    if self.act_space.discrete:
-      dist = jaxutils.OneHotDist(jnp.zeros(shape))
-    else:
-      dist = tfd.Uniform(-jnp.ones(shape), jnp.ones(shape))
-      dist = tfd.Independent(dist, 1)
-    action = dist.sample(seed=nj.rng())
-    return {'action': action}, state
+    action = {}
+    for key, space in self.act_space.items():
+      shape = (batch_size,) + space.shape
+      if space.discrete:
+        dist = jaxutils.OneHotDist(jnp.zeros((*shape, int(space.high))))
+      else:
+        dist = tfd.Uniform(-jnp.ones(shape), jnp.ones(shape))
+        dist = tfd.Independent(dist, 1)
+      action[key] = dist.sample(seed=nj.rng())
+    return action, state
 
   def train(self, imagine, start, data):
     return None, {}

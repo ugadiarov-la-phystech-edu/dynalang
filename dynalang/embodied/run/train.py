@@ -41,6 +41,10 @@ def train(agent, env, replay, logger, args):
     length = len(ep['reward']) - 1
     score = float(ep['reward'].astype(np.float64).sum())
     sum_abs_reward = float(np.abs(ep['reward']).astype(np.float64).sum())
+    if 'is_read_step' in ep:
+      real_length = len(ep['is_read_step']) - sum(ep['is_read_step'])
+    else:
+      real_length = length
     logger.add({
         'real_length': len(ep['is_read_step']) - sum(ep['is_read_step']) if 'is_read_step' in ep else length,
         'length': length,

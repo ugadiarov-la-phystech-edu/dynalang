@@ -47,6 +47,9 @@ class Config(dict):
       from ruamel.yaml import YAML
       yaml = YAML(typ='safe', pure=True)
       return cls(yaml.load(filename.read()))
+      from ruamel.yaml import YAML
+      yaml = YAML(typ='safe', pure=True)
+      return cls(yaml.load(filename.read()))
     else:
       raise NotImplementedError(filename.suffix)
 

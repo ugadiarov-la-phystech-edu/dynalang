@@ -522,26 +522,22 @@ def patch_timm_for_fx_tracing():
     # Monkey patch method in vision transformer
     timm.models.vision_transformer.resample_abs_pos_embed = resample_abs_pos_embed
 
-    # Patch _assert in timm.layers.patch_embed so that PatchEmbed size checks
-    # (e.g. "H % patch_size == 0") become leaf nodes during torch.fx tracing
-    # instead of raising AssertionError with Proxy arguments.
-    def _assert_traceable(condition: bool, error_str: str):
-        """torch.fx-safe replacement for timm's internal _assert helper."""
-        assert condition, error_str
+    # During torch.fx symbolic tracing (used by torchvision.create_feature_extractor),
+    # shape values like H = x.shape[2] are Proxy objects, not ints.
+    # timm's _assert(H % patch_size == 0, msg) then receives a Proxy as `condition`
+    # and crashes. Fix: skip the assertion when condition is not a plain bool.
+    def _assert_proxy_safe(condition, error_str: str):
+        if isinstance(condition, bool) and not condition:
+            raise AssertionError(error_str)
 
-    torch.fx.wrap(_assert_traceable)
-
-    try:
-        import timm.layers.patch_embed as _patch_embed_mod
-        _patch_embed_mod._assert = _assert_traceable
-    except (ImportError, AttributeError):
-        pass
-
-    try:
-        import timm.models.layers.helpers as _helpers_mod
-        _helpers_mod._assert = _assert_traceable
-    except (ImportError, AttributeError):
-        pass
+    for mod_path in ("timm.layers.patch_embed", "timm.models.layers.helpers"):
+        try:
+            import importlib
+            mod = importlib.import_module(mod_path)
+            if hasattr(mod, "_assert"):
+                mod._assert = _assert_proxy_safe
+        except ImportError:
+            pass
 
 
 torch.fx.wrap("int")  # Needed to allow tracing with int()

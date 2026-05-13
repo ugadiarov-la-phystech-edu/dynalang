@@ -280,6 +280,17 @@ class CometOutput:
     experiment.set_name(os.getenv('COMET_EXPERIMENT_NAME', name))
     experiment.log_system_info('command', ' '.join(sys.argv))
     experiment.log_system_info('PID', str(os.getpid()))
+
+    try:
+      from git import Repo
+      repo = Repo('.')
+      branch_name = repo.active_branch.name
+      commit_hash = repo.head.commit.hexsha
+      experiment.log_system_info('git:branch', branch_name)
+      experiment.log_system_info('git:commit', commit_hash)
+    except:
+      pass
+
     self._experiment = experiment
 
   def __call__(self, summaries):

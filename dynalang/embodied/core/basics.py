@@ -17,7 +17,7 @@ CONVERSION = {
     np.uint8: np.uint8,
     np.uint32: np.uint32,
     bool: bool,
-    np.unicode_: np.dtype("object"),
+    np.str_: np.dtype("object"),
     str: str,
 }
 
