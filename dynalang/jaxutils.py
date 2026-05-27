@@ -389,7 +389,8 @@ class Optimizer(nj.Module):
 
   def __init__(
       self, lr, opt='adam', eps=1e-5, clip=100.0, warmup=0, wd=0.0,
-      wd_pattern=r'/(w|kernel)$', lateclip=0.0, frozen_keys=r'^$'):
+      wd_pattern=r'/(w|kernel)$', lateclip=0.0, frozen_keys=r'^$',
+      grad_accum_steps=1):
     assert wd_pattern[0] not in ('0', '1')
     # assert self.path not in self.PARAM_COUNTS
     self.PARAM_COUNTS[self.path] = None
@@ -436,6 +437,8 @@ class Optimizer(nj.Module):
           jnp.array, 1e4, jnp.float32, name='grad_scale')
       self.good_steps = nj.Variable(
           jnp.array, 0, jnp.int32, name='good_steps')
+    if grad_accum_steps > 1:
+      self.opt = optax.MultiSteps(self.opt, every_k_schedule=grad_accum_steps)
 
   def __call__(self, modules, lossfn, *args, has_aux=False, **kwargs):
     def wrapped(*args, **kwargs):

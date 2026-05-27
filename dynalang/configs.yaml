@@ -147,7 +147,7 @@ defaults:
     transformer: {layers: 2, heads: 8, ffup: 4, act: silu, norm: layer, dropout: 0.1, output: binary}
   loss_scales: {image: 1.0, vector: 1.0, reward: 1.0, cont: 1.0, dyn: 0.5, rep: 0.1, actor: 1.0, critic: 1.0, slowreg: 1.0, token: 1.0, lm: 0.0}
   rssm_loss: {free: 1.0}
-  model_opt: {opt: adam, lr: 1e-4, eps: 1e-8, clip: 1000.0, wd: 0.0, warmup: 0, lateclip: 0.0, frozen_keys: '^$'}
+  model_opt: {opt: adam, lr: 1e-4, eps: 1e-8, clip: 1000.0, wd: 0.0, warmup: 0, lateclip: 0.0, frozen_keys: '^$', grad_accum_steps: 1}
   skip_cnn_training: False
   skip_mlp_training: False
   zero_data_keys: ['']
@@ -163,8 +163,8 @@ defaults:
     typ: mlp
     mlp: {layers: 5, units: 1024, act: silu, norm: layer, dist: symexp_twohot, outscale: 0.0, outnorm: False, inputs: [deter, stoch], winit: normal, fan: avg, bins: 255, symlog_inputs: False}
     transformer: {layers: 3, heads: 8, ffup: 4, act: silu, norm: layer, dropout: 0.1, output: symexp_twohot, bins: 255}
-  actor_opt: {opt: adam, lr: 3e-5, eps: 1e-5, clip: 100.0, wd: 0.0, warmup: 0, lateclip: 0.0}
-  critic_opt: {opt: adam, lr: 3e-5, eps: 1e-5, clip: 100.0, wd: 0.0, warmup: 0, lateclip: 0.0}
+  actor_opt: {opt: adam, lr: 3e-5, eps: 1e-5, clip: 100.0, wd: 0.0, warmup: 0, lateclip: 0.0, grad_accum_steps: 1}
+  critic_opt: {opt: adam, lr: 3e-5, eps: 1e-5, clip: 100.0, wd: 0.0, warmup: 0, lateclip: 0.0, grad_accum_steps: 1}
   actor_dist_disc: onehot
   actor_dist_cont: normal
   actor_grad_disc: reinforce
@@ -184,7 +184,7 @@ defaults:
 
   # Exploration
   expl_rewards: {extr: 1.0, disag: 0.1}
-  expl_opt: {opt: adam, lr: 1e-4, eps: 1e-5, clip: 100.0, wd: 0.0, warmup: 0}
+  expl_opt: {opt: adam, lr: 1e-4, eps: 1e-5, clip: 100.0, wd: 0.0, warmup: 0, grad_accum_steps: 1}
   disag_head: {layers: 5, units: 1024, act: silu, norm: layer, dist: mse, outscale: 1.0, inputs: [deter, stoch, action], winit: normal, fan: avg}
   disag_target: [stoch]
   disag_models: 8
