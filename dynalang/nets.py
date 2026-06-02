@@ -1123,7 +1123,11 @@ class AggregationTransformerHead(nj.Module):
     from .transformer import TransformerEncoder
     
     self._space = space
-    self._shape = space.shape
+    if isinstance(space, dict):
+      self._shape = {k: tuple(v) for k, v in space.items()}
+      assert isinstance(output, dict), output
+    else:
+      self._shape = space.shape
     self._output = output
     self._layers = layers
     self._units = units
@@ -1148,7 +1152,6 @@ class AggregationTransformerHead(nj.Module):
     
     self._dist_kw = {k: v for k, v in kw.items() if k in (
         'outscale', 'outnorm', 'minstd', 'maxstd', 'unimix', 'bins')}
-    self._dist_kw['dist'] = output
 
   def __call__(self, inputs, training=False, bdims=None):
     feat = self._inputs(inputs)
@@ -1194,7 +1197,13 @@ class AggregationTransformerHead(nj.Module):
       raise NotImplementedError(f'aggregation_method: {self._aggregation_method}')
     
     x = x.reshape((*bshape, x.shape[-1])) #[B*T, units] → [B, T, units]
-    dist = self.get('dist', Dist, self._shape, **self._dist_kw)(x)
+    if isinstance(self._shape, dict):
+      return {
+          k: self.get(f'dist_{k}', Dist, shp, dist=self._output[k],
+                      **self._dist_kw)(x)
+          for k, shp in self._shape.items()}
+    dist = self.get('dist', Dist, self._shape, dist=self._output,
+                    **self._dist_kw)(x)
     return dist
 
 

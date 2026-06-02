@@ -491,7 +491,6 @@ class ImagActorCritic(nj.Module):
       self.grad = config.actor_grad_cont
     else:
       self.grad = 'reinforce'
-    disc = list(act_space.values())[0].discrete
     dist1, dist2 = config.actor_dist_disc, config.actor_dist_cont
     shapes = {
         k: (*s.shape, int(s.high)) if s.discrete else s.shape
@@ -506,12 +505,9 @@ class ImagActorCritic(nj.Module):
           name='actor', dims=mlp_dims, shape=shapes, **config.actor.mlp,
           dist=dists)
     elif config.actor.typ == 'transformer':
-      from .embodied.core.space import Space
-      actor_space = Space(np.float32, list(act_space.values())[0].shape)
-      dist_type = config.actor_dist_disc if disc else config.actor_dist_cont
       self.actor = nets.AggregationTransformerHead(
-          actor_space, dist_type, inputs=['deter', 'stoch'], dims=actor_dims, bdims=actor_bdims,
-          **config.actor.transformer, name='actor')
+          shapes, dists, inputs=['deter', 'stoch'], dims=actor_dims,
+          bdims=actor_bdims, **config.actor.transformer, name='actor')
     else:
       raise NotImplementedError(f'actor.typ: {config.actor.typ}')
     
