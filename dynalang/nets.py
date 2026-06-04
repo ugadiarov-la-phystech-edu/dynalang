@@ -86,7 +86,7 @@ class RSSM(nj.Module):
     prior = {k: swap(v) for k, v in prior.items()}
     return prior
 
-  def obs_step(self, prev_state, prev_action, embed, is_first):
+  def obs_step(self, prev_state, prev_action, embed, is_first, training=True):
     prev_action = jaxutils.concat_dict(prev_action)
     deter = self._gru(prev_state, prev_action, is_first)
     x = jnp.concatenate([deter, embed], -1)
@@ -692,7 +692,7 @@ class EarlyRSSM(nj.Module):
     prior = {k: swap(v) for k, v in prior.items()}
     return prior
 
-  def obs_step(self, prev_state, prev_action, embed, is_first):
+  def obs_step(self, prev_state, prev_action, embed, is_first, training=True):
     prev_state, prev_action = tree_map(
         lambda prev, init: jaxutils.switch(is_first, init, prev),
         (prev_state, prev_action),
