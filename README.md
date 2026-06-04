@@ -52,10 +52,16 @@ sh scripts/run_messenger_s1.sh EXP_NAME GPU_IDS SEED
 1. Install dependencies for VLN. Since VLN-CE depends on an older version of the Habitat simulator, we provide a conda yml file with pinned dependency versions and recommend you install the same version of JAX.
 ```bash
 conda create -n dynalang-vln python=3.8
+conda activate dynalang-vln
 pip install "jax[cuda11_cudnn82]==0.4.8" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-pip install torch torchvision
+pip install torch==2.0.1 torchvision==0.15.2
 conda env update -f env_vln.yml
-conda install -c aihabitat -c conda-forge habitat-sim=0.1.7 headless
+```
+
+Then install the **headless** build of `habitat-sim` 0.1.7. Do **not** use `conda install -c aihabitat -c conda-forge habitat-sim=0.1.7 headless`: that command resolves to the non-headless build and will not give you the headless simulator (see the [discussion](https://github.com/facebookresearch/habitat-lab/issues/1888)). Instead, download the headless package directly from the [aihabitat channel files](https://anaconda.org/aihabitat/habitat-sim/files?version=0.1.7) and install it from the local file (the example below is the Linux + Python 3.8 build):
+```bash
+wget https://anaconda.org/aihabitat/habitat-sim/0.1.7/download/linux-64/habitat-sim-0.1.7-py3.8_headless_linux_856d4b08c1a2632626bf0d205bf46471a99502b7.tar.bz2
+conda install habitat-sim-0.1.7-py3.8_headless_linux_856d4b08c1a2632626bf0d205bf46471a99502b7.tar.bz2
 ```
 
 2. Clone our VLN-CE and habitat-lab forks into this project repo:
