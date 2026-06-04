@@ -46,6 +46,38 @@ def sinusoidal_positional_encoding(
   return pe
 
 
+def sinusoidal_pe_2d_interleaved(
+    seq_len: int,
+    d_model: int,
+    type_indices: jnp.ndarray,
+) -> jnp.ndarray:
+  """Interleaved 2D sinusoidal PE over a temporal axis and a slot-type axis."""
+  assert d_model % 4 == 0, d_model
+  n_pairs = d_model // 2 
+  T = seq_len
+  N = type_indices.shape[0]
+
+  pair_idx = jnp.arange(n_pairs)
+  omega = jnp.power(10000.0, pair_idx / (n_pairs - 1))  # (n_pairs,)
+
+  t_pos = jnp.arange(T)[:, None]              # (T, 1)
+  angles_t = t_pos / omega[None, :]           # (T, n_pairs)
+
+  k_pos = type_indices.astype(jnp.float32)[:, None]  # (N, 1)
+  angles_k = k_pos / omega[None, :]                  # (N, n_pairs)
+
+  angles_t = jnp.broadcast_to(angles_t[:, None, :], (T, N, n_pairs))
+  angles_k = jnp.broadcast_to(angles_k[None, :, :], (T, N, n_pairs))
+
+  even_pairs = (pair_idx % 2 == 0)            # (n_pairs,)
+  angles = jnp.where(even_pairs[None, None, :], angles_t, angles_k)
+
+  sin_vals = jnp.sin(angles)                  # (T, N, n_pairs)
+  cos_vals = jnp.cos(angles)                  # (T, N, n_pairs)
+  pe = jnp.stack([sin_vals, cos_vals], axis=-1)  # (T, N, n_pairs, 2)
+  return pe.reshape(T, N, d_model)
+
+
 def scaled_dot_product_attention(
     q: jnp.ndarray,
     k: jnp.ndarray,
@@ -415,8 +447,10 @@ class ObjectCentricDynamicsTransformer(nj.Module):
 
   def __init__(
       self, num_layers, d_model, nhead, feedforward_units=1024,
-      dropout=0.0, norm_first=True, norm=True, action_mode='none'):
+      dropout=0.0, norm_first=True, norm=True, action_mode='none',
+      pe_mode='temporal', n_text_slots=0):
     assert action_mode in ('none', 'slot', 'cross_attn'), action_mode
+    assert pe_mode in ('temporal', 'interleaved'), pe_mode
     self._num_layers = num_layers
     self._d_model = d_model
     self._nhead = nhead
@@ -425,6 +459,16 @@ class ObjectCentricDynamicsTransformer(nj.Module):
     self._norm_first = norm_first
     self._norm = norm
     self._action_mode = action_mode
+    self._pe_mode = pe_mode
+    self._n_text_slots = n_text_slots
+
+  def _type_indices(self, num_slots):
+    n_action = 1 if self._action_mode == 'slot' else 0
+    n_text = self._n_text_slots
+    n_obj = num_slots - n_text - n_action
+    assert n_obj >= 0, (num_slots, n_text, n_action)
+    types = [0] * n_obj + [1] * n_text + [2] * n_action
+    return jnp.asarray(types, dtype=jnp.int32)
 
   def __call__(self, x, causal_mask=None, action_embeds=None, training=False):
     """
@@ -438,8 +482,14 @@ class ObjectCentricDynamicsTransformer(nj.Module):
       x: (B, T, num_slots, d_model)
     """
     T = x.shape[1]
-    pe = sinusoidal_positional_encoding(T, self._d_model)
-    x = x + pe[None, :, None, :]
+    if self._pe_mode == 'interleaved':
+      num_slots = x.shape[2]
+      type_indices = self._type_indices(num_slots)
+      pe = sinusoidal_pe_2d_interleaved(T, self._d_model, type_indices)
+      x = x + pe[None, :, :, :]
+    else:
+      pe = sinusoidal_positional_encoding(T, self._d_model)
+      x = x + pe[None, :, None, :]
     x = _dropout(x, self._dropout, training)
 
     for i in range(self._num_layers):

@@ -183,6 +183,7 @@ class WorldModel(nj.Module):
         base_slots = list(self.encoder.slot_shapes.values())[0][0]
         n_text = 1 if len(self.encoder.mlp_shapes) > 0 else 0
         octssm_cfg['num_slots'] = base_slots + n_text
+        octssm_cfg['n_text_slots'] = n_text
         print(f'WorldModel: auto-set octssm.num_slots = '
               f'{base_slots} object slots + {n_text} text slot(s) = '
               f'{octssm_cfg["num_slots"]}')
