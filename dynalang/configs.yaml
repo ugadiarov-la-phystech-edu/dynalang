@@ -104,6 +104,7 @@ defaults:
       early_stop_penalty: 0
       use_descriptions: False
       desc_length: 50
+      gpu_id: 0
     messenger:
       size: [16, 16]
       length: 64

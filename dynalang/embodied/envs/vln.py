@@ -18,6 +18,7 @@ class VLNEnv(embodied.Env):
     length=500,
     use_text=True,
     use_depth=False,
+    use_semantic=False,
     load_embeddings=True,
     dataset='train',
     # For training with expert demos (unused in final version)
@@ -33,6 +34,7 @@ class VLNEnv(embodied.Env):
     use_descriptions=False,
     desc_length=50,
     seed=None,
+    gpu_id=0,
   ):
     assert mode in dataset, "Mismatched env mode and dataset"
 
@@ -44,6 +46,7 @@ class VLNEnv(embodied.Env):
     self._mode = mode
     self._use_text = use_text
     self._use_depth = use_depth
+    self._use_semantic = use_semantic
     self._load_embeddings = load_embeddings
     self._use_expert = use_expert
     self._use_descriptions = use_descriptions
@@ -62,10 +65,11 @@ class VLNEnv(embodied.Env):
     self.cur_text = ''
     # Number of episodes (for annealing expert episodes if using demos)
     self._num_eps = 0
+    self._disc_act_space = ['STOP', 'MOVE_FORWARD', 'TURN_LEFT', 'TURN_RIGHT']
 
     if seed is None:
       seed = 42
-    assert self._desc_length < self._length
+    assert self._desc_length <= self._length
     
     config_opts = [
       'TASK_CONFIG.DATASET.SPLIT', dataset,
@@ -87,6 +91,17 @@ class VLNEnv(embodied.Env):
       os.path.dirname(os.path.realpath(__file__)) + '/vln.yaml',
       opts=config_opts
     )
+    self.config.defrost()
+    self.config.SIMULATOR_GPU_IDS = [gpu_id]
+    self.config.TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.GPU_DEVICE_ID = gpu_id
+    if use_semantic:
+      sensors = list(self.config.TASK_CONFIG.SIMULATOR.AGENT_0.SENSORS)
+      if 'SEMANTIC_SENSOR' not in sensors:
+        sensors.append('SEMANTIC_SENSOR')
+      self.config.TASK_CONFIG.SIMULATOR.AGENT_0.SENSORS = sensors
+      self.config.TASK_CONFIG.SIMULATOR.SEMANTIC_SENSOR.WIDTH = size[0]
+      self.config.TASK_CONFIG.SIMULATOR.SEMANTIC_SENSOR.HEIGHT = size[1]
+    self.config.freeze()
     self._env = make_env_fn(
       self.config,
       get_env_class(self.config.ENV_NAME)
@@ -160,11 +175,15 @@ class VLNEnv(embodied.Env):
 
   @property
   def act_space(self):
-    self._disc_act_space = ['STOP', 'MOVE_FORWARD', 'TURN_LEFT', 'TURN_RIGHT']
     return {
         'action': embodied.Space(np.int32, (), 0, len(self._disc_act_space)),
         'reset': embodied.Space(bool),
     }
+
+  @staticmethod
+  def _action_index(action):
+    """Discrete index; policy/driver may pass float (e.g. after is_last masking)."""
+    return int(np.asarray(action).item())
   
   def step(self, action):
     if self._done or action['reset']:
@@ -201,7 +220,8 @@ class VLNEnv(embodied.Env):
         "is_demo": self._expert_ep,
       })
       ob[f'log_image'] = self.render_with_text(
-        ob, self.cur_text, log_traj_id, self._disc_act_space[action['action']]
+        ob, self.cur_text, log_traj_id,
+        self._disc_act_space[self._action_index(action['action'])],
       )
 
       if self._expert_ep:
@@ -213,7 +233,8 @@ class VLNEnv(embodied.Env):
       
       return ob
 
-    action = action['action'] # possible actions: STOP, MOVE_FORWARD, TURN_LEFT, TURN_RIGHT
+    # STOP, MOVE_FORWARD, TURN_LEFT, TURN_RIGHT
+    action = self._action_index(action['action'])
     
     if self.done_first_input:
       self._step += 1
@@ -269,8 +290,7 @@ class VLNEnv(embodied.Env):
         # (seq, dim)
         embeds = self.encoder(**tokens).last_hidden_state.squeeze(0)
       self.embed_cache[string] = embeds.cpu().numpy()
-      self.token_cache[string] = {
-        k: v.squeeze(0).cpu().numpy() for k, v in tokens}
+      self.token_cache[string] = tokens['input_ids'].squeeze(0).cpu().numpy()
     return (
       self.embed_cache[string],
       self.token_cache[string]
@@ -321,7 +341,8 @@ class VLNEnv(embodied.Env):
       
   def preprocess_obs(self, ob):
     new_ob = {}
-    img = Image.fromarray(ob['rgb'])
+    rgb = ob['rgb']
+    img = Image.fromarray(rgb)
     img = img.resize(self._size)
     new_ob['image'] =  np.asarray(img, dtype=np.uint8)
     if self._use_depth:
@@ -332,17 +353,21 @@ class VLNEnv(embodied.Env):
   
   def render_with_text(self, ob, instr_text, traj_id, ac):
     """Render policy image with debugging information."""
-    img = self._env.render()
-    img = Image.fromarray(img)
+    img = Image.fromarray(ob['image'])
     draw = ImageDraw.Draw(img)
     # Define the maximum width of the text
     max_width = 256
 
     # Calculate the height of the text
     instr_text = 'Instruction: ' + instr_text
-    instr_text = instr_text.encode("ascii", "ignore")
-    instr_text = instr_text.decode()
-    text_width, text_height = draw.textsize(instr_text)
+    instr_text = instr_text.strip().replace('\n', ' ').replace('\r', ' ')
+    instr_text = instr_text.encode("ascii", "ignore").decode()
+    try:
+      text_width = draw.textlength(instr_text)
+    except (AttributeError, ValueError):
+      text_width, _ = draw.textsize(instr_text)
+    if text_width == 0:
+      text_width = len(instr_text) * 6
     max_len = int((max_width / text_width) * len(instr_text))
     wrapped_text = "\n".join([instr_text[i:i+max_len] for i in range(0, len(instr_text), max_len)])
 
