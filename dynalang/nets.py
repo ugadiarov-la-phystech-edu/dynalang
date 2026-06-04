@@ -385,8 +385,10 @@ class ObjectCentricTSSM(TSSM):
       self, num_slots, deter=512, units=512, stoch=32, classes=32,
       tf_context_length=16, tf_layers=4, tf_heads=8, feedforward_units=1024,
       dropout=0.0, unroll=False, unimix=0.01, action_clip=1.0,
-      action_mode='none', winit='normal', **kw):
+      action_mode='none', pe_mode='temporal', n_text_slots=0,
+      winit='normal', **kw):
     assert action_mode in ('none', 'slot', 'cross_attn'), action_mode
+    assert pe_mode in ('temporal', 'interleaved'), pe_mode
     super().__init__(
         deter=deter, units=units, stoch=stoch, classes=classes,
         tf_context_length=tf_context_length, tf_layers=tf_layers,
@@ -400,6 +402,7 @@ class ObjectCentricTSSM(TSSM):
         num_layers=tf_layers, d_model=units, nhead=tf_heads,
         feedforward_units=feedforward_units, dropout=dropout,
         norm_first=True, norm=True, action_mode=action_mode,
+        pe_mode=pe_mode, n_text_slots=n_text_slots,
         name='oc_transformer')
 
   def initial(self, batch_size):
