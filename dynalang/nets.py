@@ -783,18 +783,19 @@ class MultiEncoder(nj.Module):
     excluded = ('is_first', 'is_last')
     shapes = {k: v for k, v in shapes.items() if (
         k not in excluded and not k.startswith('log_'))}
-    self.slot_shapes = {k: v for k, v in shapes.items() if k == 'slot'}
     self.cnn_shapes = {k: v for k, v in shapes.items() if (
-        len(v) == 3 and re.match(cnn_keys, k) and k != 'slot')}
+        len(v) == 3 and re.match(cnn_keys, k))}
     self.mlp_shapes = {k: v for k, v in shapes.items() if (
-        len(v) in (1, 2) and re.match(mlp_keys, k) and k != 'slot')}
+        len(v) in (1, 2) and re.match(mlp_keys, k))}
     assert not ("token" in self.mlp_shapes and \
                 "token_embed" in self.mlp_shapes), \
       "Probably shouldn't have both token and token_embed, use token$?"
-    self.shapes = {**self.cnn_shapes, **self.mlp_shapes, **self.slot_shapes}
+    self.shapes = {**self.cnn_shapes, **self.mlp_shapes}
     print('Encoder CNN shapes:', self.cnn_shapes)
     print('Encoder MLP shapes:', self.mlp_shapes)
-    print('Encoder Slot shapes:', self.slot_shapes)
+    self._slot_dim = mlp_units
+    self.n_output_slots = (
+        (1 if self.cnn_shapes else 0) + (1 if self.mlp_shapes else 0))
     cnn_kw = {**kw, 'minres': minres, 'name': 'cnn'}
     mlp_kw = {**kw, 'symlog_inputs': symlog_inputs, 'name': 'mlp'}
     if cnn == 'resnet':
@@ -811,18 +812,17 @@ class MultiEncoder(nj.Module):
     data = {
         k: v.reshape((-1,) + v.shape[len(batch_dims):])
         for k, v in data.items()}
-    result = {}
+    slots = []
 
-    if 'slot' in data:
-      result['slot'] = data['slot'].reshape(batch_dims + data['slot'].shape[1:])
-      
     if self.cnn_shapes:
       inputs = jnp.concatenate([data[k] for k in self.cnn_shapes], -1)
       output = self._cnn(inputs)
       output = output.reshape((output.shape[0], -1))
       if zero_cnn:
         output = jnp.zeros_like(output)
-      result['image'] = output.reshape(batch_dims + output.shape[1:])
+      image = output.reshape(batch_dims + output.shape[1:])
+      image = self.get('enc_img_slot', Linear, self._slot_dim)(image)
+      slots.append(image[..., None, :])
 
     if self.mlp_shapes:
       inputs = [
@@ -833,18 +833,10 @@ class MultiEncoder(nj.Module):
       output = self._mlp(inputs)
       if zero_mlp:
         output = jnp.zeros_like(output)
-      result['text'] = output.reshape(batch_dims + output.shape[1:])
+      text = output.reshape(batch_dims + output.shape[1:])
+      slots.append(text[..., None, :])
 
-    # Merge text into the visual representation so downstream models see one tensor
-    if 'slot' in result and 'text' in result:
-      slot_dim = result['slot'].shape[-1]
-      text_slot = self.get('text_slot_proj', Linear, slot_dim)(result['text'])
-      result['slot'] = jnp.concatenate(
-          [result['slot'], text_slot[..., None, :]], axis=-2)
-    elif 'image' in result and 'text' in result:
-      result['image'] = jnp.concatenate([result['image'], result['text']], axis=-1)
-
-    return result['slot'] if 'slot' in result else result['image']
+    return jnp.concatenate(slots, axis=-2)
 
 
 
@@ -857,17 +849,15 @@ class MultiDecoder(nj.Module):
       outscale=1.0, minres=4, cnn_sigmoid=False, **kw):
     excluded = ('is_first', 'is_last', 'is_terminal', 'reward')
     shapes = {k: v for k, v in shapes.items() if k not in excluded}
-    self.slot_shapes = {k: v for k, v in shapes.items() if k == 'slot'}
     self.cnn_shapes = {
         k: v for k, v in shapes.items()
-        if re.match(cnn_keys, k) and len(v) == 3 and k != 'slot'}
+        if re.match(cnn_keys, k) and len(v) == 3}
     self.mlp_shapes = {
         k: v for k, v in shapes.items()
-        if re.match(mlp_keys, k) and len(v) == 1 and k != 'slot'}
-    self.shapes = {**self.cnn_shapes, **self.mlp_shapes, **self.slot_shapes}
+        if re.match(mlp_keys, k) and len(v) == 1}
+    self.shapes = {**self.cnn_shapes, **self.mlp_shapes}
     print('Decoder CNN shapes:', self.cnn_shapes)
     print('Decoder MLP shapes:', self.mlp_shapes)
-    print('Decoder Slot shapes:', self.slot_shapes)
     cnn_kw = {**kw, 'minres': minres, 'sigmoid': cnn_sigmoid}
     mlp_kw = {**kw, 'dist': vector_dist, 'outscale': outscale, 'bins': bins}
     if self.cnn_shapes:
@@ -889,21 +879,13 @@ class MultiDecoder(nj.Module):
     self._image_dist = image_dist
 
   def __call__(self, inputs, drop_loss_indices=None):
-    features = self._inputs(inputs)
+    features = self._inputs(inputs) 
     dists = {}
-    
-    if self.slot_shapes:
-      shape = self.slot_shapes['slot']
-      n_obj_slots = shape[0]
-      # features may have more slots than the ground truth (e.g. +1 text slot);
-      # reconstruct only the first n_obj_slots entries.
-      obj_features = features[..., :n_obj_slots, :]
-      projector = self.get('slot_proj', Linear, shape[-1], act='none')
-      slot_mean = projector(obj_features)
-      dists['slot'] = jaxutils.MSEDist(slot_mean, 2, 'sum')
-
+    n_text_slots = 1 if self.mlp_shapes else 0
+    n_img_slots = features.shape[-2] - n_text_slots
     if self.cnn_shapes:
-      feat = features
+      #image uses only the image slot
+      feat = features[..., :n_img_slots, :].reshape(features.shape[:-2] + (-1,))
       if drop_loss_indices is not None:
         feat = feat[:, drop_loss_indices]
       flat = feat.reshape([-1, feat.shape[-1]])
@@ -915,14 +897,10 @@ class MultiDecoder(nj.Module):
           key: self._make_image_dist(key, mean)
           for (key, shape), mean in zip(self.cnn_shapes.items(), means)})
     if self.mlp_shapes:
-      if self.slot_shapes:
-        # Text observations are encoded as the last slot
-        n_obj_slots = self.slot_shapes['slot'][0]
-        mlp_features = features[..., n_obj_slots:, :].reshape(
-            features.shape[:-2] + (-1,))
-      else:
-        mlp_features = features
-      dists.update(self._mlp(mlp_features))
+      #text uses only the text slot
+      text_feat = features[..., n_img_slots:, :].reshape(
+          features.shape[:-2] + (-1,))
+      dists.update(self._mlp(text_feat))
     return dists
 
   def _make_image_dist(self, name, mean):
