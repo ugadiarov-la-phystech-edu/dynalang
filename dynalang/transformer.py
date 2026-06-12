@@ -13,6 +13,8 @@ Tensor layout (batch-first):
 Masks follow PyTorch conventions:
     attn_mask        — additive float mask, -inf blocks a position.
     key_padding_mask — bool array (batch, src_len), True = ignore that key.
+
+Attention is implemented via kvax Flash-Attention 2 (Triton, GPU required).
 """
 
 import math
@@ -20,6 +22,9 @@ from typing import Optional
 
 import jax
 import jax.numpy as jnp
+
+from kvax.ops import create_attention_mask, flash_attention
+from kvax.utils import PADDING_SEGMENT_ID
 
 from . import ninjax as nj
 from .nets import Linear, Norm
@@ -55,29 +60,43 @@ def scaled_dot_product_attention(
     dropout: float = 0.0,
     training: bool = False,
 ) -> jnp.ndarray:
+  """Scaled dot-product attention via kvax Flash-Attention 2.
+  Dropout on attention weights is not supported by kvax and is ignored.
   """
-  q, k, v : (batch, seq, nhead, head_dim)
-  Returns : (batch, tgt_seq, nhead, head_dim)
-  """
-  head_dim = q.shape[-1]
-  scale = 1.0 / math.sqrt(head_dim)
-  logits = jnp.einsum('btnh,bsnh->bnts', q, k) * scale  # (B, H, Tq, Tk)
+  batch, q_len, _, head_dim = q.shape
+  _, kv_len, _, _ = k.shape
+  causal = mask is not None
 
-  bool_mask: Optional[jnp.ndarray] = None
-  if mask is not None:
-    bool_mask = jnp.isfinite(mask)
-    if bool_mask.ndim == 3:
-      bool_mask = bool_mask[:, None, :, :]
-  if key_padding_mask is not None:
-    kpm = ~key_padding_mask[:, None, None, :]  # (B, 1, 1, Tk)
-    bool_mask = kpm if bool_mask is None else (bool_mask & kpm)
+  if causal:
+    pos_q  = jnp.broadcast_to(jnp.arange(q_len,  dtype=jnp.int32)[None, :], (batch, q_len))
+    pos_kv = jnp.broadcast_to(jnp.arange(kv_len, dtype=jnp.int32)[None, :], (batch, kv_len))
+  else:
+    # Constant positions make query_pos >= kv_pos always true → full attention.
+    pos_q  = jnp.zeros((batch, q_len),  dtype=jnp.int32)
+    pos_kv = jnp.zeros((batch, kv_len), dtype=jnp.int32)
 
-  if bool_mask is not None:
-    logits = jnp.where(bool_mask, logits, jnp.finfo(logits.dtype).min)
+  seg_q  = jnp.zeros((batch, q_len),  dtype=jnp.int32)
+  seg_kv = (
+      jnp.where(key_padding_mask, PADDING_SEGMENT_ID, 0).astype(jnp.int32)
+      if key_padding_mask is not None
+      else jnp.zeros((batch, kv_len), dtype=jnp.int32)
+  )
 
-  weights = jax.nn.softmax(logits, axis=-1)
-  weights = _dropout(weights, dropout, training)
-  return jnp.einsum('bnts,bsnh->btnh', weights, v)  # (B, Tq, H, D)
+  attn_mask = create_attention_mask(
+      query_positions=pos_q,  query_segment_ids=seg_q,
+      kv_positions=pos_kv,    kv_segment_ids=seg_kv,
+      calc_bwd_mask=training,
+      skip_pad_tokens=key_padding_mask is not None,
+  )
+
+  return flash_attention(
+      query=q, key=k, value=v,
+      query_positions=pos_q,  query_segment_ids=seg_q,
+      kv_positions=pos_kv,    kv_segment_ids=seg_kv,
+      mask=attn_mask,
+      scale=1.0 / math.sqrt(head_dim),
+      assume_sequential_positions=causal,
+  )
 
 
 class MultiHeadAttention(nj.Module):

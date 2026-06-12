@@ -1,10 +1,12 @@
 import concurrent.futures
+import contextlib
 import os
 
 import embodied
 import jax
 import jax.numpy as jnp
 import numpy as np
+from kvax.utils import attention_specs
 
 from . import jaxutils
 from . import ninjax as nj
@@ -43,6 +45,17 @@ class JAXAgent(embodied.Agent):
     print(f'JAX devices ({jax.local_device_count()}):', available)
     print('Policy devices:', ', '.join([str(x) for x in self.policy_devices]))
     print('Train devices: ', ', '.join([str(x) for x in self.train_devices]))
+    if not self.single_device:
+      raise RuntimeError(
+          'kvax flash attention requires a single train/policy device ')
+    mesh = jax.sharding.Mesh(
+        np.array(self.train_devices).reshape(len(self.train_devices)), ('data',))
+    self._kvax_stack = contextlib.ExitStack()
+    self._kvax_stack.enter_context(mesh)
+    self._kvax_stack.enter_context(attention_specs(
+        query_specs=('data', None, None, None),
+        kv_specs=('data', None, None, None),
+    ))
 
     self._transform()
     self.varibs = self._init_varibs(obs_space, act_space)

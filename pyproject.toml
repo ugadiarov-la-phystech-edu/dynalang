@@ -25,10 +25,13 @@ datasets = "*"
 transformers = "*"
 torch = { version = "*", optional = true }
 wandb = { version = "*", optional = true }
+kvax = { version = "*", optional = true }
 
 [tool.poetry.extras]
 # For pre-embedding new sentences
 dev = ["torch"]
+# Flash attention via kvax (GPU + Triton required)
+flash = ["kvax"]
 
 [build-system]
 requires = ["poetry-core"]
