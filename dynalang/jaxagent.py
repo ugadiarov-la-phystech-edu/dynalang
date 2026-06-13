@@ -2,6 +2,8 @@ import concurrent.futures
 import contextlib
 import os
 
+os.environ.setdefault('TRITON_DISABLE_LINE_INFO', '1')
+
 import embodied
 import jax
 import jax.numpy as jnp
@@ -284,6 +286,7 @@ class JAXAgent(embodied.Agent):
     if self.config.platform == 'cpu':
       jax.config.update('jax_disable_most_optimizations', self.config.debug)
     jaxutils.COMPUTE_DTYPE = getattr(jnp, self.config.precision)
+    jaxutils.configure_flash_attention(self.config)
 
   def _transform(self):
     self._init_policy = nj.pure(lambda x: self.agent.policy_initial(len(x)))

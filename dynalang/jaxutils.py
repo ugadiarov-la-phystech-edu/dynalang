@@ -14,6 +14,24 @@ tree_map = jax.tree_util.tree_map
 tree_leaves = jax.tree_util.tree_leaves
 sg = lambda x: tree_map(jax.lax.stop_gradient, x)
 COMPUTE_DTYPE = jnp.float32
+FLASH_ATTENTION_PARAMS = None
+
+
+def configure_flash_attention(jax_config):
+  """Apply jax.flash_attention settings from configs.yaml."""
+  global FLASH_ATTENTION_PARAMS
+  from kvax.utils import FlashAttentionParamsConfig
+
+  fa = getattr(jax_config, 'flash_attention', None)
+  if fa is None:
+    FLASH_ATTENTION_PARAMS = FlashAttentionParamsConfig()
+    return
+  FLASH_ATTENTION_PARAMS = FlashAttentionParamsConfig(
+      query_block_size=int(fa.query_block_size),
+      kv_block_size=int(fa.kv_block_size),
+      num_warps=int(fa.num_warps),
+      num_stages=int(fa.num_stages),
+  )
 
 def load_partial_checkpoint(varibs, state, load_key=''):
   ckpt_paths, ckpt_params, _ = optree.tree_flatten_with_path(state)

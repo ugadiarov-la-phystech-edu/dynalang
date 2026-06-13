@@ -18,27 +18,26 @@ Attention is implemented via kvax Flash-Attention 2 (Triton, GPU required).
 """
 
 import math
+import os
 from typing import Optional
 
 import jax
 import jax.numpy as jnp
 
 from kvax.ops import create_attention_mask, flash_attention
-from kvax.utils import FlashAttentionParamsConfig, PADDING_SEGMENT_ID
+from kvax.utils import PADDING_SEGMENT_ID
 
+from . import jaxutils
 from . import ninjax as nj
 from .nets import Linear, Norm
-
-# kvax auto-detects block sizes only for H100; on other GPUs bwd_params stays None
-_FA_PARAMS = FlashAttentionParamsConfig()
 
 
 def _kvax_compute_dtype(in_dtype):
   """Use fp16 inside kvax on pre-Ampere GPUs (Turing lacks fp32 tensor-core MMA)."""
   try:
     cap = jax.devices('gpu')[0].compute_capability
-    major = cap[0] if isinstance(cap, tuple) else int(cap)
-    if major < 8:
+    sm = cap[0] + cap[1] / 10 if isinstance(cap, tuple) else float(cap)
+    if sm < 8.0:
       return jnp.float16
   except (IndexError, ValueError, TypeError, AttributeError):
     pass
@@ -78,7 +77,11 @@ def scaled_dot_product_attention(
   """Scaled dot-product attention via kvax Flash-Attention 2.
   Dropout on attention weights is not supported by kvax and is ignored.
   """
-  params = _FA_PARAMS
+  params = jaxutils.FLASH_ATTENTION_PARAMS
+  if params is None:
+    raise RuntimeError(
+        'Flash attention is not configured. '
+        'Call jaxutils.configure_flash_attention(jax_config) first.')
   block = max(params.query_block_size, params.kv_block_size)
 
   in_dtype = q.dtype

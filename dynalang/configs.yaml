@@ -45,6 +45,7 @@ defaults:
     profiler: True
     transfer_guard: True
     mem_fraction: 0.8
+    flash_attention: {query_block_size: 64, kv_block_size: 64, num_warps: 4, num_stages: 3}
 
   run:
     save_frames_to: /dev/null
