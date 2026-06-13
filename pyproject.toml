@@ -1,38 +1,50 @@
-[tool.poetry]
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
 name = "dynalang"
 version = "0.1.0"
 description = "Code for paper 'Learning to Model the World with Language.'"
-authors = ["Jessy Lin <jessy81697@gmail.com>"]
+authors = [{ name = "Jessy Lin", email = "jessy81697@gmail.com" }]
 readme = "README.md"
 keywords = ["environment", "agent", "rl", "language"]
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "numpy==1.26.4",
+    "ruamel.yaml==0.19.1",
+    "gym==0.26.0",
+    "jax==0.4.34",
+    "jaxlib==0.4.34",
+    "kvax==0.1.0",
+    "jax-triton==0.2.0",
+    "triton==3.6",
+    "optax==0.2.5",
+    "optree==0.18.0",
+    "tensorflow-probability==0.25.0",
+    "tensorflow-cpu==2.20.0",
+    "psutil==7.2.2",
+    "rich==14.3.2",
+    "matplotlib==3.10.8",
+    "torch==2.10.0",
+    "torchvision==0.25.0",
+    "timm==1.0.26",
+    "einops==0.8.2",
+    "pytorch-lightning==1.9.5",
+    "omegaconf==2.3.0",
+    "scipy==1.15.3",
+    "cloudpickle==3.1.2",
+    "comet-ml==3.57.3",
+    "tqdm==4.67.3",
+    "moviepy==1.0.3",
+]
 
-[tool.poetry.dependencies]
-python = "^3.8"
-numpy = "*"
-"ruamel.yaml" = "*"
-gym = { version = "0.26" }
-jax = { version = "0.4.*" }
-jaxlib = { version = "0.4.*" }
-optax = "*"
-optree = "*"
-tensorflow_probability = "*"
-tensorflow_cpu = "*"
-psutil = "*"
-rich = "*"
-matplotlib = "*"
-zmq = "*"
-datasets = "*"
-transformers = "*"
-torch = { version = "*", optional = true }
-wandb = { version = "*", optional = true }
-kvax = { version = "*", optional = true }
+[project.optional-dependencies]
+cuda = [
+    "jax-cuda12-plugin==0.4.34",
+    "jax-cuda12-pjrt==0.4.34",
+]
 
-[tool.poetry.extras]
-# For pre-embedding new sentences
-dev = ["torch"]
-# Flash attention via kvax (GPU + Triton required)
-flash = ["kvax"]
-
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["dynalang*"]
