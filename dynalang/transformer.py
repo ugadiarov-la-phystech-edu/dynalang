@@ -79,6 +79,7 @@ def scaled_dot_product_attention(
   Dropout on attention weights is not supported by kvax and is ignored.
   """
   params = _FA_PARAMS
+  block = max(params.query_block_size, params.kv_block_size)
 
   in_dtype = q.dtype
   compute_dtype = _kvax_compute_dtype(in_dtype)
@@ -87,33 +88,60 @@ def scaled_dot_product_attention(
   _, kv_len, _, _ = k.shape
   causal = mask is not None
 
-  if causal:
-    pos_q = jnp.broadcast_to(
-        jnp.arange(q_len, dtype=jnp.int32)[None, :], (batch, q_len))
-    pos_kv = jnp.broadcast_to(
-        jnp.arange(kv_len, dtype=jnp.int32)[None, :], (batch, kv_len))
-  else:
-    # Constant positions make query_pos >= kv_pos always true → full attention.
-    pos_q = jnp.zeros((batch, q_len), dtype=jnp.int32)
-    pos_kv = jnp.zeros((batch, kv_len), dtype=jnp.int32)
+  def _pad_to(n):
+    return ((n + block - 1) // block) * block
 
-  seg_q = jnp.zeros((batch, q_len), dtype=jnp.int32)
-  seg_kv = (
-      jnp.where(key_padding_mask, PADDING_SEGMENT_ID, 0).astype(jnp.int32)
-      if key_padding_mask is not None
-      else jnp.zeros((batch, kv_len), dtype=jnp.int32)
-  )
+  q_pad = _pad_to(q_len) - q_len
+  kv_pad = _pad_to(kv_len) - kv_len
 
+  def _pad_seq(x, n):
+    return x if n == 0 else jnp.pad(
+        x, ((0, 0), (0, n), (0, 0), (0, 0)))
+
+  q = _pad_seq(q, q_pad)
+  k = _pad_seq(k, kv_pad)
+  v = _pad_seq(v, kv_pad)
   if compute_dtype != in_dtype:
     q = q.astype(compute_dtype)
     k = k.astype(compute_dtype)
     v = v.astype(compute_dtype)
+
+  q_len_padded = q.shape[1]
+  kv_len_padded = k.shape[1]
+
+  if causal:
+    pos_q = jnp.broadcast_to(
+        jnp.arange(q_len_padded, dtype=jnp.int32)[None, :], (batch, q_len_padded))
+    pos_kv = jnp.broadcast_to(
+        jnp.arange(kv_len_padded, dtype=jnp.int32)[None, :], (batch, kv_len_padded))
+  else:
+    # Constant positions make query_pos >= kv_pos always true → full attention.
+    pos_q = jnp.zeros((batch, q_len_padded), dtype=jnp.int32)
+    pos_kv = jnp.zeros((batch, kv_len_padded), dtype=jnp.int32)
+
+  seg_q = jnp.zeros((batch, q_len_padded), dtype=jnp.int32)
+  if key_padding_mask is not None:
+    if kv_pad > 0:
+      key_padding_mask = jnp.concatenate([
+          key_padding_mask,
+          jnp.zeros((batch, kv_pad), dtype=bool),
+      ], axis=1)
+    seg_kv = jnp.where(key_padding_mask, PADDING_SEGMENT_ID, 0).astype(jnp.int32)
+  elif kv_pad > 0:
+    kv_valid = jnp.broadcast_to(
+        jnp.arange(kv_len_padded)[None, :] < kv_len, (batch, kv_len_padded))
+    seg_kv = jnp.where(kv_valid, 0, PADDING_SEGMENT_ID).astype(jnp.int32)
+  else:
+    seg_kv = jnp.zeros((batch, kv_len_padded), dtype=jnp.int32)
+
+  has_pad = (q_pad > 0) or (kv_pad > 0) or key_padding_mask is not None
 
   attn_mask = create_attention_mask(
       query_positions=pos_q,  query_segment_ids=seg_q,
       kv_positions=pos_kv,    kv_segment_ids=seg_kv,
       fwd_params=params, bwd_params=params,
       calc_bwd_mask=training,
+      skip_pad_tokens=has_pad,
   )
 
   out = flash_attention(
@@ -125,7 +153,7 @@ def scaled_dot_product_attention(
       fwd_params=params, bwd_params=params,
       assume_sequential_positions=causal,
   )
-  return out.astype(in_dtype)
+  return out[:, :q_len].astype(in_dtype)
 
 
 class MultiHeadAttention(nj.Module):
