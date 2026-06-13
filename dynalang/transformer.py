@@ -24,10 +24,25 @@ import jax
 import jax.numpy as jnp
 
 from kvax.ops import create_attention_mask, flash_attention
-from kvax.utils import PADDING_SEGMENT_ID
+from kvax.utils import FlashAttentionParamsConfig, PADDING_SEGMENT_ID
 
 from . import ninjax as nj
 from .nets import Linear, Norm
+
+# kvax auto-detects block sizes only for H100; on other GPUs bwd_params stays None
+_FA_PARAMS = FlashAttentionParamsConfig()
+
+
+def _kvax_compute_dtype(in_dtype):
+  """Use fp16 inside kvax on pre-Ampere GPUs (Turing lacks fp32 tensor-core MMA)."""
+  try:
+    cap = jax.devices('gpu')[0].compute_capability
+    major = cap[0] if isinstance(cap, tuple) else int(cap)
+    if major < 8:
+      return jnp.float16
+  except (IndexError, ValueError, TypeError, AttributeError):
+    pass
+  return in_dtype
 
 
 def _dropout(x: jnp.ndarray, rate: float, training: bool) -> jnp.ndarray:
@@ -63,40 +78,54 @@ def scaled_dot_product_attention(
   """Scaled dot-product attention via kvax Flash-Attention 2.
   Dropout on attention weights is not supported by kvax and is ignored.
   """
+  params = _FA_PARAMS
+
+  in_dtype = q.dtype
+  compute_dtype = _kvax_compute_dtype(in_dtype)
+
   batch, q_len, _, head_dim = q.shape
   _, kv_len, _, _ = k.shape
   causal = mask is not None
 
   if causal:
-    pos_q  = jnp.broadcast_to(jnp.arange(q_len,  dtype=jnp.int32)[None, :], (batch, q_len))
-    pos_kv = jnp.broadcast_to(jnp.arange(kv_len, dtype=jnp.int32)[None, :], (batch, kv_len))
+    pos_q = jnp.broadcast_to(
+        jnp.arange(q_len, dtype=jnp.int32)[None, :], (batch, q_len))
+    pos_kv = jnp.broadcast_to(
+        jnp.arange(kv_len, dtype=jnp.int32)[None, :], (batch, kv_len))
   else:
     # Constant positions make query_pos >= kv_pos always true → full attention.
-    pos_q  = jnp.zeros((batch, q_len),  dtype=jnp.int32)
+    pos_q = jnp.zeros((batch, q_len), dtype=jnp.int32)
     pos_kv = jnp.zeros((batch, kv_len), dtype=jnp.int32)
 
-  seg_q  = jnp.zeros((batch, q_len),  dtype=jnp.int32)
+  seg_q = jnp.zeros((batch, q_len), dtype=jnp.int32)
   seg_kv = (
       jnp.where(key_padding_mask, PADDING_SEGMENT_ID, 0).astype(jnp.int32)
       if key_padding_mask is not None
       else jnp.zeros((batch, kv_len), dtype=jnp.int32)
   )
 
+  if compute_dtype != in_dtype:
+    q = q.astype(compute_dtype)
+    k = k.astype(compute_dtype)
+    v = v.astype(compute_dtype)
+
   attn_mask = create_attention_mask(
       query_positions=pos_q,  query_segment_ids=seg_q,
       kv_positions=pos_kv,    kv_segment_ids=seg_kv,
+      fwd_params=params, bwd_params=params,
       calc_bwd_mask=training,
-      skip_pad_tokens=key_padding_mask is not None,
   )
 
-  return flash_attention(
+  out = flash_attention(
       query=q, key=k, value=v,
       query_positions=pos_q,  query_segment_ids=seg_q,
       kv_positions=pos_kv,    kv_segment_ids=seg_kv,
       mask=attn_mask,
       scale=1.0 / math.sqrt(head_dim),
+      fwd_params=params, bwd_params=params,
       assume_sequential_positions=causal,
   )
+  return out.astype(in_dtype)
 
 
 class MultiHeadAttention(nj.Module):
