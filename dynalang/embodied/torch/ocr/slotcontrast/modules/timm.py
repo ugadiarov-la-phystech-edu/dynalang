@@ -468,8 +468,31 @@ def vit_large_patch7_224_msn(pretrained=False, **kwargs):
     return _create_msn_vit("vit_large_patch7_224_msn", pretrained=pretrained, **model_kwargs)
 
 
+def _disable_fused_attn():
+    """Globally disable timm's fused (F.scaled_dot_product_attention) path.
+
+    timm 1.0.x Attention uses fused_attn=use_fused_attn() (True by default on
+    torch>=2.x). The fused native op is not symbolically traceable by
+    torchvision's FX feature extractor and fails on its is_causal arg with
+    "argument 'is_causal' must be bool". set_fused_attn(False) forces the manual
+    (fx-traceable) attention path everywhere.
+    """
+    for mod_path in ('timm.layers', 'timm.models.layers'):
+        try:
+            import importlib
+            mod = importlib.import_module(mod_path)
+            if hasattr(mod, 'set_fused_attn'):
+                mod.set_fused_attn(False)
+                return True
+        except ImportError:
+            continue
+    return False
+
+
 def patch_timm_for_fx_tracing():
     """Patch timm to allow torch.fx tracing."""
+
+    _disable_fused_attn()
 
     def resample_abs_pos_embed(
         posemb,
