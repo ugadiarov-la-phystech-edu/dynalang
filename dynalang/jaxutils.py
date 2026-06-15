@@ -389,10 +389,13 @@ class Optimizer(nj.Module):
 
   def __init__(
       self, lr, opt='adam', eps=1e-5, clip=100.0, warmup=0, wd=0.0,
-      wd_pattern=r'/(w|kernel)$', lateclip=0.0, frozen_keys=r'^$'):
+      wd_pattern=r'/(w|kernel)$', lateclip=0.0, frozen_keys=r'^$',
+      accum_steps=1):
     assert wd_pattern[0] not in ('0', '1')
+    assert accum_steps >= 1, accum_steps
     # assert self.path not in self.PARAM_COUNTS
     self.PARAM_COUNTS[self.path] = None
+    self.accum_steps = int(accum_steps)
     wd_pattern = re.compile(wd_pattern)
     frozen_keys = re.compile(frozen_keys)
     chain = []
@@ -429,6 +432,9 @@ class Optimizer(nj.Module):
     )
 #    self.opt = optax.chain(*chain)
     self.step = nj.Variable(jnp.array, 0, jnp.int32, name='step')
+    if self.accum_steps > 1:
+      self.accum_count = nj.Variable(
+          jnp.array, 0, jnp.int32, name='accum_count')
     self.scaling = (COMPUTE_DTYPE == jnp.float16)
     if self.scaling:
       self.opt = optax.apply_if_finite(self.opt, max_consecutive_errors=1000)
@@ -461,18 +467,52 @@ class Optimizer(nj.Module):
       metrics[f'{self.name}_grad_scale'] = self.grad_scale.read()
       metrics[f'{self.name}_grad_overflow'] = (~finite).astype(jnp.float32)
     optstate = self.get('state', self.opt.init, params)
-    updates, optstate = self.opt.update(grads, optstate, params)
+    if self.accum_steps > 1:
+      params, optstate, norm = self._accumulate(grads, params, optstate)
+    else:
+      updates, optstate = self.opt.update(grads, optstate, params)
+      params = optax.apply_updates(params, updates)
+      norm = optax.global_norm(grads)
+      if self.scaling:
+        norm = jnp.where(jnp.isfinite(norm), norm, jnp.nan)
+      self.step.write(self.step.read() + jnp.isfinite(norm).astype(jnp.int32))
     self.put('state', optstate)
-    nj.context().update(optax.apply_updates(params, updates))
-    norm = optax.global_norm(grads)
-    if self.scaling:
-      norm = jnp.where(jnp.isfinite(norm), norm, jnp.nan)
-    self.step.write(self.step.read() + jnp.isfinite(norm).astype(jnp.int32))
+    nj.context().update(params)
     metrics['loss'] = loss.mean()
     metrics['grad_norm'] = norm
     metrics['grad_steps'] = self.step.read()
     metrics = {f'{self.name}_{k}': v for k, v in metrics.items()}
     return (metrics, aux) if has_aux else metrics
+
+  def _accumulate(self, grads, params, optstate):
+    accum = self.get('accum', lambda g: tree_map(jnp.zeros_like, g), grads)
+    accum = tree_map(jnp.add, accum, grads)
+    count = self.accum_count.read() + 1
+    apply_now = (count % self.accum_steps == 0)
+    avg_grads = tree_map(lambda x: x / self.accum_steps, accum)
+    norm = optax.global_norm(avg_grads)
+    if self.scaling:
+      norm = jnp.where(jnp.isfinite(norm), norm, jnp.nan)
+
+    def do_apply(operands):
+      avg_grads, optstate, params, accum = operands
+      updates, optstate = self.opt.update(avg_grads, optstate, params)
+      params = optax.apply_updates(params, updates)
+      accum = tree_map(jnp.zeros_like, accum)
+      return params, optstate, accum
+
+    def no_apply(operands):
+      avg_grads, optstate, params, accum = operands
+      return params, optstate, accum
+
+    params, optstate, accum = jax.lax.cond(
+        apply_now, do_apply, no_apply,
+        (avg_grads, optstate, params, accum))
+    self.put('accum', accum)
+    self.accum_count.write(count % self.accum_steps)
+    did_step = (apply_now & jnp.isfinite(norm)).astype(jnp.int32)
+    self.step.write(self.step.read() + did_step)
+    return params, optstate, norm
 
   def _update_scale(self, grads):
     finite = jnp.array([
