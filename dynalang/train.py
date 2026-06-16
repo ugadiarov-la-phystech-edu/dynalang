@@ -286,9 +286,14 @@ def wrapped_env(config, batch, is_eval=False, **overrides):
     ctor = bind(wrappers.RestartOnException, ctor)
   if batch:
     amount = config.envs.eval_amount if is_eval else config.envs.amount
-    envs = [ctor() for _ in range(amount)]
-    
+    spare = config.envs.get('spare', 0)
     use_slots = config.get('use_slot_extractor', False)
+    if spare > 0 and not use_slots:
+      envs = [ctor() for _ in range(amount + spare)]
+      return embodied.BufferedBatchEnv(
+          envs, amount, (config.envs.parallel != 'none'))
+    envs = [ctor() for _ in range(amount)]
+
     if use_slots:
       slot_extractor = make_slot_extractor(config)
       return embodied.BatchSlotExtractorEnv(

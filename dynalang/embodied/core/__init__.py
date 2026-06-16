@@ -21,6 +21,7 @@ from .uuid import uuid
 from .usage import Usage
 
 from .batch_env import BatchEnv
+from .buffered_batch_env import BufferedBatchEnv
 from .slot_batch_env import BatchSlotExtractorEnv
 from .slot_extractor import SlotExtractor, DummySlotExtractor
 from .random import RandomAgent
