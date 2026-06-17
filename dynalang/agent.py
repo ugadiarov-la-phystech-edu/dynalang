@@ -546,7 +546,7 @@ class ImagActorCritic(nj.Module):
     total = sum(self.scales[k] for k in self.critics)
     for key, critic in self.critics.items():
       rew, ret, base = critic.score(traj, self.actor)
-      offset, invscale = self.retnorms[key](ret)
+      offset, invscale = self.retnorms[key](ret, mask=self.opt.will_apply())
       normed_ret = (ret - offset) / invscale
       normed_base = (base - offset) / invscale
       advs.append((normed_ret - normed_base) * self.scales[key] / total)
@@ -638,7 +638,7 @@ class VFunction(nj.Module):
     target = sg(self.score(traj, slow=self.config.slow_critic_target)[1])
     mets, metrics = self.opt(self.net, self.loss, traj, target, has_aux=True)
     metrics.update(mets)
-    self.updater()
+    self.updater(update=self.opt.just_applied())
     return metrics
 
   def loss(self, traj, target):

@@ -303,11 +303,11 @@ class Moments(nj.Module):
     else:
       raise NotImplementedError(self.impl)
 
-  def __call__(self, x):
-    self.update(x)
+  def __call__(self, x, mask=True):
+    self.update(x, mask)
     return self.stats()
 
-  def update(self, x):
+  def update(self, x, mask=True):
     if parallel():
       mean = lambda x: jax.lax.pmean(x.mean(), 'i')
       min_ = lambda x: jax.lax.pmin(x.min(), 'i')
@@ -320,31 +320,35 @@ class Moments(nj.Module):
       per = jnp.percentile
     x = sg(x.astype(jnp.float32))
     m = self.decay
+    gate = jnp.asarray(mask, jnp.float32)
+    istep = gate.astype(jnp.int32)
+    def setv(var, newval):
+      var.write(gate * newval + (1 - gate) * var.read())
     if self.impl == 'off':
       pass
     elif self.impl == 'mean_std':
-      self.step.write(self.step.read() + 1)
-      self.mean.write(m * self.mean.read() + (1 - m) * mean(x))
-      self.sqrs.write(m * self.sqrs.read() + (1 - m) * mean(x * x))
+      self.step.write(self.step.read() + istep)
+      setv(self.mean, m * self.mean.read() + (1 - m) * mean(x))
+      setv(self.sqrs, m * self.sqrs.read() + (1 - m) * mean(x * x))
     elif self.impl == 'min_max':
       low, high = min_(x), max_(x)
-      self.low.write(m * jnp.minimum(self.low.read(), low) + (1 - m) * low)
-      self.high.write(m * jnp.maximum(self.high.read(), high) + (1 - m) * high)
+      setv(self.low, m * jnp.minimum(self.low.read(), low) + (1 - m) * low)
+      setv(self.high, m * jnp.maximum(self.high.read(), high) + (1 - m) * high)
     elif self.impl == 'perc_ema':
       low, high = per(x, self.perclo), per(x, self.perchi)
-      self.low.write(m * self.low.read() + (1 - m) * low)
-      self.high.write(m * self.high.read() + (1 - m) * high)
+      setv(self.low, m * self.low.read() + (1 - m) * low)
+      setv(self.high, m * self.high.read() + (1 - m) * high)
     elif self.impl == 'perc_ema_corr':
-      self.step.write(self.step.read() + 1)
+      self.step.write(self.step.read() + istep)
       low, high = per(x, self.perclo), per(x, self.perchi)
-      self.low.write(m * self.low.read() + (1 - m) * low)
-      self.high.write(m * self.high.read() + (1 - m) * high)
+      setv(self.low, m * self.low.read() + (1 - m) * low)
+      setv(self.high, m * self.high.read() + (1 - m) * high)
     elif self.impl == 'mean_mag':
       curr = mean(jnp.abs(x))
-      self.mag.write(m * self.mag.read() + (1 - m) * curr)
+      setv(self.mag, m * self.mag.read() + (1 - m) * curr)
     elif self.impl == 'max_mag':
       curr = max_(jnp.abs(x))
-      self.mag.write(m * jnp.maximum(self.mag.read(), curr) + (1 - m) * curr)
+      setv(self.mag, m * jnp.maximum(self.mag.read(), curr) + (1 - m) * curr)
     else:
       raise NotImplementedError(self.impl)
 
@@ -352,7 +356,9 @@ class Moments(nj.Module):
     if self.impl == 'off':
       return 0.0, 1.0
     elif self.impl == 'mean_std':
-      corr = 1 - self.decay ** self.step.read().astype(jnp.float32)
+
+      corr = jnp.maximum(1 - self.decay ** self.step.read().astype(jnp.float32),
+                         1e-8)
       mean = self.mean.read() / corr
       var = (self.sqrs.read() / corr) - self.mean.read() ** 2
       std = jnp.sqrt(jnp.maximum(var, 1 / self.max ** 2) + self.eps)
@@ -366,7 +372,8 @@ class Moments(nj.Module):
       invscale = jnp.maximum(1 / self.max, self.high.read() - self.low.read())
       return sg(offset), sg(invscale)
     elif self.impl == 'perc_ema_corr':
-      corr = 1 - self.decay ** self.step.read().astype(jnp.float32)
+      corr = jnp.maximum(1 - self.decay ** self.step.read().astype(jnp.float32),
+                         1e-8)
       lo = self.low.read() / corr
       hi = self.high.read() / corr
       invscale = jnp.maximum(1 / self.max, hi - lo)
@@ -514,6 +521,16 @@ class Optimizer(nj.Module):
     self.step.write(self.step.read() + did_step)
     return params, optstate, norm
 
+  def will_apply(self):
+    if self.accum_steps <= 1:
+      return jnp.array(True)
+    return ((self.accum_count.read() + 1) % self.accum_steps) == 0
+
+  def just_applied(self):
+    if self.accum_steps <= 1:
+      return jnp.array(True)
+    return self.accum_count.read() == 0
+
   def _update_scale(self, grads):
     finite = jnp.array([
         jnp.isfinite(x).all() for x in jax.tree_util.tree_leaves(grads)]).all()
@@ -561,16 +578,17 @@ class SlowUpdater:
     self.period = period
     self.updates = nj.Variable(jnp.zeros, (), jnp.int32, name='updates')
 
-  def __call__(self):
+  def __call__(self, update=True):
     assert self.src.getm()
+    do = jnp.asarray(update, jnp.float32)
     updates = self.updates.read()
     need_init = (updates == 0).astype(jnp.float32)
     need_update = (updates % self.period == 0).astype(jnp.float32)
-    mix = jnp.clip(1.0 * need_init + self.fraction * need_update, 0, 1)
+    mix = jnp.clip(1.0 * need_init + self.fraction * need_update, 0, 1) * do
     source = {
         k.replace(f'/{self.src.name}/', f'/{self.dst.name}/'): v
         for k, v in self.src.getm().items()}
     self.dst.putm(tree_map(
         lambda s, d: mix * s + (1 - mix) * d,
         source, self.dst.getm()))
-    self.updates.write(updates + 1)
+    self.updates.write(updates + do.astype(jnp.int32))
