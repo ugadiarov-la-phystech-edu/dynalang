@@ -83,6 +83,7 @@ def scaled_dot_product_attention(
         'Flash attention is not configured. '
         'Call jaxutils.configure_flash_attention(jax_config) first.')
   block = max(params.query_block_size, params.kv_block_size)
+  min_blocks = jaxutils.FLASH_ATTENTION_MIN_BLOCKS
 
   in_dtype = q.dtype
   compute_dtype = _kvax_compute_dtype(in_dtype)
@@ -92,7 +93,8 @@ def scaled_dot_product_attention(
   causal = mask is not None
 
   def _pad_to(n):
-    return ((n + block - 1) // block) * block
+    padded = ((n + block - 1) // block) * block
+    return max(padded, min_blocks * block)
 
   q_pad = _pad_to(q_len) - q_len
   kv_pad = _pad_to(kv_len) - kv_len
