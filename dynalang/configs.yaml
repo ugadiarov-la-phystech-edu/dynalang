@@ -105,6 +105,8 @@ defaults:
       use_descriptions: False
       desc_length: 50
       gpu_id: 0
+      split_scenes: False
+      group_by_scene: False
     messenger:
       size: [16, 16]
       length: 64

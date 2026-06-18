@@ -8,6 +8,29 @@ import random
 from PIL import Image, ImageFont, ImageDraw
 import pickle
 
+
+def _resolve_worker_id(worker_index, num_workers):
+  if worker_index is None:
+    worker_index = int(os.environ.get('DYNALANG_ENV_WORKER', '0'))
+  if num_workers is None:
+    num_workers = int(os.environ.get('DYNALANG_ENV_NUM_WORKERS', '1'))
+  return worker_index, num_workers
+
+
+def _split_scenes(scenes, num_workers, seed):
+  """Round-robin scene split used by VLN-CE / habitat-lab VectorEnv."""
+  scenes = list(scenes)
+  rng = random.Random(seed)
+  rng.shuffle(scenes)
+  if len(scenes) == 1:
+    return [[scenes[0]] for _ in range(num_workers)]
+  splits = [[] for _ in range(num_workers)]
+  for idx, scene in enumerate(scenes):
+    splits[idx % num_workers].append(scene)
+  assert sum(map(len, splits)) == len(scenes)
+  return splits
+
+
 class VLNEnv(embodied.Env):
 
   def __init__(
@@ -35,6 +58,10 @@ class VLNEnv(embodied.Env):
     desc_length=50,
     seed=None,
     gpu_id=0,
+    split_scenes=False,
+    worker_index=None,
+    num_workers=None,
+    group_by_scene=False,
   ):
     assert mode in dataset, "Mismatched env mode and dataset"
 
@@ -70,12 +97,15 @@ class VLNEnv(embodied.Env):
     if seed is None:
       seed = 42
     assert self._desc_length <= self._length
-    
+
+    worker_index, num_workers = _resolve_worker_id(worker_index, num_workers)
+    active_split = split_scenes and num_workers > 1
+
     config_opts = [
       'TASK_CONFIG.DATASET.SPLIT', dataset,
       'TASK_CONFIG.TASK.NDTW.SPLIT', dataset,
       'TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.SHUFFLE', mode == 'train',
-      'TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.GROUP_BY_SCENE', mode != 'train',
+      'TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.GROUP_BY_SCENE', group_by_scene,
       'TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.CYCLE', mode == 'train',
     ]
     if mode == 'test':
@@ -94,6 +124,31 @@ class VLNEnv(embodied.Env):
     self.config.defrost()
     self.config.SIMULATOR_GPU_IDS = [gpu_id]
     self.config.TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.GPU_DEVICE_ID = gpu_id
+    if active_split:
+      from habitat_lab.habitat import make_dataset
+
+      dataset_obj = make_dataset(
+        self.config.TASK_CONFIG.DATASET.TYPE,
+        config=self.config.TASK_CONFIG.DATASET,
+      )
+      scenes = dataset_obj.get_scenes_to_load(self.config.TASK_CONFIG.DATASET)
+      if len(scenes) == 0:
+        raise RuntimeError(
+          'No scenes to load; scene split requires a non-empty MP3D dataset.')
+      if len(scenes) < num_workers and len(scenes) != 1:
+        raise RuntimeError(
+          f'Reduce envs.amount ({num_workers}) below number of scenes '
+          f'({len(scenes)}).')
+      assigned = _split_scenes(scenes, num_workers, seed)[worker_index]
+      self.config.TASK_CONFIG.DATASET.CONTENT_SCENES = assigned
+      self.config.TASK_CONFIG.SEED = seed + worker_index
+      print(
+        f'[VLN worker {worker_index}/{num_workers}] '
+        f'{len(assigned)}/{len(scenes)} scenes assigned:',
+        flush=True,
+      )
+      for scene in assigned:
+        print(f'  {scene}', flush=True)
     if use_semantic:
       sensors = list(self.config.TASK_CONFIG.SIMULATOR.AGENT_0.SENSORS)
       if 'SEMANTIC_SENSOR' not in sensors:
