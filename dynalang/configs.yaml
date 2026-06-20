@@ -83,8 +83,8 @@ defaults:
   envs: {amount: 4, parallel: process, length: 0, reset: True, restart: True, discretize: 0, eval_amount: 4}
   wrapper: {length: 0, reset: True, discretize: 0, checks: False, timeout_reward: 0.0}
   env:
-    atari: {size: [64, 64], repeat: 4, sticky: True, gray: True, actions: all, lives: unused, noops: 0, pooling: 2, aggregate: max, resize: pillow}
-    atari100k: {size: [64, 64], repeat: 4, sticky: False, gray: False, actions: needed, lives: unused, noops: 30, resize: pillow}
+    atari: {size: [64, 64], repeat: 4, sticky: True, gray: True, actions: all, lives: False, noops: 0}
+    atari100k: {size: [64, 64], repeat: 4, sticky: False, gray: False, actions: needed, lives: False, noops: 30}
     dmlab: {size: [64, 64], repeat: 4, episodic: True}
     minecraft: {size: [64, 64], break_speed: 100.0, logs: False}
     dmc: {size: [64, 64], repeat: 2, camera: -1}

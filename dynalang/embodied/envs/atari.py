@@ -8,7 +8,12 @@ class Atari(embodied.Env):
 
   def __init__(
       self, name, repeat=4, size=(84, 84), gray=True, noops=0, lives=False,
-      sticky=True, actions='all', length=108000, seed=None):
+      sticky=True, actions='all', length=108000, seed=None, **unused):
+    del unused
+    if lives in ('unused', 'none', None):
+      lives = False
+    else:
+      lives = bool(lives)
     assert size[0] == size[1]
 
     if self.LOCK is None:
