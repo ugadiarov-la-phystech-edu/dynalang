@@ -14,6 +14,7 @@ dependencies = [
     "numpy==1.26.4",
     "ruamel.yaml==0.19.1",
     "gym==0.26.0",
+    "ale-py==0.9.0",
     "jax==0.4.33",
     "jaxlib==0.4.33",
     "optax==0.2.5",
