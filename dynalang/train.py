@@ -279,7 +279,7 @@ def make_slot_extractor(config):
 
 
 def wrapped_env(config, batch, is_eval=False, **overrides):
-  ctor = bind(make_env, config, **overrides)
+  ctor = bind(make_env, config, is_eval=is_eval, **overrides)
   if batch and config.envs.parallel != 'none':
     ctor = bind(embodied.Parallel, ctor, config.envs.parallel)
   if config.envs.restart:
@@ -306,7 +306,7 @@ def wrapped_env(config, batch, is_eval=False, **overrides):
     return ctor()
 
 
-def make_env(config, **overrides):
+def make_env(config, is_eval=False, **overrides):
   from embodied.envs import from_gym
   suite, task = config.task.split('_', 1)
   ctor = {
@@ -334,6 +334,12 @@ def make_env(config, **overrides):
     module = importlib.import_module(module)
     ctor = getattr(module, cls)
   kwargs = config.env.get(suite, {})
+  if suite == 'vln' and 'log_image_every' not in kwargs:
+    if is_eval:
+      amount = max(config.envs.eval_amount, 1)
+      kwargs['log_image_every'] = max(1, int(config.run.log_every // amount))
+    else:
+      kwargs['log_image_every'] = 0
   kwargs.update(overrides)
   env = ctor(task, **kwargs)
   return wrap_env(env, config)

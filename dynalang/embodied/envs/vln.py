@@ -35,6 +35,9 @@ class VLNEnv(embodied.Env):
     desc_length=50,
     seed=None,
     gpu_id=0,
+    # Annotate log_image every N env steps; 0=never, -1=always. Default from
+    # run.log_every is set in train.make_env when this is omitted from config.
+    log_image_every=None,
   ):
     assert mode in dataset, "Mismatched env mode and dataset"
 
@@ -66,6 +69,8 @@ class VLNEnv(embodied.Env):
     # Number of episodes (for annealing expert episodes if using demos)
     self._num_eps = 0
     self._disc_act_space = ['STOP', 'MOVE_FORWARD', 'TURN_LEFT', 'TURN_RIGHT']
+    self._log_image_every = 0 if log_image_every is None else log_image_every
+    self._total_steps = 0
 
     if seed is None:
       seed = 42
@@ -219,9 +224,10 @@ class VLNEnv(embodied.Env):
         "is_read_step": not self.done_first_input,
         "is_demo": self._expert_ep,
       })
-      ob[f'log_image'] = self.render_with_text(
+      ob['log_image'] = self._make_log_image(
         ob, self.cur_text, log_traj_id,
         self._disc_act_space[self._action_index(action['action'])],
+        is_first=True, is_last=False,
       )
 
       if self._expert_ep:
@@ -230,7 +236,8 @@ class VLNEnv(embodied.Env):
         ob["next_expert_ac"] = self.next_expert_ac
       else:
         ob["next_expert_ac"] = -1
-      
+
+      self._total_steps += 1
       return ob
 
     # STOP, MOVE_FORWARD, TURN_LEFT, TURN_RIGHT
@@ -272,10 +279,23 @@ class VLNEnv(embodied.Env):
       f'log_{self._mode}_oracle_success': infos['oracle_success'],
       f'log_language_info': self.cur_text,
     })
-    ob[f'log_image'] = self.render_with_text(
-      ob, self.cur_text, log_traj_id, self._disc_act_space[action]
+    is_last = (self._step >= self._length) or self._done
+    ob['log_image'] = self._make_log_image(
+      ob, self.cur_text, log_traj_id, self._disc_act_space[action],
+      is_first=False, is_last=is_last,
     )
+    self._total_steps += 1
     return ob
+
+  def _make_log_image(self, ob, instr_text, traj_id, ac, is_first=False, is_last=False):
+    """Cheap log_image by default; annotate only at log cadence or episode bounds."""
+    if self._log_image_every < 0:
+      return self.render_with_text(ob, instr_text, traj_id, ac)
+    if self._log_image_every == 0:
+      return ob['image'].copy()
+    if is_first or is_last or (self._total_steps % self._log_image_every == 0):
+      return self.render_with_text(ob, instr_text, traj_id, ac)
+    return ob['image'].copy()
 
   def _embed(self, string):
     """Embed string with encoder or get from cache."""
