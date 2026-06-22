@@ -38,11 +38,20 @@ class VLNEnv(embodied.Env):
     # Annotate log_image every N env steps; 0=never, -1=always. Default from
     # run.log_every is set in train.make_env when this is omitted from config.
     log_image_every=None,
+    # If True, downscale RGB/depth to ``size`` in preprocess (PIL). If False,
+    # keep the raw simulator-sensor resolution (no PIL resize).
+    resize=True,
+    # Optional override for the simulator RGB/DEPTH sensor resolution (square).
+    # None keeps the value from vlnce_task.yaml (256). Useful to benchmark
+    # rendering at the target resolution directly instead of downscaling later.
+    sensor_size=None,
   ):
     assert mode in dataset, "Mismatched env mode and dataset"
 
     self._task = 'cont'
     self._size = size
+    self._resize = resize
+    self._sensor_size = sensor_size
     self._length = length
     self._step = 0
     self._done = False
@@ -99,6 +108,11 @@ class VLNEnv(embodied.Env):
     self.config.defrost()
     self.config.SIMULATOR_GPU_IDS = [gpu_id]
     self.config.TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.GPU_DEVICE_ID = gpu_id
+    if self._sensor_size is not None:
+      self.config.TASK_CONFIG.SIMULATOR.RGB_SENSOR.WIDTH = self._sensor_size
+      self.config.TASK_CONFIG.SIMULATOR.RGB_SENSOR.HEIGHT = self._sensor_size
+      self.config.TASK_CONFIG.SIMULATOR.DEPTH_SENSOR.WIDTH = self._sensor_size
+      self.config.TASK_CONFIG.SIMULATOR.DEPTH_SENSOR.HEIGHT = self._sensor_size
     if use_semantic:
       sensors = list(self.config.TASK_CONFIG.SIMULATOR.AGENT_0.SENSORS)
       if 'SEMANTIC_SENSOR' not in sensors:
@@ -135,12 +149,13 @@ class VLNEnv(embodied.Env):
     spaces = {k: embodied.Space(v.dtype, v.shape)
               for k, v in self._env.observation_space.items()}
     new_space = {}
-    # resize image
+    # Output image size: downscaled ``size`` when resizing, else raw sensor res.
+    img_hw = tuple(self._size) if self._resize else tuple(spaces['rgb'].shape[:2])
     new_space['image'] = embodied.Space(
       dtype=spaces['rgb'].dtype,
-      shape=self._size + (3,),
-      low=np.zeros(self._size + (3,), dtype=np.int8),
-      high=255 * np.ones(self._size + (3,), dtype=np.int8)
+      shape=img_hw + (3,),
+      low=np.zeros(img_hw + (3,), dtype=np.int8),
+      high=255 * np.ones(img_hw + (3,), dtype=np.int8)
     )
     if self._use_depth:
       new_space['depth'] = new_space['image']
@@ -354,17 +369,21 @@ class VLNEnv(embodied.Env):
     """Normalize and clip depth images."""
     depth = (np.clip(depth, 0, 5.0) / 5.0 * 255).astype(np.uint8) # Clip to 5m, convert to uint8
     depth = np.repeat(depth, 3, axis=-1)
-    depth = Image.fromarray(depth)
-    depth = depth.resize(self._size)
+    if self._resize:
+      depth = Image.fromarray(depth)
+      depth = depth.resize(self._size)
     depth = np.asarray(depth, dtype=np.uint8)
     return depth
       
   def preprocess_obs(self, ob):
     new_ob = {}
     rgb = ob['rgb']
-    img = Image.fromarray(rgb)
-    img = img.resize(self._size)
-    new_ob['image'] =  np.asarray(img, dtype=np.uint8)
+    if self._resize:
+      img = Image.fromarray(rgb)
+      img = img.resize(self._size)
+      new_ob['image'] = np.asarray(img, dtype=np.uint8)
+    else:
+      new_ob['image'] = np.asarray(rgb, dtype=np.uint8)
     if self._use_depth:
       new_ob['depth'] = self.preprocess_depth(ob['depth'])
     if self._use_text:
