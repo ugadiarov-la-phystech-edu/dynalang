@@ -96,6 +96,10 @@ class Agent(nj.Module):
         return wm_outs, state, metrics
     # Flatten (batch, seq) -> (batch * seq)
     start = tree_map(lambda x: x.reshape([-1] + list(x.shape[2:])), context)
+    if self.config.imag_samples > 0:
+      total = len(jax.tree_util.tree_leaves(start)[0])
+      idx = jax.random.permutation(nj.rng(), total)[:self.config.imag_samples]
+      start = tree_map(lambda x: x[idx], start)
     _, mets = self.task_behavior.train(self.wm.imagine, start, context)
     metrics.update(mets)
     if self.config.expl_behavior != 'None':

@@ -173,6 +173,7 @@ defaults:
   imag_horizon: 15
   imag_unroll: False
   imag_cont: mean
+  imag_samples: 0
   horizon: 333
   return_lambda: 0.95
   critic_slowreg: logprob
