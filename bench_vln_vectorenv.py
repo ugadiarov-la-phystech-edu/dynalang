@@ -283,7 +283,7 @@ def plot(results, target, path):
   import matplotlib.pyplot as plt
 
   series = sorted({(r['backend'], r['resize']) for r in results})
-  fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+  fig, axes = plt.subplots(1, 4, figsize=(22, 5))
   for backend, resize in series:
     rs = sorted((r for r in results
                  if r['backend'] == backend and r['resize'] == resize),
@@ -294,13 +294,16 @@ def plot(results, target, path):
     label = f'{backend}/{resize}'
     axes[0].plot(ns, [r['time_per_target'] for r in rs], 'o-', label=label)
     axes[1].plot(ns, [r['build_s'] for r in rs], 'o-', label=label)
-    axes[2].plot(ns, [r['fps'] for r in rs], 'o-', label=label)
+    axes[2].plot(ns, [r['total_per_target'] for r in rs], 'o-', label=label)
+    axes[3].plot(ns, [r['fps'] for r in rs], 'o-', label=label)
   axes[0].set_ylabel(f'wall time to collect {target} steps (s)')
   axes[0].set_title('Collection time vs N')
   axes[1].set_ylabel('build / spawn time (s)')
   axes[1].set_title('Build time vs N')
-  axes[2].set_ylabel('fps (env-steps / s)')
-  axes[2].set_title('FPS vs N')
+  axes[2].set_ylabel(f'build + collect {target} steps (s)')
+  axes[2].set_title('Total time vs N')
+  axes[3].set_ylabel('fps (env-steps / s)')
+  axes[3].set_title('FPS vs N')
   for ax in axes:
     ax.set_xlabel('number of envs (N)')
     ax.grid(alpha=0.3)
@@ -343,8 +346,11 @@ def main():
   results = []
   for backend in backends:
     for mode in modes:
-      if backend == 'vectorenv_raw' and mode == 'pil64':
-        # raw habitat has no PIL stage; pil64 == raw256 for it. Skip dup.
+      # raw habitat has no PIL stage, so pil64 == raw256 for it. Skip pil64
+      # only when raw256 is also requested (otherwise it's a real duplicate);
+      # if raw256 is absent, still run vectorenv_raw once under pil64.
+      if (backend == 'vectorenv_raw' and mode == 'pil64'
+          and 'raw256' in modes):
         print(f'(skip {backend}/{mode}: identical to {backend}/raw256)')
         continue
       print(f'\n=== {backend} / resize={mode} ===')
