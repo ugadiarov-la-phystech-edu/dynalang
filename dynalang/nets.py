@@ -456,6 +456,7 @@ class ObjectCentricTSSM(TSSM):
 
     L = self._tf_context_length
     causal_mask = jnp.triu(jnp.full((L, L), -jnp.inf), k=1)
+    key_pad_mask = valid <= 0.5  
 
     if self._action_mode in ('slot', 'cross_attn'):
       action_embedding = self.get('action_proj', Linear, **self._kw)(prev_action)  # (B, units)
@@ -473,6 +474,7 @@ class ObjectCentricTSSM(TSSM):
         cast(tf_input),
         causal_mask=causal_mask,
         action_embeds=cast(action_context) if self._action_mode == 'cross_attn' else None,
+        key_padding_mask=key_pad_mask,
         training=training)
 
     deter = out[:, -1]  # (B, num_slots[+1], units)
