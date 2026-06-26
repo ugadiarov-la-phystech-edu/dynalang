@@ -116,6 +116,9 @@ defaults:
       num_trashcans: 2
       p_teleport: 0.05
       p_unsafe: 0.
+      use_object_slots: False
+      num_slots: 20
+      slot_tile_size: 32
     langroom:
       length: 200
       vocab_size: 15
