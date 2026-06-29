@@ -78,8 +78,42 @@ def remat_if(fn, enabled):
   return jax.checkpoint(fn) if enabled else fn
 
 
-def scan(fn, inputs, start, unroll=True, modify=False):
+def _scan_remat(fn2, carry, xs, modify=False):
+  """lax.scan + jax.checkpoint compatible with ninjax (params hoisted via pure)."""
+  if modify:
+    raise NotImplementedError('remat scan with modify=True is not supported')
+
+  def body(state, rng, carry, inp):
+    carry, y = fn2(carry, inp)
+    return (carry, y), state
+
+  pure_fn = nj.pure(body, nested=True)
+  nj._prerun(pure_fn, carry, jax.tree_util.tree_map(lambda x: x[0], xs))
+  length = len(jax.tree_util.tree_leaves(xs)[0])
+  rngs = nj.rng(length)
+  frozen = dict(nj.context())
+
+  @jax.checkpoint
+  def checkpointed(carry, inp, rng):
+    (carry, y), _ = pure_fn(
+        frozen, rng, carry, inp, create=False, modify=False)
+    return carry, y
+
+  def inner(carry, x):
+    inp, rng = x
+    return checkpointed(carry, inp, rng)
+
+  carry, ys = jax.lax.scan(inner, carry, (xs, rngs), length)
+  return ys
+
+
+def scan(fn, inputs, start, unroll=True, modify=False, remat=False):
   fn2 = lambda carry, inp: (fn(carry, inp),) * 2
+  if remat:
+    if unroll:
+      print('Note: remat scan uses lax.scan (unroll=False).')
+      unroll = False
+    return _scan_remat(fn2, start, inputs, modify=modify)
   if not unroll:
     return nj.scan(fn2, start, inputs, modify=modify)[1]
   length = len(jax.tree_util.tree_leaves(inputs)[0])

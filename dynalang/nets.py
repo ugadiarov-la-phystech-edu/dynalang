@@ -70,10 +70,10 @@ class RSSM(nj.Module):
       batch_size = action.shape[0]
       action = swap(action)
     state = state or self.initial(batch_size)
-    step = jaxutils.remat_if(
-        lambda prev, inputs: self.obs_step(prev, *inputs), self._obs_remat)
+    step = lambda prev, inputs: self.obs_step(prev, *inputs)
     inputs = action, swap(embed), swap(is_first)
-    post = jaxutils.scan(step, inputs, state, self._unroll)
+    post = jaxutils.scan(
+        step, inputs, state, self._unroll, remat=self._obs_remat)
     post = {k: swap(v) for k, v in post.items()}
     return post
 
@@ -86,8 +86,8 @@ class RSSM(nj.Module):
       batch_size = action.shape[0]
       action = swap(action)
     state = state or self.initial(batch_size)
-    img_step = jaxutils.remat_if(self.img_step, self._img_remat)
-    prior = jaxutils.scan(img_step, action, state, self._unroll)
+    prior = jaxutils.scan(
+        self.img_step, action, state, self._unroll, remat=self._img_remat)
     prior = {k: swap(v) for k, v in prior.items()}
     return prior
 
@@ -277,9 +277,9 @@ class TSSM(nj.Module):
       state = state or self.initial(action.shape[0])
       action = swap(action)
     inputs = action, swap(embed), swap(is_first)
-    obs_step = jaxutils.remat_if(
-        lambda prev, inp: self.obs_step(prev, *inp), self._obs_remat)
-    post = jaxutils.scan(obs_step, inputs, state, self._unroll)
+    step = lambda prev, inp: self.obs_step(prev, *inp)
+    post = jaxutils.scan(
+        step, inputs, state, self._unroll, remat=self._obs_remat)
     post = {k: swap(v) for k, v in post.items()}
     return post
 
@@ -291,8 +291,8 @@ class TSSM(nj.Module):
     else:
       state = state or self.initial(action.shape[0])
       action = swap(action)
-    img_step = jaxutils.remat_if(self.img_step, self._img_remat)
-    prior = jaxutils.scan(img_step, action, state, self._unroll)
+    prior = jaxutils.scan(
+        self.img_step, action, state, self._unroll, remat=self._img_remat)
     prior = {k: swap(v) for k, v in prior.items()}
     return prior
 
@@ -543,10 +543,10 @@ class TokenRSSM(nj.Module):
       batch_size = action.shape[0]
       action_sw = swap(action)
     state = state or self.initial(batch_size)
-    step = jaxutils.remat_if(
-        lambda prev, inputs: self.obs_step(prev, *inputs), self._obs_remat)
+    step = lambda prev, inputs: self.obs_step(prev, *inputs)
     inputs = (action_sw, swap(embed), swap(token), swap(is_first))
-    post = jaxutils.scan(step, inputs, state, self._unroll)
+    post = jaxutils.scan(
+        step, inputs, state, self._unroll, remat=self._obs_remat)
     post = {k: swap(v) for k, v in post.items()}
     return post
 
@@ -559,8 +559,8 @@ class TokenRSSM(nj.Module):
       batch_size = action.shape[0]
       action = swap(action)
     state = state or self.initial(batch_size)
-    img_step = jaxutils.remat_if(self.img_step, self._img_remat)
-    prior = jaxutils.scan(img_step, action, state, self._unroll)
+    prior = jaxutils.scan(
+        self.img_step, action, state, self._unroll, remat=self._img_remat)
     prior = {k: swap(v) for k, v in prior.items()}
     return prior
 
@@ -695,10 +695,10 @@ class EarlyRSSM(nj.Module):
   def observe(self, embed, action, is_first, state=None):
     state = state or self.initial(action.shape[0])
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
-    step = jaxutils.remat_if(
-        lambda prev, inputs: self.obs_step(prev, *inputs), self._obs_remat)
+    step = lambda prev, inputs: self.obs_step(prev, *inputs)
     inputs = swap(action), swap(embed), swap(is_first)
-    post = jaxutils.scan(step, inputs, state, self._unroll)
+    post = jaxutils.scan(
+        step, inputs, state, self._unroll, remat=self._obs_remat)
     post = {k: swap(v) for k, v in post.items()}
     return post
 
@@ -706,8 +706,8 @@ class EarlyRSSM(nj.Module):
     state = state or self.initial(action.shape[0])
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
     action = swap(action)
-    img_step = jaxutils.remat_if(self.img_step, self._img_remat)
-    prior = jaxutils.scan(img_step, action, state, self._unroll)
+    prior = jaxutils.scan(
+        self.img_step, action, state, self._unroll, remat=self._img_remat)
     prior = {k: swap(v) for k, v in prior.items()}
     return prior
 

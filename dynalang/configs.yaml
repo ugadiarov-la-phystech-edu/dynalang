@@ -172,8 +172,8 @@ defaults:
   critic_type: vfunction
   imag_horizon: 15
   imag_unroll: False
-  imag_remat: False
-  obs_remat: False
+  imag_remat: False  # remat scan body; forces lax.scan (unroll=False)
+  obs_remat: False   # remat observe scan body; forces lax.scan (unroll=False)
   imag_cont: mean
   horizon: 333
   return_lambda: 0.95

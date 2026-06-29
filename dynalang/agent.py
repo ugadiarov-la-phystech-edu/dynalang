@@ -347,10 +347,9 @@ class WorldModel(nj.Module):
       state = self.rssm.img_step(state, action)
       action, carry = policy(state, carry)
       return state, action, carry
-    step = jaxutils.remat_if(step, self.config.imag_remat)
     states, actions, carries = jaxutils.scan(
         step, jnp.arange(horizon), (state, action, carry),
-        self.config.imag_unroll)
+        self.config.imag_unroll, remat=self.config.imag_remat)
     states, actions, carries = tree_map(
         lambda traj, first: jnp.concatenate([first[None], traj], 0),
         (states, actions, carries), (state, action, carry))
