@@ -74,6 +74,10 @@ def subsample(values, amount=1024):
   return values
 
 
+def remat_if(fn, enabled):
+  return jax.checkpoint(fn) if enabled else fn
+
+
 def scan(fn, inputs, start, unroll=True, modify=False):
   fn2 = lambda carry, inp: (fn(carry, inp),) * 2
   if not unroll:

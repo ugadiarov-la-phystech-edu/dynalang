@@ -20,7 +20,8 @@ class RSSM(nj.Module):
 
   def __init__(
       self, impl='softmax', deter=1024, stoch=32, classes=32, unroll=False,
-      unimix=0.01, action_clip=1.0, bottleneck=-1, maskgit={}, **kw):
+      unimix=0.01, action_clip=1.0, bottleneck=-1, maskgit={},
+      obs_remat=False, img_remat=False, **kw):
     assert impl in ('gaussian', 'softmax', 'maskgit'), impl
     self._impl = impl
     self._deter = deter
@@ -30,6 +31,8 @@ class RSSM(nj.Module):
     self._unimix = unimix
     self._action_clip = action_clip
     self._bottleneck = bottleneck
+    self._obs_remat = obs_remat
+    self._img_remat = img_remat
     self._kw = kw
     if self._impl == 'maskgit':
       from . import maskgit as mg
@@ -67,7 +70,8 @@ class RSSM(nj.Module):
       batch_size = action.shape[0]
       action = swap(action)
     state = state or self.initial(batch_size)
-    step = lambda prev, inputs: self.obs_step(prev, *inputs)
+    step = jaxutils.remat_if(
+        lambda prev, inputs: self.obs_step(prev, *inputs), self._obs_remat)
     inputs = action, swap(embed), swap(is_first)
     post = jaxutils.scan(step, inputs, state, self._unroll)
     post = {k: swap(v) for k, v in post.items()}
@@ -82,7 +86,8 @@ class RSSM(nj.Module):
       batch_size = action.shape[0]
       action = swap(action)
     state = state or self.initial(batch_size)
-    prior = jaxutils.scan(self.img_step, action, state, self._unroll)
+    img_step = jaxutils.remat_if(self.img_step, self._img_remat)
+    prior = jaxutils.scan(img_step, action, state, self._unroll)
     prior = {k: swap(v) for k, v in prior.items()}
     return prior
 
@@ -221,7 +226,7 @@ class TSSM(nj.Module):
       self, deter=512, units=512, stoch=32, classes=32, tf_context_length=16,
       tf_layers=4, tf_heads=8, feedforward_units=1024, dropout=0.0,
       unroll=False, unimix=0.01, action_clip=1.0, action_mode='concat',
-      winit='normal', **kw):
+      winit='normal', obs_remat=False, img_remat=False, **kw):
     assert deter == units, (deter, units)
     assert action_mode in ('none', 'concat', 'cross_attn'), action_mode
     from .transformer import TransformerEncoder, TransformerDecoder
@@ -234,6 +239,8 @@ class TSSM(nj.Module):
     self._unimix = unimix
     self._action_clip = action_clip
     self._action_mode = action_mode
+    self._obs_remat = obs_remat
+    self._img_remat = img_remat
     self._kw = {'units': units, 'winit': winit, **kw}
     if action_mode == 'cross_attn':
       self._decoder = TransformerDecoder(
@@ -270,8 +277,9 @@ class TSSM(nj.Module):
       state = state or self.initial(action.shape[0])
       action = swap(action)
     inputs = action, swap(embed), swap(is_first)
-    post = jaxutils.scan(
-        lambda prev, inp: self.obs_step(prev, *inp), inputs, state, self._unroll)
+    obs_step = jaxutils.remat_if(
+        lambda prev, inp: self.obs_step(prev, *inp), self._obs_remat)
+    post = jaxutils.scan(obs_step, inputs, state, self._unroll)
     post = {k: swap(v) for k, v in post.items()}
     return post
 
@@ -283,7 +291,8 @@ class TSSM(nj.Module):
     else:
       state = state or self.initial(action.shape[0])
       action = swap(action)
-    prior = jaxutils.scan(self.img_step, action, state, self._unroll)
+    img_step = jaxutils.remat_if(self.img_step, self._img_remat)
+    prior = jaxutils.scan(img_step, action, state, self._unroll)
     prior = {k: swap(v) for k, v in prior.items()}
     return prior
 
@@ -500,7 +509,8 @@ class TokenRSSM(nj.Module):
 
   def __init__(
       self, deter=1024, stoch=32, classes=32, vocab=256, unroll=False,
-      unimix=0.01, action_clip=1.0, bottleneck=-1, prior_layers=3, **kw):
+      unimix=0.01, action_clip=1.0, bottleneck=-1, prior_layers=3,
+      obs_remat=False, img_remat=False, **kw):
     self._deter = deter
     self._stoch = stoch
     self._classes = classes
@@ -510,6 +520,8 @@ class TokenRSSM(nj.Module):
     self._action_clip = action_clip
     self._bottleneck = bottleneck
     self._prior_layers = prior_layers
+    self._obs_remat = obs_remat
+    self._img_remat = img_remat
     self._kw = kw
 
   def initial(self, batch_size):
@@ -531,7 +543,8 @@ class TokenRSSM(nj.Module):
       batch_size = action.shape[0]
       action_sw = swap(action)
     state = state or self.initial(batch_size)
-    step = lambda prev, inputs: self.obs_step(prev, *inputs)
+    step = jaxutils.remat_if(
+        lambda prev, inputs: self.obs_step(prev, *inputs), self._obs_remat)
     inputs = (action_sw, swap(embed), swap(token), swap(is_first))
     post = jaxutils.scan(step, inputs, state, self._unroll)
     post = {k: swap(v) for k, v in post.items()}
@@ -546,7 +559,8 @@ class TokenRSSM(nj.Module):
       batch_size = action.shape[0]
       action = swap(action)
     state = state or self.initial(batch_size)
-    prior = jaxutils.scan(self.img_step, action, state, self._unroll)
+    img_step = jaxutils.remat_if(self.img_step, self._img_remat)
+    prior = jaxutils.scan(img_step, action, state, self._unroll)
     prior = {k: swap(v) for k, v in prior.items()}
     return prior
 
@@ -656,7 +670,8 @@ class EarlyRSSM(nj.Module):
 
   def __init__(
       self, deter=1024, stoch=32, classes=32, unroll=False,
-      unimix=0.01, action_clip=1.0, bottleneck=-1, prior_layers=3, **kw):
+      unimix=0.01, action_clip=1.0, bottleneck=-1, prior_layers=3,
+      obs_remat=False, img_remat=False, **kw):
     self._deter = deter
     self._stoch = stoch
     self._classes = classes
@@ -665,6 +680,8 @@ class EarlyRSSM(nj.Module):
     self._action_clip = action_clip
     self._bottleneck = bottleneck
     self._prior_layers = prior_layers
+    self._obs_remat = obs_remat
+    self._img_remat = img_remat
     self._kw = kw
 
   def initial(self, batch_size):
@@ -678,7 +695,8 @@ class EarlyRSSM(nj.Module):
   def observe(self, embed, action, is_first, state=None):
     state = state or self.initial(action.shape[0])
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
-    step = lambda prev, inputs: self.obs_step(prev, *inputs)
+    step = jaxutils.remat_if(
+        lambda prev, inputs: self.obs_step(prev, *inputs), self._obs_remat)
     inputs = swap(action), swap(embed), swap(is_first)
     post = jaxutils.scan(step, inputs, state, self._unroll)
     post = {k: swap(v) for k, v in post.items()}
@@ -688,7 +706,8 @@ class EarlyRSSM(nj.Module):
     state = state or self.initial(action.shape[0])
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
     action = swap(action)
-    prior = jaxutils.scan(self.img_step, action, state, self._unroll)
+    img_step = jaxutils.remat_if(self.img_step, self._img_remat)
+    prior = jaxutils.scan(img_step, action, state, self._unroll)
     prior = {k: swap(v) for k, v in prior.items()}
     return prior
 

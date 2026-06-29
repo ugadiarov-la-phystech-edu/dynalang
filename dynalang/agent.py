@@ -168,14 +168,18 @@ class WorldModel(nj.Module):
 #    shapes = {k: tuple(v.shape) for k, v in obs_space.items()}
 #    shapes = {k: v for k, v in shapes.items() if not k.startswith('log_')}
     self.encoder = nets.MultiEncoder(shapes, **config.encoder, name='enc')
+    remat_kw = {
+        'obs_remat': config.obs_remat,
+        'img_remat': config.imag_remat,
+    }
     if self.config.rssm_type == 'rssm':
-      self.rssm = nets.RSSM(**config.rssm, name='rssm')
+      self.rssm = nets.RSSM(**config.rssm, **remat_kw, name='rssm')
     elif self.config.rssm_type == 'early':
-      self.rssm = nets.EarlyRSSM(**config.early_rssm, name='rssm')
+      self.rssm = nets.EarlyRSSM(**config.early_rssm, **remat_kw, name='rssm')
     elif self.config.rssm_type == 'token':
-      self.rssm = nets.TokenRSSM(**config.token_rssm, name='rssm')
+      self.rssm = nets.TokenRSSM(**config.token_rssm, **remat_kw, name='rssm')
     elif self.config.rssm_type == 'tssm':
-      self.rssm = nets.TSSM(**config.tssm, name='rssm')
+      self.rssm = nets.TSSM(**config.tssm, **remat_kw, name='rssm')
     elif self.config.rssm_type == 'octssm':
       octssm_cfg = dict(config.octssm)
       if self.encoder.slot_shapes:
@@ -186,7 +190,7 @@ class WorldModel(nj.Module):
         print(f'WorldModel: auto-set octssm.num_slots = '
               f'{base_slots} object slots + {n_text} text slot(s) = '
               f'{octssm_cfg["num_slots"]}')
-      self.rssm = nets.ObjectCentricTSSM(**octssm_cfg, name='rssm')
+      self.rssm = nets.ObjectCentricTSSM(**octssm_cfg, **remat_kw, name='rssm')
     else:
       raise NotImplementedError(self.config.rssm_type)
     
@@ -343,6 +347,7 @@ class WorldModel(nj.Module):
       state = self.rssm.img_step(state, action)
       action, carry = policy(state, carry)
       return state, action, carry
+    step = jaxutils.remat_if(step, self.config.imag_remat)
     states, actions, carries = jaxutils.scan(
         step, jnp.arange(horizon), (state, action, carry),
         self.config.imag_unroll)
