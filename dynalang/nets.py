@@ -885,9 +885,10 @@ class MultiDecoder(nj.Module):
     dists = {}
     n_text_slots = 1 if self.mlp_shapes else 0
     n_img_slots = features.shape[-2] - n_text_slots
+    combined_feat = features[..., :n_img_slots + n_text_slots, :].reshape(
+        features.shape[:-2] + (-1,))
     if self.cnn_shapes:
-      #image uses only the image slot
-      feat = features[..., :n_img_slots, :].reshape(features.shape[:-2] + (-1,))
+      feat = combined_feat
       if drop_loss_indices is not None:
         feat = feat[:, drop_loss_indices]
       flat = feat.reshape([-1, feat.shape[-1]])
@@ -899,10 +900,7 @@ class MultiDecoder(nj.Module):
           key: self._make_image_dist(key, mean)
           for (key, shape), mean in zip(self.cnn_shapes.items(), means)})
     if self.mlp_shapes:
-      #text uses only the text slot
-      text_feat = features[..., n_img_slots:, :].reshape(
-          features.shape[:-2] + (-1,))
-      dists.update(self._mlp(text_feat))
+      dists.update(self._mlp(combined_feat))
     return dists
 
   def _make_image_dist(self, name, mean):
