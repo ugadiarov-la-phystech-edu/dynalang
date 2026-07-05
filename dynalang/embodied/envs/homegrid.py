@@ -90,13 +90,27 @@ class SlotImageWrapper:
   same slot.
 
   The masking logic is ported from ocdreamer/collect_homegrid.py.
+
+  Slot groups (semantic, fixed layout — ~8 slots max):
+    scene     — wall + all floor types (tile/carpet/wood)
+    agent     — agent sprite + direction arrow
+    fixtures  — static furniture (sofa, table, fridge, …)
+    trashcan  — all trash cans merged (Storage)
+    trash     — one slot per trash type (bottle/fruit/papers/plates)
   """
 
-  # "Stuff" classes are merged by class (one slot per class, e.g. all floor
-  # tiles -> one slot), unlike "things" which get one slot per instance.
-  #  Floor (tile/carpet/wood) and wall therefore
-  # each become a single merged slot; only "background" (empty 0-id) is dropped.
-  STUFF_CLASSES = {"background", "wall", "tile", "carpet", "wood"}
+  SCENE_CLASSES = frozenset({"wall", "tile", "carpet", "wood"})
+  TRASH_TYPES = frozenset({"bottle", "fruit", "papers", "plates"})
+  TRASHCAN_TYPES = frozenset({"recycling_bin", "trash_bin", "compost_bin"})
+  # Pixel keys without an instance id (floors, walls).
+  STUFF_CLASSES = frozenset({"background", *SCENE_CLASSES})
+  SLOT_GROUP_NAMES = {
+      "scene": "scene",
+      "agent": "agent",
+      "fixtures": "fixtures",
+      "trashcan": "trashcan",
+      "trash": "trash",
+  }
 
   def __init__(self, env, num_slots=10, tile_size=32, out_size=(64, 64)):
     from homegrid.base import (
@@ -199,8 +213,12 @@ class SlotImageWrapper:
     slots = np.zeros(
         (self.num_slots, self.out_size[0], self.out_size[1], 3), dtype=np.uint8)
 
-    for gid, (name, pix_id) in gid_to_info.items():
-      binary = seg == pix_id
+    for gid, (name, pix_ids) in gid_to_info.items():
+      if isinstance(pix_ids, (int, np.integer)):
+        pix_ids = [int(pix_ids)]
+      binary = np.zeros(seg.shape, dtype=bool)
+      for pix_id in pix_ids:
+        binary |= seg == pix_id
       if not binary.any():
         continue
       if gid not in self._slot_of_gid:
@@ -242,6 +260,31 @@ class SlotImageWrapper:
     if tex.shape[-1] == 4:
       return tex[:, :, 3] == 255
     return np.ones((ts, ts), dtype=bool)
+
+  def _gid_for(self, instance_key, tracker):
+    if isinstance(instance_key, tuple):
+      return instance_key
+    if instance_key in tracker:
+      return tracker[instance_key]
+    return instance_key
+
+  def _slot_group(self, name, instance_key, tracker):
+    """Map an object to a stable semantic slot group key."""
+    if name in self.SCENE_CLASSES:
+      return ("scene",)
+    if name == "agent":
+      return ("agent",)
+    if name in self.TRASHCAN_TYPES:
+      return ("trashcan",)
+    if name in self.TRASH_TYPES:
+      return ("trash", name)
+    return ("fixtures",)
+
+  def _group_display_name(self, slot_group):
+    kind = slot_group[0]
+    if kind == "trash":
+      return slot_group[1]
+    return self.SLOT_GROUP_NAMES.get(kind, kind)
 
   def _obj_texture(self, obj):
     hg = self._hg
@@ -294,8 +337,8 @@ class SlotImageWrapper:
 
     Returns:
       seg: (H*ts, W*ts) uint8 mask, 0 = background.
-      gid_to_info: {global_id -> (name, pixel_id)} for object (non-stuff)
-                   instances. global_id is stable across the whole episode.
+      gid_to_info: {slot_group -> (display_name, [pixel_ids])}.  Each slot
+                   group may cover several seg pixel ids (OR'd in slot images).
     """
     hg = self._hg
     (FloorWithObject, Inanimate, Pickable, Storage, Wall) = (
@@ -343,30 +386,28 @@ class SlotImageWrapper:
     seg = np.zeros((h * ts, w * ts), dtype=np.uint8)
 
     name_to_id = {}
-    id_to_key = {}
     next_id = [1]
+    group_to_pix = {}
+    group_names = {}
     all_textures = env.textures
-
-    def gid_for(instance_key):
-      if isinstance(instance_key, tuple):
-        # composite key -> map via the representative object id later;
-        # fall back to the tuple itself (stable within an episode).
-        return instance_key
-      if instance_key in tracker:
-        return tracker[instance_key]
-      return instance_key
 
     def get_id(name, instance_key=None):
       name = PART_TO_WHOLE.get(name, name)
       if name in self.STUFF_CLASSES or instance_key is None:
-        key = name
+        mask_key = name
       else:
-        key = (name, gid_for(instance_key))
-      if key not in name_to_id:
-        name_to_id[key] = next_id[0]
-        id_to_key[next_id[0]] = key
+        mask_key = (name, self._gid_for(instance_key, tracker))
+      if mask_key not in name_to_id:
+        name_to_id[mask_key] = next_id[0]
         next_id[0] += 1
-      return name_to_id[key]
+      pix_id = name_to_id[mask_key]
+      slot_group = self._slot_group(name, instance_key, tracker)
+      if slot_group not in group_to_pix:
+        group_to_pix[slot_group] = []
+        group_names[slot_group] = self._group_display_name(slot_group)
+      if pix_id not in group_to_pix[slot_group]:
+        group_to_pix[slot_group].append(pix_id)
+      return pix_id
 
     for j in range(h):
       for i in range(w):
@@ -429,20 +470,9 @@ class SlotImageWrapper:
               if tri_fn((px + 0.5) / ts, (py + 0.5) / ts):
                 tile[py, px] = agent_id
 
-    gid_to_info = {}
-    for pix_id, key in id_to_key.items():
-      if isinstance(key, tuple):
-        # "Thing": one slot per object instance. ``gid`` is the stable instance
-        # id (tracker int / ('composite', pos) / 'agent'); composite multi-tile
-        # objects (rug, chair, ...) already share one gid, i.e. one slot.
-        name, gid = key
-        gid_to_info[gid] = (name, pix_id)
-      else:
-        # "Stuff" (floor tile/carpet/wood, wall): merged by class into a single
-        # slot each (mirrors collect_homegrid.py, where STUFF_CLASSES use
-        # key=name). Background is the empty 0-id and never gets a slot.
-        name = key
-        if name == "background":
-          continue
-        gid_to_info[("stuff", name)] = (name, pix_id)
+    gid_to_info = {
+        slot_group: (group_names[slot_group], pix_ids)
+        for slot_group, pix_ids in group_to_pix.items()
+        if slot_group[0] != "background"
+    }
     return seg, gid_to_info

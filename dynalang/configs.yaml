@@ -117,7 +117,7 @@ defaults:
       p_teleport: 0.05
       p_unsafe: 0.
       use_object_slots: False
-      num_slots: 20
+      num_slots: 8  # scene + agent + fixtures + trashcan + 4 trash types
       slot_tile_size: 32
     langroom:
       length: 200
