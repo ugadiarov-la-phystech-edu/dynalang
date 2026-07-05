@@ -835,12 +835,14 @@ class MultiEncoder(nj.Module):
         output = jnp.zeros_like(output)
       result['text'] = output.reshape(batch_dims + output.shape[1:])
 
-    # Merge text into the visual representation so downstream models see one tensor
+    # Merge text into each slot so downstream models see one tensor per slot
     if 'slot' in result and 'text' in result:
-      slot_dim = result['slot'].shape[-1]
-      text_slot = self.get('text_slot_proj', Linear, slot_dim)(result['text'])
-      result['slot'] = jnp.concatenate(
-          [result['slot'], text_slot[..., None, :]], axis=-2)
+      slots = result['slot']
+      text = result['text']
+      text = jnp.broadcast_to(
+          text[..., None, :],
+          slots.shape[:-1] + (text.shape[-1],))
+      result['slot'] = jnp.concatenate([slots, text], axis=-1)
     elif 'image' in result and 'text' in result:
       result['image'] = jnp.concatenate([result['image'], result['text']], axis=-1)
 
@@ -894,10 +896,7 @@ class MultiDecoder(nj.Module):
     
     if self.slot_shapes:
       shape = self.slot_shapes['slot']
-      n_obj_slots = shape[0]
-      # features may have more slots than the ground truth (e.g. +1 text slot);
-      # reconstruct only the first n_obj_slots entries.
-      obj_features = features[..., :n_obj_slots, :]
+      obj_features = features[..., :shape[0], :]
       projector = self.get('slot_proj', Linear, shape[-1], act='none')
       slot_mean = projector(obj_features)
       dists['slot'] = jaxutils.MSEDist(slot_mean, 2, 'sum')
@@ -916,10 +915,8 @@ class MultiDecoder(nj.Module):
           for (key, shape), mean in zip(self.cnn_shapes.items(), means)})
     if self.mlp_shapes:
       if self.slot_shapes:
-        # Text observations are encoded as the last slot
-        n_obj_slots = self.slot_shapes['slot'][0]
-        mlp_features = features[..., n_obj_slots:, :].reshape(
-            features.shape[:-2] + (-1,))
+        # Text is appended to every slot in the encoder; pool slots for decoding.
+        mlp_features = features.mean(axis=-2)
       else:
         mlp_features = features
       dists.update(self._mlp(mlp_features))
