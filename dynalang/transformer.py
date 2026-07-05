@@ -395,9 +395,10 @@ class ObjectCentricDynamicsTransformer(nj.Module):
     B, T, num_slots, dim = x.shape
     assert dim == self._d_model, (dim, self._d_model)
 
-    # Temporal positional encoding, shared across slots of the same step.
-    pe = sinusoidal_positional_encoding(T, self._d_model)
-    x = x + pe[None, :, None, :]
+    # Positional encoding over the flattened token sequence (T * num_slots).
+    pe = sinusoidal_positional_encoding(T * num_slots, self._d_model)
+    pe = pe.reshape(T, num_slots, dim)
+    x = x + pe[None, :, :, :]
     x = _dropout(x, self._dropout, training)
 
     # Flatten time and slots into one joint token sequence: (B, T*num_slots, D).
