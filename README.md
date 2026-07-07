@@ -11,9 +11,35 @@ For more information, check out:
 # Getting Started
 
 Install dependencies:
-```
+
+```bash
 pip install -e .
+
+# With optional extras
+pip install -e ".[cuda]"        # JAX CUDA 12 plugin
 ```
+
+For GPU training with JAX, the CUDA extra alone is not enough — you also need the CUDA compiler toolkit (`ptxas`, `libdevice`). Install it via pip or conda:
+
+```bash
+pip install nvidia-cuda-nvcc-cu12
+# or: conda install -c nvidia cuda-nvcc=12.4
+```
+
+If JAX fails with `ptxas not found` or `libdevice not found`, point XLA to your environment before running training:
+
+```bash
+export CUDA_HOME=$CONDA_PREFIX
+export XLA_FLAGS="--xla_gpu_cuda_data_dir=$CONDA_PREFIX"
+```
+
+Verify GPU access:
+
+```bash
+python -c "import jax; print(jax.devices())"
+```
+
+See the sections below for environment-specific setup (HomeGrid, Messenger, VLN, LangRoom).
 
 ## 🏠 HomeGrid
 

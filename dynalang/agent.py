@@ -178,8 +178,11 @@ class WorldModel(nj.Module):
       self.rssm = nets.TSSM(**config.tssm, name='rssm')
     elif self.config.rssm_type == 'octssm':
       octssm_cfg = dict(config.octssm)
-      # One slot per modality from the encoder (image slot + text slot).
       octssm_cfg['num_slots'] = self.encoder.n_output_slots
+      has_text = len(self.encoder.mlp_shapes) > 0
+      if has_text:
+        print(f'WorldModel: octssm.num_slots = {octssm_cfg["num_slots"]}, '
+              f'text appended to each slot')
       self.rssm = nets.ObjectCentricTSSM(**octssm_cfg, name='rssm')
     else:
       raise NotImplementedError(self.config.rssm_type)
