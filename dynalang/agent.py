@@ -178,8 +178,14 @@ class WorldModel(nj.Module):
       self.rssm = nets.TSSM(**config.tssm, name='rssm')
     elif self.config.rssm_type == 'octssm':
       octssm_cfg = dict(config.octssm)
-      if self.encoder.slot_shapes:
-        # Auto-derive num_slots from encoder output 
+      if getattr(self.encoder, 'slot_based', False):
+        octssm_cfg['num_slots'] = self.encoder.n_output_slots
+        print(f'WorldModel: auto-set octssm.num_slots = '
+              f'{self.encoder.n_object_slots} object slot(s) + '
+              f'{self.encoder.n_image_slots} image slot(s) + '
+              f'{self.encoder.n_text_slots} text slot(s) = '
+              f'{octssm_cfg["num_slots"]}')
+      elif self.encoder.slot_shapes:
         base_slots = list(self.encoder.slot_shapes.values())[0][0]
         n_text = 1 if len(self.encoder.mlp_shapes) > 0 else 0
         octssm_cfg['num_slots'] = base_slots + n_text
@@ -227,6 +233,7 @@ class WorldModel(nj.Module):
     scales.update({k: image for k in self.heads['decoder'].cnn_shapes})
     scales.update({k: vector for k in self.heads['decoder'].mlp_shapes})
     scales.update({k: vector for k in self.heads['decoder'].slot_shapes})
+    scales.update({k: image for k in self.heads['decoder'].slot_image_shapes})
     self.scales = scales
 
   def initial(self, batch_size):
@@ -395,6 +402,43 @@ class WorldModel(nj.Module):
       error = (model - truth + 1) / 2
       video = jnp.concatenate([truth, model, error], 2)
       report[f'openl_{key}'] = jaxutils.video_grid(video)
+
+    for key in self.heads['decoder'].slot_image_shapes.keys():
+      n_show = min(2, data[key].shape[0])
+      truth = data[key][:n_show].astype(jnp.float32)
+      model = jnp.concatenate([recon[key].mode()[:, :5], openl[key].mode()], 1)
+      model = jnp.clip(model[:n_show].astype(jnp.float32), 0.0, 1.0)
+      error = jnp.clip((model - truth + 1) / 2, 0.0, 1.0)
+
+      def _slots_to_row(x):
+        n, t, s, h, w, c = x.shape
+        return x.transpose((0, 1, 3, 2, 4, 5)).reshape((n, t, h, s * w, c))
+
+      video = jnp.concatenate(
+          [_slots_to_row(truth), _slots_to_row(model), _slots_to_row(error)], 2)
+      report[f'openl_{key}'] = jaxutils.video_grid(video)
+
+      if 'image' in data and data['image'].shape[-3:-1] == truth.shape[-3:-1]:
+        s = truth.shape[2]
+        import colorsys
+        palette = jnp.asarray(np.array(
+            [colorsys.hsv_to_rgb((i * 0.61803398875) % 1.0, 0.85, 1.0)
+             for i in range(s)], dtype=np.float32))
+        bg = data['image'][:n_show].astype(jnp.float32)
+        if bg.shape[-1] == 1:
+          bg = jnp.repeat(bg, 3, axis=-1)
+
+        def _overlay(slots, alpha=0.5):
+          mask = (slots.sum(-1, keepdims=True) > 1e-3).astype(jnp.float32)
+          colors = palette.reshape((1, 1, s, 1, 1, 3))
+          color_sum = (mask * colors).sum(2)
+          count = mask.sum(2)
+          avg = color_sum / jnp.maximum(count, 1.0)
+          any_mask = (count > 0).astype(jnp.float32)
+          return bg * (1 - alpha * any_mask) + alpha * any_mask * avg
+
+        overlay = jnp.concatenate([_overlay(truth), _overlay(model)], 2)
+        report[f'openl_{key}_overlay'] = jaxutils.video_grid(overlay)
     # 1 step prediction loss for text
     # Calculate text ppl over entire batch and seq len for more context
     # Above is buggy - observe takes in prev_actions, ac taken into this state (see loss)

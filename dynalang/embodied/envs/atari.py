@@ -20,7 +20,8 @@ class Atari(embodied.Env):
   def __init__(
       self, name, repeat=4, size=(84, 84), gray=True, noops=0, lives='unused',
       sticky=True, actions='all', length=108000, pooling=2, aggregate='max',
-      resize='pillow', autostart=False, clip_reward=False, seed=None, **unused):
+      resize='pillow', autostart=False, clip_reward=False, seed=None,
+      use_object_slots=False, num_slots=4, **unused):
     del unused
     lives = self._normalize_lives(lives)
     assert lives in ('unused', 'discount', 'reset'), lives
@@ -46,6 +47,8 @@ class Atari(embodied.Env):
     self.autostart = autostart
     self.clip_reward = clip_reward
     self.rng = np.random.default_rng(seed)
+    self.use_object_slots = use_object_slots
+    self.num_slots = num_slots
 
     with self.LOCK:
       self.ale = ale_py.ALEInterface()
@@ -84,13 +87,17 @@ class Atari(embodied.Env):
 
   @property
   def obs_space(self):
-    return {
+    spaces = {
         'image': embodied.Space(np.uint8, (*self.size, 1 if self.gray else 3)),
         'reward': embodied.Space(np.float32),
         'is_first': embodied.Space(bool),
         'is_last': embodied.Space(bool),
         'is_terminal': embodied.Space(bool),
     }
+    if self.use_object_slots:
+      spaces['slot_image'] = embodied.Space(
+          np.uint8, (self.num_slots, *self.size, 3))
+    return spaces
 
   @property
   def act_space(self):
@@ -163,23 +170,40 @@ class Atari(embodied.Env):
       image = np.amax(self.buffers, 0)
     elif self.aggregate == 'mean':
       image = np.mean(self.buffers, 0).astype(np.uint8)
-    if self.resize == 'opencv':
-      import cv2
-      image = cv2.resize(image, self.size, interpolation=cv2.INTER_AREA)
-    elif self.resize == 'pillow':
-      from PIL import Image
-      image = Image.fromarray(image)
-      image = image.resize(self.size, Image.BILINEAR)
-      image = np.array(image)
+    slot_image = None
+    if self.use_object_slots:
+      from . import atari_pong_slots
+      slot_image = atari_pong_slots.build_slot_images(image, self.num_slots)
+      slot_image = self._resize_slots(slot_image)
+    image = self._resize(image)
     if self.gray:
       image = (image * self.WEIGHTS).sum(-1).astype(image.dtype)[:, :, None]
-    return dict(
+    obs = dict(
         image=image,
         reward=np.float32(reward),
         is_first=is_first,
         is_last=is_last,
         is_terminal=is_last,
     )
+    if slot_image is not None:
+      obs['slot_image'] = slot_image
+    return obs
+
+  def _resize(self, image):
+    if image.shape[:2] == self.size:
+      return image
+    if self.resize == 'opencv':
+      import cv2
+      return cv2.resize(image, self.size, interpolation=cv2.INTER_AREA)
+    from PIL import Image
+    image = Image.fromarray(image)
+    image = image.resize(self.size, Image.BILINEAR)
+    return np.array(image)
+
+  def _resize_slots(self, slots):
+    if slots.shape[1:3] == self.size:
+      return slots
+    return np.stack([self._resize(slots[i]) for i in range(slots.shape[0])])
 
   def close(self):
     return None
