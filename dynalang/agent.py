@@ -179,12 +179,15 @@ class WorldModel(nj.Module):
     elif self.config.rssm_type == 'octssm':
       octssm_cfg = dict(config.octssm)
       if self.encoder.slot_shapes:
-        # Auto-derive num_slots from encoder output 
+        # Auto-derive num_slots 
         base_slots = list(self.encoder.slot_shapes.values())[0][0]
+        n_image = 1 if self.config.encoder.get('image_slot_size', 0) > 0 else 0
         n_text = 1 if len(self.encoder.mlp_shapes) > 0 else 0
-        octssm_cfg['num_slots'] = base_slots + n_text
+        octssm_cfg['num_slots'] = base_slots + n_image + n_text
         print(f'WorldModel: auto-set octssm.num_slots = '
-              f'{base_slots} object slots + {n_text} text slot(s) = '
+              f'{base_slots} slotcontrast slot(s) + '
+              f'{n_image} image slot(s) + '
+              f'{n_text} text slot(s) = '
               f'{octssm_cfg["num_slots"]}')
       self.rssm = nets.ObjectCentricTSSM(**octssm_cfg, name='rssm')
     else:

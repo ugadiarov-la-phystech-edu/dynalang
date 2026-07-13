@@ -781,7 +781,7 @@ class MultiEncoder(nj.Module):
       self, shapes, cnn_keys=r'.*', mlp_keys=r'.*', mlp_layers=4,
       mlp_units=512, cnn='resize', cnn_depth=48,
       cnn_blocks=2, resize='stride',
-      symlog_inputs=False, minres=4, **kw):
+      symlog_inputs=False, minres=4, image_slot_size=0, **kw):
     excluded = ('is_first', 'is_last')
     shapes = {k: v for k, v in shapes.items() if (
         k not in excluded and not k.startswith('log_'))}
@@ -794,9 +794,20 @@ class MultiEncoder(nj.Module):
                 "token_embed" in self.mlp_shapes), \
       "Probably shouldn't have both token and token_embed, use token$?"
     self.shapes = {**self.cnn_shapes, **self.mlp_shapes, **self.slot_shapes}
+    self._image_slot_size = image_slot_size
+    self._image_shape = shapes.get('image')
     print('Encoder CNN shapes:', self.cnn_shapes)
     print('Encoder MLP shapes:', self.mlp_shapes)
     print('Encoder Slot shapes:', self.slot_shapes)
+    if image_slot_size and self.slot_shapes and self._image_shape:
+      slot_dim = self.slot_shapes['slot'][-1]
+      flat_dim = image_slot_size * image_slot_size * self._image_shape[-1]
+      if flat_dim > slot_dim:
+        print(f'Encoder: image slot flat dim {flat_dim} > slot dim {slot_dim}, '
+              f'truncating to {slot_dim}')
+      elif flat_dim < slot_dim:
+        print(f'Encoder: image slot flat dim {flat_dim} < slot dim {slot_dim}, '
+              f'zero-padding to {slot_dim}')
     cnn_kw = {**kw, 'minres': minres, 'name': 'cnn'}
     mlp_kw = {**kw, 'symlog_inputs': symlog_inputs, 'name': 'mlp'}
     if cnn == 'resnet':
@@ -817,7 +828,24 @@ class MultiEncoder(nj.Module):
 
     if 'slot' in data:
       result['slot'] = data['slot'].reshape(batch_dims + data['slot'].shape[1:])
-      
+
+    # Add image slot directly to object slots by resizing and flattening.
+    if self._image_slot_size > 0 and 'image' in data and 'slot' in result:
+      slot_dim = result['slot'].shape[-1]
+      size = self._image_slot_size
+      x = jax.image.resize(
+          data['image'], (data['image'].shape[0], size, size, data['image'].shape[-1]),
+          method='linear')
+      flat = x.reshape(x.shape[0], -1)
+      n = flat.shape[-1]
+      if n < slot_dim:
+        flat = jnp.pad(flat, ((0, 0), (0, slot_dim - n)))
+      else:
+        flat = flat[:, :slot_dim]
+      img_slot = flat.reshape(batch_dims + (slot_dim,))
+      result['slot'] = jnp.concatenate(
+          [result['slot'], img_slot[..., None, :]], axis=-2)
+
     if self.cnn_shapes:
       inputs = jnp.concatenate([data[k] for k in self.cnn_shapes], -1)
       output = self._cnn(inputs)
@@ -856,7 +884,7 @@ class MultiDecoder(nj.Module):
       self, shapes, inputs=['tensor'], cnn_keys=r'.*', mlp_keys=r'.*',
       mlp_layers=4, mlp_units=512, cnn='resize', cnn_depth=48, cnn_blocks=2,
       image_dist='mse', vector_dist='mse', resize='stride', bins=255,
-      outscale=1.0, minres=4, cnn_sigmoid=False, **kw):
+      outscale=1.0, minres=4, cnn_sigmoid=False, image_slot_size=0, **kw):
     excluded = ('is_first', 'is_last', 'is_terminal', 'reward')
     shapes = {k: v for k, v in shapes.items() if k not in excluded}
     self.slot_shapes = {k: v for k, v in shapes.items() if k == 'slot'}
@@ -867,6 +895,7 @@ class MultiDecoder(nj.Module):
         k: v for k, v in shapes.items()
         if re.match(mlp_keys, k) and len(v) == 1 and k != 'slot'}
     self.shapes = {**self.cnn_shapes, **self.mlp_shapes, **self.slot_shapes}
+    self._image_slot_size = image_slot_size
     print('Decoder CNN shapes:', self.cnn_shapes)
     print('Decoder MLP shapes:', self.mlp_shapes)
     print('Decoder Slot shapes:', self.slot_shapes)
@@ -893,11 +922,11 @@ class MultiDecoder(nj.Module):
   def __call__(self, inputs, drop_loss_indices=None):
     features = self._inputs(inputs)
     dists = {}
+    n_obj_slots = self.slot_shapes['slot'][0] if self.slot_shapes else 0
     
     if self.slot_shapes:
       shape = self.slot_shapes['slot']
-      n_obj_slots = shape[0]
-      # features may have more slots than the ground truth (e.g. +1 text slot);
+      # features may have more slots than the ground truth (e.g. +1 text slot and/or +1 for image slot);
       # reconstruct only the first n_obj_slots entries.
       obj_features = features[..., :n_obj_slots, :]
       projector = self.get('slot_proj', Linear, shape[-1], act='none')
@@ -919,8 +948,8 @@ class MultiDecoder(nj.Module):
     if self.mlp_shapes:
       if self.slot_shapes:
         # Text observations are encoded as the last slot
-        n_obj_slots = self.slot_shapes['slot'][0]
-        mlp_features = features[..., n_obj_slots:, :].reshape(
+        text_start = n_obj_slots + (1 if self._image_slot_size > 0 else 0) # decoder ignores  full image slot
+        mlp_features = features[..., text_start:, :].reshape(
             features.shape[:-2] + (-1,))
       else:
         mlp_features = features
