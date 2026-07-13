@@ -775,13 +775,24 @@ class EarlyRSSM(nj.Module):
     return {'logit': logit}
 
 
+def downsample_image(image, size):
+  """Resize image to (size, size) with linear interpolation."""
+  batch_shape = image.shape[:-3]
+  h, w, c = image.shape[-3:]
+  flat = image.reshape((-1, h, w, c))
+  out = jax.image.resize(
+      flat.astype(f32), (flat.shape[0], size, size, c), method='linear')
+  return out.reshape(batch_shape + (size, size, c))
+
+
 class MultiEncoder(nj.Module):
 
   def __init__(
       self, shapes, cnn_keys=r'.*', mlp_keys=r'.*', mlp_layers=4,
       mlp_units=512, cnn='resize', cnn_depth=48,
       cnn_blocks=2, resize='stride',
-      symlog_inputs=False, minres=4, **kw):
+      symlog_inputs=False, minres=4,
+      image_slot_size=0, image_slot_key='image', **kw):
     excluded = ('is_first', 'is_last')
     shapes = {k: v for k, v in shapes.items() if (
         k not in excluded and not k.startswith('log_'))}
@@ -794,9 +805,14 @@ class MultiEncoder(nj.Module):
                 "token_embed" in self.mlp_shapes), \
       "Probably shouldn't have both token and token_embed, use token$?"
     self.shapes = {**self.cnn_shapes, **self.mlp_shapes, **self.slot_shapes}
+    self.image_slot_size = image_slot_size
+    self.image_slot_key = image_slot_key
     print('Encoder CNN shapes:', self.cnn_shapes)
     print('Encoder MLP shapes:', self.mlp_shapes)
     print('Encoder Slot shapes:', self.slot_shapes)
+    if self.image_slot_size > 0:
+      print(f'Encoder image slot: {image_slot_key} -> '
+            f'{self.image_slot_size}x{self.image_slot_size} via MLP')
     cnn_kw = {**kw, 'minres': minres, 'name': 'cnn'}
     mlp_kw = {**kw, 'symlog_inputs': symlog_inputs, 'name': 'mlp'}
     if cnn == 'resnet':
@@ -805,6 +821,17 @@ class MultiEncoder(nj.Module):
       raise NotImplementedError(cnn)
     if self.mlp_shapes:
       self._mlp = MLP(None, mlp_layers, mlp_units, dist='none', **mlp_kw)
+    if self.image_slot_size > 0:
+      image_shapes = {
+          k: v for k, v in shapes.items() if len(v) == 3 and k != 'slot'}
+      assert image_slot_key in image_shapes, (
+          f"image_slot_key '{image_slot_key}' not found in observation shapes")
+      assert image_slot_key not in self.cnn_shapes, (
+          f"Cannot use image slot and CNN encoder for '{image_slot_key}'")
+      self._image_slot_channels = image_shapes[image_slot_key][-1]
+      enc_kw = {**mlp_kw, 'name': 'image_slot_enc'}
+      self._image_slot_mlp = MLP(
+          None, mlp_layers, mlp_units, dist='none', **enc_kw)
     self.preprocessors = {}
 
   def __call__(self, data, zero_mlp=False, zero_cnn=False):
@@ -837,6 +864,21 @@ class MultiEncoder(nj.Module):
         output = jnp.zeros_like(output)
       result['text'] = output.reshape(batch_dims + output.shape[1:])
 
+    if 'slot' in result and self.image_slot_size > 0:
+      assert self.image_slot_key in data, (
+          f"Missing '{self.image_slot_key}' observation for image slot")
+      image = downsample_image(
+          data[self.image_slot_key].astype(f32), self.image_slot_size)
+      flat = image.reshape(image.shape[:-3] + (-1,))
+      flat = jaxutils.cast_to_compute(flat)
+      hidden = self._image_slot_mlp(flat)
+      slot_dim = result['slot'].shape[-1]
+      image_slot = self.get(
+          'image_slot_proj', Linear, slot_dim, act='none')(hidden)
+      image_slot = image_slot.reshape(batch_dims + (1, slot_dim))
+      result['slot'] = jnp.concatenate(
+          [result['slot'], image_slot], axis=-2)
+
     # Merge text into the visual representation so downstream models see one tensor
     if 'slot' in result and 'text' in result:
       slot_dim = result['slot'].shape[-1]
@@ -856,7 +898,8 @@ class MultiDecoder(nj.Module):
       self, shapes, inputs=['tensor'], cnn_keys=r'.*', mlp_keys=r'.*',
       mlp_layers=4, mlp_units=512, cnn='resize', cnn_depth=48, cnn_blocks=2,
       image_dist='mse', vector_dist='mse', resize='stride', bins=255,
-      outscale=1.0, minres=4, cnn_sigmoid=False, **kw):
+      outscale=1.0, minres=4, cnn_sigmoid=False,
+      image_slot_size=0, image_slot_key='image', **kw):
     excluded = ('is_first', 'is_last', 'is_terminal', 'reward')
     shapes = {k: v for k, v in shapes.items() if k not in excluded}
     self.slot_shapes = {k: v for k, v in shapes.items() if k == 'slot'}
@@ -867,9 +910,14 @@ class MultiDecoder(nj.Module):
         k: v for k, v in shapes.items()
         if re.match(mlp_keys, k) and len(v) == 1 and k != 'slot'}
     self.shapes = {**self.cnn_shapes, **self.mlp_shapes, **self.slot_shapes}
+    self.image_slot_size = image_slot_size
+    self.image_slot_key = image_slot_key
     print('Decoder CNN shapes:', self.cnn_shapes)
     print('Decoder MLP shapes:', self.mlp_shapes)
     print('Decoder Slot shapes:', self.slot_shapes)
+    if self.image_slot_size > 0:
+      print(f'Decoder image slot: {image_slot_key} -> '
+            f'{self.image_slot_size}x{self.image_slot_size} via MLP')
     cnn_kw = {**kw, 'minres': minres, 'sigmoid': cnn_sigmoid}
     mlp_kw = {**kw, 'dist': vector_dist, 'outscale': outscale, 'bins': bins}
     if self.cnn_shapes:
@@ -887,22 +935,47 @@ class MultiDecoder(nj.Module):
     if self.mlp_shapes:
       self._mlp = MLP(
           self.mlp_shapes, mlp_layers, mlp_units, **mlp_kw, name='mlp')
+    if self.image_slot_size > 0:
+      image_shapes = {
+          k: v for k, v in shapes.items() if len(v) == 3 and k != 'slot'}
+      assert image_slot_key in image_shapes, (
+          f"image_slot_key '{image_slot_key}' not found in observation shapes")
+      assert image_slot_key not in self.cnn_shapes, (
+          f"Cannot use image slot and CNN encoder for '{image_slot_key}'")
+      self._image_slot_channels = image_shapes[image_slot_key][-1]
+      dec_kw = {**kw, 'name': 'image_slot_dec'}
+      self._image_slot_mlp = MLP(
+          None, mlp_layers, mlp_units, dist='none', **dec_kw)
     self._inputs = Input(inputs, dims='deter')
     self._image_dist = image_dist
 
   def __call__(self, inputs, drop_loss_indices=None):
     features = self._inputs(inputs)
     dists = {}
+    n_obj_slots = self.slot_shapes['slot'][0] if self.slot_shapes else 0
+    n_image_slot = 1 if self.image_slot_size > 0 else 0
     
     if self.slot_shapes:
       shape = self.slot_shapes['slot']
-      n_obj_slots = shape[0]
-      # features may have more slots than the ground truth (e.g. +1 text slot);
-      # reconstruct only the first n_obj_slots entries.
+      # features may have extra slots (image/text); reconstruct object slots only.
       obj_features = features[..., :n_obj_slots, :]
       projector = self.get('slot_proj', Linear, shape[-1], act='none')
       slot_mean = projector(obj_features)
       dists['slot'] = jaxutils.MSEDist(slot_mean, 2, 'sum')
+
+    if self.image_slot_size > 0:
+      image_features = features[..., n_obj_slots:n_obj_slots + n_image_slot, :]
+      hidden = self._image_slot_mlp(
+          image_features.reshape([-1, image_features.shape[-1]]))
+      hidden = hidden.reshape(image_features.shape[:-1] + (hidden.shape[-1],))
+      flat_dim = self.image_slot_size ** 2 * self._image_slot_channels
+      image_mean = self.get(
+          'image_slot_out', Linear, flat_dim, act='none')(hidden)
+      image_shape = image_features.shape[:-2] + (
+          self.image_slot_size, self.image_slot_size, self._image_slot_channels)
+      image_mean = image_mean.reshape(image_shape)
+      dists[self.image_slot_key] = self._make_image_dist(
+          self.image_slot_key, image_mean)
 
     if self.cnn_shapes:
       feat = features
@@ -918,9 +991,9 @@ class MultiDecoder(nj.Module):
           for (key, shape), mean in zip(self.cnn_shapes.items(), means)})
     if self.mlp_shapes:
       if self.slot_shapes:
-        # Text observations are encoded as the last slot
-        n_obj_slots = self.slot_shapes['slot'][0]
-        mlp_features = features[..., n_obj_slots:, :].reshape(
+        # Text observations are encoded as the last slot(s) after object/image slots.
+        mlp_features = features[
+            ..., n_obj_slots + n_image_slot:, :].reshape(
             features.shape[:-2] + (-1,))
       else:
         mlp_features = features

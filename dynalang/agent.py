@@ -181,11 +181,12 @@ class WorldModel(nj.Module):
       if self.encoder.slot_shapes:
         # Auto-derive num_slots from encoder output 
         base_slots = list(self.encoder.slot_shapes.values())[0][0]
+        n_image = 1 if self.encoder.image_slot_size > 0 else 0
         n_text = 1 if len(self.encoder.mlp_shapes) > 0 else 0
-        octssm_cfg['num_slots'] = base_slots + n_text
+        octssm_cfg['num_slots'] = base_slots + n_image + n_text
         print(f'WorldModel: auto-set octssm.num_slots = '
-              f'{base_slots} object slots + {n_text} text slot(s) = '
-              f'{octssm_cfg["num_slots"]}')
+              f'{base_slots} object slots + {n_image} image slot(s) + '
+              f'{n_text} text slot(s) = {octssm_cfg["num_slots"]}')
       self.rssm = nets.ObjectCentricTSSM(**octssm_cfg, name='rssm')
     else:
       raise NotImplementedError(self.config.rssm_type)
@@ -225,6 +226,8 @@ class WorldModel(nj.Module):
     scales = self.config.loss_scales.copy()
     image, vector = scales.pop('image'), scales.pop('vector')
     scales.update({k: image for k in self.heads['decoder'].cnn_shapes})
+    if self.encoder.image_slot_size > 0:
+      scales[self.encoder.image_slot_key] = image
     scales.update({k: vector for k in self.heads['decoder'].mlp_shapes})
     scales.update({k: vector for k in self.heads['decoder'].slot_shapes})
     self.scales = scales
@@ -316,7 +319,8 @@ class WorldModel(nj.Module):
 
     losses.update(rssm_losses)
     for key, dist in dists.items():
-      loss = -dist.log_prob(data[key].astype(jnp.float32))
+      target = self._loss_target(key, data)
+      loss = -dist.log_prob(target)
       assert loss.shape == embed.shape[:2], (key, loss.shape)
       losses[key] = loss
     scaled = {k: v * self.scales[k] for k, v in losses.items()}
@@ -389,8 +393,11 @@ class WorldModel(nj.Module):
     openl = self.heads['decoder'](
         self.rssm.imagine({k: data[k][:6, 5:] for k in act_keys}, start),
     )
-    for key in self.heads['decoder'].cnn_shapes.keys():
+    for key in self._decoder_image_keys():
       truth = data[key][:6].astype(jnp.float32)
+      if (self.encoder.image_slot_size > 0 and
+          key == self.encoder.image_slot_key):
+        truth = nets.downsample_image(truth, self.encoder.image_slot_size)
       model = jnp.concatenate([recon[key].mode()[:, :5], openl[key].mode()], 1)
       error = (model - truth + 1) / 2
       video = jnp.concatenate([truth, model, error], 2)
@@ -455,6 +462,19 @@ class WorldModel(nj.Module):
     )
     return recon, openl, reward
   
+  def _decoder_image_keys(self):
+    keys = list(self.heads['decoder'].cnn_shapes.keys())
+    if self.encoder.image_slot_size > 0:
+      keys.append(self.encoder.image_slot_key)
+    return keys
+
+  def _loss_target(self, key, data):
+    target = data[key].astype(jnp.float32)
+    if (self.encoder.image_slot_size > 0 and
+        key == self.encoder.image_slot_key):
+      target = nets.downsample_image(target, self.encoder.image_slot_size)
+    return target
+
   def _metrics(self, data, dists, post, prior, losses, model_loss):
     entropy = lambda feat: self.rssm.get_dist(feat).entropy()
     metrics = {}
