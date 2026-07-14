@@ -98,7 +98,7 @@ class SlotImageWrapper:
     agent     — agent sprite + direction arrow
     fixtures  — static furniture (sofa, table, fridge, …)
     trashcan  — all trash cans merged (Storage)
-    trash     — one slot per trash type (bottle/fruit/papers/plates)
+    trash     — all trash types merged (bottle/fruit/papers/plates)
   """
 
   SCENE_CLASSES = frozenset({"wall", "tile", "carpet", "wood"})
@@ -279,13 +279,11 @@ class SlotImageWrapper:
     if name in self.TRASHCAN_TYPES:
       return ("trashcan",)
     if name in self.TRASH_TYPES:
-      return ("trash", name)
+      return ("trash",)
     return ("fixtures",)
 
   def _group_display_name(self, slot_group):
     kind = slot_group[0]
-    if kind == "trash":
-      return slot_group[1]
     return self.SLOT_GROUP_NAMES.get(kind, kind)
 
   def _obj_texture(self, obj):

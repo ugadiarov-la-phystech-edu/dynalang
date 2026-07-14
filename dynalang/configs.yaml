@@ -117,7 +117,7 @@ defaults:
       p_teleport: 0.05
       p_unsafe: 0.
       use_object_slots: False
-      num_slots: 8  # scene + agent + fixtures + trashcan + 4 trash types
+      num_slots: 5  # scene + agent + fixtures + trashcan + trash
       slot_tile_size: 32
       slot_out_size: [64, 64]  # output size of each slot image; smaller = cheaper
     langroom:
