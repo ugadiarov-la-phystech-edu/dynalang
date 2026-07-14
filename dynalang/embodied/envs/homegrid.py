@@ -20,6 +20,7 @@ class HomeGrid(embodied.Env):
     use_object_slots=False,
     num_slots=10,
     slot_tile_size=32,
+    slot_out_size=None,
   ):
     from . import from_gym
     import homegrid
@@ -34,8 +35,9 @@ class HomeGrid(embodied.Env):
                    p_unsafe=p_unsafe,
                    fixed_state=fixed_state)
     if use_object_slots:
+      out_size = tuple(slot_out_size) if slot_out_size else size
       env = SlotImageWrapper(
-          env, num_slots=num_slots, tile_size=slot_tile_size, out_size=size)
+          env, num_slots=num_slots, tile_size=slot_tile_size, out_size=out_size)
     env = homegrid.wrappers.Gym26Wrapper(env)
     self._env = env
     self.observation_space = self._env.observation_space

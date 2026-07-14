@@ -119,6 +119,7 @@ defaults:
       use_object_slots: False
       num_slots: 8  # scene + agent + fixtures + trashcan + 4 trash types
       slot_tile_size: 32
+      slot_out_size: [64, 64]  # output size of each slot image; smaller = cheaper
     langroom:
       length: 200
       vocab_size: 15
