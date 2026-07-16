@@ -181,11 +181,26 @@ class WorldModel(nj.Module):
       if self.encoder.slot_shapes:
         # Auto-derive num_slots from encoder output 
         base_slots = list(self.encoder.slot_shapes.values())[0][0]
-        n_text = 1 if len(self.encoder.mlp_shapes) > 0 else 0
+        text_token = octssm_cfg.get('text_token', False)
+        text_to_all = getattr(self.encoder, 'text_to_all_slots', False)
+        has_text_mlp = len(self.encoder.mlp_shapes) > 0
+        # text_to_all_slots appends text into each object slot (no extra slot).
+        # Separate text slot only when text MLP is present and not text_to_all.
+        n_text = 0
+        if text_token:
+          n_text = 1
+        elif has_text_mlp and not text_to_all:
+          n_text = 1
         octssm_cfg['num_slots'] = base_slots + n_text
+        parts = [f'{base_slots} object slots']
+        if has_text_mlp and text_to_all:
+          parts.append('text appended to each slot')
+        if text_token:
+          parts.append('+1 learnable text token')
+        elif n_text:
+          parts.append('+1 encoder text slot')
         print(f'WorldModel: auto-set octssm.num_slots = '
-              f'{base_slots} object slots + {n_text} text slot(s) = '
-              f'{octssm_cfg["num_slots"]}')
+              f'{octssm_cfg["num_slots"]} ({", ".join(parts)})')
       self.rssm = nets.ObjectCentricTSSM(**octssm_cfg, name='rssm')
     else:
       raise NotImplementedError(self.config.rssm_type)

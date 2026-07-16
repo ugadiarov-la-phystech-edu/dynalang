@@ -385,7 +385,7 @@ class ObjectCentricTSSM(TSSM):
       self, num_slots, deter=512, units=512, stoch=32, classes=32,
       tf_context_length=16, tf_layers=4, tf_heads=8, feedforward_units=1024,
       dropout=0.0, unroll=False, unimix=0.01, action_clip=1.0,
-      action_mode='none', winit='normal', **kw):
+      action_mode='none', text_token=False, winit='normal', **kw):
     assert action_mode in ('none', 'slot', 'cross_attn'), action_mode
     super().__init__(
         deter=deter, units=units, stoch=stoch, classes=classes,
@@ -395,6 +395,10 @@ class ObjectCentricTSSM(TSSM):
         action_clip=action_clip, winit=winit, **kw)
     from .transformer import ObjectCentricDynamicsTransformer
     self._num_slots = num_slots
+    self._text_token = text_token
+    self._num_obj_slots = num_slots - 1 if text_token else num_slots
+    if text_token:
+      assert num_slots > 1, 'text_token requires num_slots > 1'
     self._action_mode = action_mode
     self._oc_transformer = ObjectCentricDynamicsTransformer(
         num_layers=tf_layers, d_model=units, nhead=tf_heads,
@@ -422,12 +426,21 @@ class ObjectCentricTSSM(TSSM):
     state['stoch'] = self._prior(cast(state['deter']), sample=True)['stoch']
     return cast(state)
 
+  def _text_slot_embed(self, batch_shape):
+    token = self.get('text_slot_token', jnp.zeros, [self._units], f32)
+    return jnp.broadcast_to(token, (*batch_shape, 1, self._units))
+
   def obs_step(self, prev_state, prev_action, embed, is_first, training=True):
     prev_action = jaxutils.concat_dict(prev_action)
     prev_state, prev_action = tree_map(
         lambda prev, init: jaxutils.switch(is_first, init, prev),
         (prev_state, prev_action),
         (self.initial(len(is_first)), jnp.zeros_like(prev_action)))
+    if self._text_token and embed.shape[-2] == self._num_obj_slots:
+      embed = jnp.concatenate([
+          embed,
+          jnp.zeros(embed.shape[:-2] + (1, embed.shape[-1]), embed.dtype),
+      ], axis=-2)
     next_state = self._step(prev_state, prev_action, training=training)
     deter = next_state['deter']  # (B, num_slots, units)
     x = jnp.concatenate([deter, embed], -1)
@@ -445,8 +458,14 @@ class ObjectCentricTSSM(TSSM):
     batch_shape = prev_state['deter'].shape[:-2]
     stoch_flat = prev_state['stoch'].reshape(
         (*batch_shape, self._num_slots, -1))  # (B, num_slots, stoch*classes)
-    new_slot_embed = self.get('projection_layer', Linear, **self._kw)(
-        stoch_flat)  # (B, num_slots, units)
+    if self._text_token:
+      obj_embed = self.get('projection_layer', Linear, **self._kw)(
+          stoch_flat[..., :self._num_obj_slots, :])
+      text_embed = self._text_slot_embed(batch_shape)
+      new_slot_embed = jnp.concatenate([obj_embed, text_embed], axis=-2)
+    else:
+      new_slot_embed = self.get('projection_layer', Linear, **self._kw)(
+          stoch_flat)  # (B, num_slots, units)
 
     tf_context = jnp.concatenate(
         [prev_state['tf_context'][:, 1:], new_slot_embed[:, None, :, :]], axis=1)
@@ -781,7 +800,7 @@ class MultiEncoder(nj.Module):
       self, shapes, cnn_keys=r'.*', mlp_keys=r'.*', mlp_layers=4,
       mlp_units=512, cnn='resize', cnn_depth=48,
       cnn_blocks=2, resize='stride',
-      symlog_inputs=False, minres=4, **kw):
+      symlog_inputs=False, minres=4, text_to_all_slots=False, **kw):
     excluded = ('is_first', 'is_last')
     shapes = {k: v for k, v in shapes.items() if (
         k not in excluded and not k.startswith('log_'))}
@@ -794,9 +813,11 @@ class MultiEncoder(nj.Module):
                 "token_embed" in self.mlp_shapes), \
       "Probably shouldn't have both token and token_embed, use token$?"
     self.shapes = {**self.cnn_shapes, **self.mlp_shapes, **self.slot_shapes}
+    self.text_to_all_slots = text_to_all_slots
     print('Encoder CNN shapes:', self.cnn_shapes)
     print('Encoder MLP shapes:', self.mlp_shapes)
     print('Encoder Slot shapes:', self.slot_shapes)
+    print('Encoder text_to_all_slots:', self.text_to_all_slots)
     cnn_kw = {**kw, 'minres': minres, 'name': 'cnn'}
     mlp_kw = {**kw, 'symlog_inputs': symlog_inputs, 'name': 'mlp'}
     if cnn == 'resnet':
@@ -839,10 +860,20 @@ class MultiEncoder(nj.Module):
 
     # Merge text into the visual representation so downstream models see one tensor
     if 'slot' in result and 'text' in result:
-      slot_dim = result['slot'].shape[-1]
-      text_slot = self.get('text_slot_proj', Linear, slot_dim)(result['text'])
-      result['slot'] = jnp.concatenate(
-          [result['slot'], text_slot[..., None, :]], axis=-2)
+      if self.text_to_all_slots:
+        # Append text features to every slot (text_all_slots).
+        slots = result['slot']
+        text = result['text']
+        text = jnp.broadcast_to(
+            text[..., None, :],
+            slots.shape[:-1] + (text.shape[-1],))
+        result['slot'] = jnp.concatenate([slots, text], axis=-1)
+      else:
+        # Extra text slot projected into slot dim.
+        slot_dim = result['slot'].shape[-1]
+        text_slot = self.get('text_slot_proj', Linear, slot_dim)(result['text'])
+        result['slot'] = jnp.concatenate(
+            [result['slot'], text_slot[..., None, :]], axis=-2)
     elif 'image' in result and 'text' in result:
       result['image'] = jnp.concatenate([result['image'], result['text']], axis=-1)
 
@@ -918,10 +949,14 @@ class MultiDecoder(nj.Module):
           for (key, shape), mean in zip(self.cnn_shapes.items(), means)})
     if self.mlp_shapes:
       if self.slot_shapes:
-        # Text observations are encoded as the last slot
         n_obj_slots = self.slot_shapes['slot'][0]
-        mlp_features = features[..., n_obj_slots:, :].reshape(
-            features.shape[:-2] + (-1,))
+        if features.shape[-2] > n_obj_slots:
+          # Extra slot(s): encoder text slot or learnable text_token CLS.
+          mlp_features = features[..., n_obj_slots:, :].reshape(
+              features.shape[:-2] + (-1,))
+        else:
+          # text_to_all_slots without a dedicated text slot: pool over slots.
+          mlp_features = features.mean(axis=-2)
       else:
         mlp_features = features
       dists.update(self._mlp(mlp_features))
