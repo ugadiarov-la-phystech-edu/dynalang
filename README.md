@@ -64,6 +64,27 @@ wget https://anaconda.org/aihabitat/habitat-sim/0.1.7/download/linux-64/habitat-
 conda install habitat-sim-0.1.7-py3.8_headless_linux_856d4b08c1a2632626bf0d205bf46471a99502b7.tar.bz2
 ```
 
+**Important — pin `numpy`, `numba`, and `gym`.** `env_vln.yml` resolves to an internally inconsistent set (its pip `numpy==1.24.4` breaks the pinned `numba=0.54.1`), and both `numpy 1.24` and `gym 0.26` break the older Habitat stack. VLN needs these exact versions (`numpy 1.23.5` still has `np.float`, is `>=1.22` for JAX 0.4.8, and `<1.27` for `numba`):
+
+| Package | Required | Why |
+| --- | --- | --- |
+| `numpy` | `1.23.5` | `numpy>=1.24` removed `np.float`, which `habitat-sim` 0.1.7 uses. |
+| `numba` (+ `llvmlite`) | `0.58.1` (+ `0.41.1`) | `env_vln.yml`'s `numba 0.54.1` has an ABI mismatch with `numpy>=1.21`. `0.58.1` is the last `numba` supporting Python 3.8. |
+| `gym` | `0.21.0` | `gym>=0.22` rejects `spaces.Discrete(0)`, which `habitat_lab`'s `InstructionSensor` constructs. |
+
+Apply them after the steps above:
+```bash
+pip install --no-deps numpy==1.23.5 gym==0.21.0
+pip install --ignore-installed --no-deps llvmlite==0.41.1 numba==0.58.1
+```
+
+Note that `pip install -e .` (from *Getting Started*) re-resolves `pyproject.toml` and will upgrade `gym`→0.26 and `numpy`→1.24, re-breaking the env. For VLN, run it as `pip install -e . --no-deps` (the conda env already provides every dependency), or re-apply the two `pip install` lines above afterward.
+
+Symptoms if these versions drift:
+- `SystemError: initialization of _internal failed without raising an exception` — `numba`/`numpy` ABI mismatch; fix `numba`/`numpy`.
+- `AttributeError: module 'numpy' has no attribute 'float'` — `numpy>=1.24` with `habitat-sim` 0.1.7; downgrade to `numpy==1.23.5`.
+- `AssertionError: n (counts) have to be positive` from `gym/spaces/discrete.py` — `gym>=0.22` with `habitat_lab`; downgrade to `gym==0.21.0`.
+
 2. Clone our VLN-CE and habitat-lab forks into this project repo:
 ```bash
 git clone https://github.com/jlin816/VLN-CE VLN_CE
