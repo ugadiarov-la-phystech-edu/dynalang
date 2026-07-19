@@ -781,7 +781,7 @@ class MultiEncoder(nj.Module):
       self, shapes, cnn_keys=r'.*', mlp_keys=r'.*', mlp_layers=4,
       mlp_units=512, cnn='resize', cnn_depth=48,
       cnn_blocks=2, resize='stride',
-      symlog_inputs=False, minres=4, **kw):
+      symlog_inputs=False, minres=4, slotcontrast=None, **kw):
     excluded = ('is_first', 'is_last')
     shapes = {k: v for k, v in shapes.items() if (
         k not in excluded and not k.startswith('log_'))}
@@ -793,6 +793,37 @@ class MultiEncoder(nj.Module):
     assert not ("token" in self.mlp_shapes and \
                 "token_embed" in self.mlp_shapes), \
       "Probably shouldn't have both token and token_embed, use token$?"
+    # In-graph SlotContrast extractor: consumes a raw image key and emits the
+    # object slots itself (trainable), instead of a precomputed 'slot' obs.
+    slotcontrast = dict(slotcontrast or {})
+    self.slotcontrast_enabled = bool(slotcontrast.pop('enabled', False))
+    self._slotcontrast = None
+    if self.slotcontrast_enabled:
+      self._sc_image_key = slotcontrast.pop('image_key', 'image')
+      slotcontrast.pop('jax_checkpoint', None)  # consumed by jaxagent
+      # Emit raw backbone features (the SlotContrast featrec target) on the
+      # training path, for the MultiDecoder MLPDecoder head.
+      self._sc_emit_features = bool(slotcontrast.pop('emit_features', False))
+      assert not self.slot_shapes, (
+          'slotcontrast.enabled conflicts with a precomputed slot observation '
+          '(use_slot_extractor); disable one of them.')
+      assert self._sc_image_key in shapes and (
+          len(shapes[self._sc_image_key]) == 3), (
+          self._sc_image_key, shapes)
+      assert not self.cnn_shapes, (
+          'slotcontrast mode consumes the image itself; set cnn_keys to "$^" '
+          f'(got cnn_shapes={self.cnn_shapes})')
+      from . import slot_nets
+      self._slotcontrast = slot_nets.SlotContrastEncoder(
+          **slotcontrast, name='slotcontrast')
+      # Synthetic slot shape: drives octssm num_slots auto-set and the
+      # decoder's sg(slots) reconstruction head in agent.py.
+      self.slot_shapes = {'slot': (
+          self._slotcontrast.n_slots, self._slotcontrast.slot_dim)}
+      if self._sc_emit_features:
+        # Featrec target shape for the MultiDecoder MLPDecoder head.
+        self.slotcontrast_feature_shape = (
+            self._slotcontrast.n_patches, self._slotcontrast.feat_dim)
     self.shapes = {**self.cnn_shapes, **self.mlp_shapes, **self.slot_shapes}
     print('Encoder CNN shapes:', self.cnn_shapes)
     print('Encoder MLP shapes:', self.mlp_shapes)
@@ -807,17 +838,43 @@ class MultiEncoder(nj.Module):
       self._mlp = MLP(None, mlp_layers, mlp_units, dist='none', **mlp_kw)
     self.preprocessors = {}
 
-  def __call__(self, data, zero_mlp=False, zero_cnn=False):
-    some_key, some_shape = list(self.shapes.items())[0]
-    batch_dims = data[some_key].shape[:-len(some_shape)]
+  def slot_initial(self, batch_size):
+    """Initial recurrent slot state for the online policy path."""
+    assert self.slotcontrast_enabled
+    return self._slotcontrast.initial(batch_size)
+
+  def __call__(self, data, zero_mlp=False, zero_cnn=False, slot_state=None,
+               return_slot_state=False):
+    extras = None
+    if self.slotcontrast_enabled:
+      images = data[self._sc_image_key]
+      # (B, H, W, C) on the policy path, (B, T, H, W, C) in training.
+      batch_dims = images.shape[:-3]
+      # Raw ViT features are only needed as the featrec target in training
+      # (5D input); the per-step policy path skips materializing them.
+      emit = self._sc_emit_features and len(images.shape) == 5
+      if emit:
+        obj_slots, new_state, raw_feats = self._slotcontrast(
+            images, data['is_first'], slot_state, return_features=True)
+        extras = {'slots': obj_slots, 'slot_state': new_state,
+                  'features': raw_feats}
+      else:
+        obj_slots, new_state = self._slotcontrast(
+            images, data['is_first'], slot_state)
+        extras = {'slots': obj_slots, 'slot_state': new_state}
+    else:
+      some_key, some_shape = list(self.shapes.items())[0]
+      batch_dims = data[some_key].shape[:-len(some_shape)]
     data = {
         k: v.reshape((-1,) + v.shape[len(batch_dims):])
         for k, v in data.items()}
     result = {}
 
-    if 'slot' in data:
+    if self.slotcontrast_enabled:
+      result['slot'] = jaxutils.cast_to_compute(extras['slots'])
+    elif 'slot' in data:
       result['slot'] = data['slot'].reshape(batch_dims + data['slot'].shape[1:])
-      
+
     if self.cnn_shapes:
       inputs = jnp.concatenate([data[k] for k in self.cnn_shapes], -1)
       output = self._cnn(inputs)
@@ -846,7 +903,10 @@ class MultiEncoder(nj.Module):
     elif 'image' in result and 'text' in result:
       result['image'] = jnp.concatenate([result['image'], result['text']], axis=-1)
 
-    return result['slot'] if 'slot' in result else result['image']
+    embed = result['slot'] if 'slot' in result else result['image']
+    if return_slot_state:
+      return embed, extras
+    return embed
 
 
 
@@ -856,20 +916,33 @@ class MultiDecoder(nj.Module):
       self, shapes, inputs=['tensor'], cnn_keys=r'.*', mlp_keys=r'.*',
       mlp_layers=4, mlp_units=512, cnn='resize', cnn_depth=48, cnn_blocks=2,
       image_dist='mse', vector_dist='mse', resize='stride', bins=255,
-      outscale=1.0, minres=4, cnn_sigmoid=False, **kw):
+      outscale=1.0, minres=4, cnn_sigmoid=False,
+      featdec_hidden=[1024, 1024, 1024], featdec_f16=False, featdec_chunk=0,
+      **kw):
     excluded = ('is_first', 'is_last', 'is_terminal', 'reward')
     shapes = {k: v for k, v in shapes.items() if k not in excluded}
     self.slot_shapes = {k: v for k, v in shapes.items() if k == 'slot'}
+    # SlotContrast featrec head: reconstructs the frozen DINO backbone
+    # features from the extractor's slots via the SlotContrast MLPDecoder.
+    self.featrec_shapes = {
+        k: v for k, v in shapes.items() if k == 'vit_feature'}
+    self._featdec_hidden = tuple(featdec_hidden)
+    self._featdec_f16 = featdec_f16
+    self._featdec_chunk = featdec_chunk
     self.cnn_shapes = {
         k: v for k, v in shapes.items()
-        if re.match(cnn_keys, k) and len(v) == 3 and k != 'slot'}
+        if re.match(cnn_keys, k) and len(v) == 3
+        and k not in ('slot', 'vit_feature')}
     self.mlp_shapes = {
         k: v for k, v in shapes.items()
-        if re.match(mlp_keys, k) and len(v) == 1 and k != 'slot'}
-    self.shapes = {**self.cnn_shapes, **self.mlp_shapes, **self.slot_shapes}
+        if re.match(mlp_keys, k) and len(v) == 1
+        and k not in ('slot', 'vit_feature')}
+    self.shapes = {**self.cnn_shapes, **self.mlp_shapes, **self.slot_shapes,
+                   **self.featrec_shapes}
     print('Decoder CNN shapes:', self.cnn_shapes)
     print('Decoder MLP shapes:', self.mlp_shapes)
     print('Decoder Slot shapes:', self.slot_shapes)
+    print('Decoder Featrec shapes:', self.featrec_shapes)
     cnn_kw = {**kw, 'minres': minres, 'sigmoid': cnn_sigmoid}
     mlp_kw = {**kw, 'dist': vector_dist, 'outscale': outscale, 'bins': bins}
     if self.cnn_shapes:
@@ -890,11 +963,49 @@ class MultiDecoder(nj.Module):
     self._inputs = Input(inputs, dims='deter')
     self._image_dist = image_dist
 
+  def _featdec(self):
+    n_patches, feat_dim = self.featrec_shapes['vit_feature']
+    from . import slot_nets
+    return self.get(
+        'featdec', slot_nets.MLPDecoder, feat_dim, n_patches,
+        self._featdec_hidden, self._featdec_f16, self._featdec_chunk)
+
+  def _featproj(self, features):
+    """Object-slot latent features -> MLPDecoder input width (the slot dim,
+    so pretrained MLPDecoder weights stay loadable)."""
+    n_obj_slots, slot_dim = self.slot_shapes['slot']
+    obj_features = features[..., :n_obj_slots, :]
+    return self.get('featproj', Linear, slot_dim, act='none')(obj_features)
+
+  def decoder_masks(self, inputs):
+    """Soft MLPDecoder alpha masks (..., S, n_patches) decoded from the
+    world model's per-slot latents — SlotContrast's 'decoder_masks' (before
+    resizing). Shares the featrec head's parameters."""
+    assert self.featrec_shapes, 'decoder_masks needs the featrec head'
+    _, masks = self._featdec()(self._featproj(self._inputs(inputs)))
+    return masks
+
   def __call__(self, inputs, drop_loss_indices=None):
     features = self._inputs(inputs)
     dists = {}
-    
-    if self.slot_shapes:
+
+    if self.featrec_shapes:
+      # Fine-tuning mode: the featrec head replaces the slot distillation
+      # head. The object-slot latents [deter, stoch] are projected to the
+      # slot width and the MLPDecoder reconstructs the sg(raw backbone
+      # features) target injected by WorldModel.loss — so the latents
+      # themselves must carry the DINO feature information, and gradients
+      # reach the world model, this projection, the MLPDecoder and (through
+      # the posterior) the slot extractor.
+      assert self.slot_shapes, 'featrec-from-latents needs the slot shape'
+      recon, _ = self._featdec()(self._featproj(features))
+      # Mean (not sum) over the (patches, feat) event dims, matching the
+      # SlotContrast MSELoss reduction; scaled via loss_scales.vit_feature.
+      dists['vit_feature'] = jaxutils.MSEDist(
+          recon.astype(f32), 2, 'mean')
+    elif self.slot_shapes:
+      # Frozen-extractor mode: distillation only — a linear projection from
+      # the object-slot latents reconstructing sg(encoder slots), MSE-sum.
       shape = self.slot_shapes['slot']
       n_obj_slots = shape[0]
       # features may have more slots than the ground truth (e.g. +1 text slot);
@@ -1120,7 +1231,7 @@ class AggregationTransformerHead(nj.Module):
       self, space, output='mse', layers=2, units=512, heads=8, ffup=4,
       act='silu', norm='layer', dropout=0.1,
       inputs=['tensor'], dims=None, bdims=None,
-      aggregation_method='last',
+      aggregation_method='last', remat=False,
       **kw):
     from .transformer import TransformerEncoder
     
@@ -1150,6 +1261,7 @@ class AggregationTransformerHead(nj.Module):
         dropout=dropout,
         norm_first=True,
         norm=True,
+        remat=remat,
         name='transformer')
     
     self._dist_kw = {k: v for k, v in kw.items() if k in (

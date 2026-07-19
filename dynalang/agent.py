@@ -55,10 +55,15 @@ class Agent(nj.Module):
           self.wm, self.act_space, self.config, name='expl_behavior')
 
   def policy_initial(self, batch_size):
-    return (
+    state = (
         self.wm.initial(batch_size),
         self.task_behavior.initial(batch_size),
         self.expl_behavior.initial(batch_size))
+    if getattr(self.wm.encoder, 'slotcontrast_enabled', False):
+      # Recurrent slot state carries across the whole episode online,
+      # mirroring BatchSlotExtractorEnv._previous_slots.
+      state = state + (self.wm.encoder.slot_initial(batch_size),)
+    return state
 
   def train_initial(self, batch_size):
     return self.wm.initial(batch_size)
@@ -66,8 +71,14 @@ class Agent(nj.Module):
   def policy(self, obs, state, mode='train'):
     self.config.jax.jit and print('Tracing policy function.')
     obs = self.preprocess(obs)
-    (prev_latent, prev_action), task_state, expl_state = state
-    embed = self.wm.encoder(obs)
+    slotcontrast = getattr(self.wm.encoder, 'slotcontrast_enabled', False)
+    if slotcontrast:
+      (prev_latent, prev_action), task_state, expl_state, slot_state = state
+      embed, enc_extras = self.wm.encoder(
+          obs, slot_state=slot_state, return_slot_state=True)
+    else:
+      (prev_latent, prev_action), task_state, expl_state = state
+      embed = self.wm.encoder(obs)
     if self.config.rssm_type == "token":
       latent = self.wm.rssm.obs_step(
           prev_latent, prev_action, embed, obs["token"], obs['is_first'])
@@ -80,6 +91,8 @@ class Agent(nj.Module):
     outs = {'eval': task_outs, 'explore': expl_outs, 'train': task_outs}[mode]
     act = {k: v for k, v in outs.items() if k in self.act_space}
     state = ((latent, act), task_state, expl_state)
+    if slotcontrast:
+      state = state + (enc_extras['slot_state'],)
     act = {
         k: jnp.argmax(act[k], -1).astype(jnp.int32) if s.discrete else act[k]
         for k, s in self.act_space.items()}
@@ -217,8 +230,22 @@ class WorldModel(nj.Module):
     else:
       raise NotImplementedError(f'cont_head.typ: {self.config.cont_head.typ}')
     
+    dec_shapes = dict(shapes)
+    if getattr(self.encoder, 'slotcontrast_enabled', False):
+      # The in-graph slot extractor's output becomes a reconstruction target:
+      # WorldModel.loss injects sg(slots) into the data dict under 'slot', and
+      # the decoder's slot head reconstructs it (distillation; exactly the old
+      # precomputed-slot pipeline when the extractor is frozen).
+      assert self.config.rssm_type == 'octssm', (
+          'encoder.slotcontrast requires rssm_type octssm')
+      dec_shapes['slot'] = self.encoder.slot_shapes['slot']
+      if getattr(self.encoder, 'slotcontrast_feature_shape', None):
+        # SlotContrast featrec objective (fine-tuning): the decoder's
+        # MLPDecoder head reconstructs sg(raw DINO features) from the
+        # extractor's slots; see MultiDecoder.__call__.
+        dec_shapes['vit_feature'] = self.encoder.slotcontrast_feature_shape
     self.heads = {
-        'decoder': nets.MultiDecoder(shapes, **config.decoder, name='dec'),
+        'decoder': nets.MultiDecoder(dec_shapes, **config.decoder, name='dec'),
         'reward': reward_head,
         'cont': cont_head}
     self.opt = jaxutils.Optimizer(name='model_opt', **config.model_opt)
@@ -261,10 +288,30 @@ class WorldModel(nj.Module):
     return state, outs, metrics
 
   def loss(self, data, state):
-    embed = self.encoder(
-      data,
-      zero_mlp=self.config.zero_mlp,
-      zero_cnn=self.config.zero_cnn)
+    if getattr(self.encoder, 'slotcontrast_enabled', False):
+      # Replay guarantees is_first[0]=True, so the slot recurrence re-inits at
+      # every chunk start (same treatment the RSSM state gets); no cross-chunk
+      # slot carry is needed on the training path.
+      embed, enc_extras = self.encoder(
+          data,
+          zero_mlp=self.config.zero_mlp,
+          zero_cnn=self.config.zero_cnn,
+          return_slot_state=True)
+      if self.heads['decoder'].featrec_shapes:
+        # Fine-tuning mode: featrec-from-latents. Target is sg(raw backbone
+        # features), mirroring SlotContrast's target.detach() on
+        # encoder.backbone_features; no distillation head exists.
+        data = {**data, 'vit_feature': sg(
+            enc_extras['features'].astype(jnp.float32))}
+      else:
+        # Frozen-extractor mode: distillation target only; stop-gradient so
+        # the extractor cannot collapse by chasing its own output.
+        data = {**data, 'slot': sg(enc_extras['slots'].astype(jnp.float32))}
+    else:
+      embed = self.encoder(
+        data,
+        zero_mlp=self.config.zero_mlp,
+        zero_cnn=self.config.zero_cnn)
 
     prev_latent, prev_action = state
     prev_actions = {
@@ -343,6 +390,11 @@ class WorldModel(nj.Module):
       state = self.rssm.img_step(state, action)
       action, carry = policy(state, carry)
       return state, action, carry
+    if self.config.imag_remat and not nj.creating():
+      # Store only the per-step trajectory states; recompute the imagination
+      # step's internals (world-model transformer, policy) in the backward
+      # pass. Gradients reach the actor through the whole rollout either way.
+      step = jax.checkpoint(step)
     states, actions, carries = jaxutils.scan(
         step, jnp.arange(horizon), (state, action, carry),
         self.config.imag_unroll)
@@ -386,15 +438,38 @@ class WorldModel(nj.Module):
     # - logit, stoch (batch, prefix_len, rssm.stoch, rssm.classes)
     start = {k: v[:, -1] for k, v in context.items()}
     recon = self.heads['decoder'](context)
-    openl = self.heads['decoder'](
-        self.rssm.imagine({k: data[k][:6, 5:] for k in act_keys}, start),
-    )
+    prior = self.rssm.imagine({k: data[k][:6, 5:] for k in act_keys}, start)
+    openl = self.heads['decoder'](prior)
     for key in self.heads['decoder'].cnn_shapes.keys():
       truth = data[key][:6].astype(jnp.float32)
       model = jnp.concatenate([recon[key].mode()[:, :5], openl[key].mode()], 1)
       error = (model - truth + 1) / 2
       video = jnp.concatenate([truth, model, error], 2)
       report[f'openl_{key}'] = jaxutils.video_grid(video)
+    if getattr(self.encoder, 'slotcontrast_enabled', False) and (
+        self.heads['decoder'].featrec_shapes):
+      # SlotContrast 'decoder_masks' video ([original | per-slot masked
+      # frames]). In featrec-from-latents mode the masks come from the world
+      # model's per-slot latents: the full-length posterior serves as the
+      # 'truth' row, the recon(5)+imagination latents as the 'model' row.
+      from . import slot_nets
+      sub = {k: v[:6] for k, v in data.items()}
+      post6 = self.rssm.observe(
+          embed[:6], {k: data[k][:6] for k in act_keys},
+          data['is_first'][:6])
+      truth_masks = self.heads['decoder'].decoder_masks(post6)
+      video = slot_nets.decoder_masks_video(
+          sub[self.encoder._sc_image_key].astype(jnp.float32), truth_masks)
+      report['decoder_masks'] = slot_nets.video_rows(video)
+      model_latents = {
+          k: jnp.concatenate([context[k][:3], prior[k][:3]], 1)
+          for k in ('deter', 'stoch')}
+      model_masks = self.heads['decoder'].decoder_masks(model_latents)
+      openl_video = slot_nets.openl_decoder_masks_video(
+          sub[self.encoder._sc_image_key][:3].astype(jnp.float32),
+          truth_masks[:3], model_masks)
+      for i in range(openl_video.shape[0]):
+        report[f'openl_decoder_masks_{i}'] = openl_video[i]
     # 1 step prediction loss for text
     # Calculate text ppl over entire batch and seq len for more context
     # Above is buggy - observe takes in prev_actions, ac taken into this state (see loss)

@@ -389,12 +389,18 @@ class Optimizer(nj.Module):
 
   def __init__(
       self, lr, opt='adam', eps=1e-5, clip=100.0, warmup=0, wd=0.0,
-      wd_pattern=r'/(w|kernel)$', lateclip=0.0, frozen_keys=r'^$'):
+      wd_pattern=r'/(w|kernel)$', lateclip=0.0, frozen_keys=r'^$',
+      warmup_keys=r'^$'):
     assert wd_pattern[0] not in ('0', '1')
     # assert self.path not in self.PARAM_COUNTS
     self.PARAM_COUNTS[self.path] = None
     wd_pattern = re.compile(wd_pattern)
+    # With warmup_keys set, the warmup applies only to the matching parameters
+    # (e.g. 'enc/slotcontrast|dec/featdec'); everything else trains at the
+    # full learning rate from step one.
+    scoped_warmup = bool(warmup) and warmup_keys != r'^$'
     frozen_keys = re.compile(frozen_keys)
+    warmup_keys = re.compile(warmup_keys)
     chain = []
     if clip:
       chain.append(optax.clip_by_global_norm(clip))
@@ -411,22 +417,27 @@ class Optimizer(nj.Module):
           tree_map(lambda k: bool(wd_pattern.search(k)), tree_keys(params)))))
     if warmup:
       schedule = optax.linear_schedule(0.0, -lr, warmup)
-      chain.append(optax.inject_hyperparams(optax.scale)(schedule))
+      warmup_scale = optax.inject_hyperparams(optax.scale)(schedule)
+    if warmup and not scoped_warmup:
+      chain.append(warmup_scale)
     else:
       chain.append(optax.scale(-lr))
-    def partition_params_fn(params): 
+    def partition_params_fn(params):
       def label_key(k):
-        label = "frozen" if bool(frozen_keys.search(k)) else "trainable"
-        if label == "frozen":
+        if bool(frozen_keys.search(k)):
           print(f" {k}")
-        return label
+          return "frozen"
+        if scoped_warmup and bool(warmup_keys.search(k)):
+          return "warmup"
+        return "trainable"
       print("Frozen keys: ")
       return tree_map(label_key, tree_keys(params))
 
-    self.opt = optax.multi_transform(
-      {"trainable": optax.chain(*chain), "frozen": optax.set_to_zero()},
-      partition_params_fn
-    )
+    transforms = {
+        "trainable": optax.chain(*chain), "frozen": optax.set_to_zero()}
+    if scoped_warmup:
+      transforms["warmup"] = optax.chain(*chain[:-1], warmup_scale)
+    self.opt = optax.multi_transform(transforms, partition_params_fn)
 #    self.opt = optax.chain(*chain)
     self.step = nj.Variable(jnp.array, 0, jnp.int32, name='step')
     self.scaling = (COMPUTE_DTYPE == jnp.float16)

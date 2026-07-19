@@ -46,6 +46,7 @@ class JAXAgent(embodied.Agent):
 
     self._transform()
     self.varibs = self._init_varibs(obs_space, act_space)
+    self._load_slotcontrast_ckpt(config)
     self.updates = embodied.Counter()
     self.once = True
 
@@ -213,6 +214,54 @@ class JAXAgent(embodied.Agent):
       else:
         obs_pp[k] = obs[k]
     return obs_pp
+
+  def _load_slotcontrast_ckpt(self, config):
+    """Overwrite the freshly initialized SlotContrast encoder params with a
+    converted torch checkpoint (scripts/convert_slotcontrast_to_jax.py)."""
+    try:
+      slotcontrast = dict(config.encoder.slotcontrast)
+    except (AttributeError, KeyError):
+      return
+    path = slotcontrast.get('jax_checkpoint', '')
+    if not (slotcontrast.get('enabled', False) and path):
+      return
+    import pickle
+    with open(path, 'rb') as f:
+      converted = pickle.load(f)
+    if len(self.train_devices) > 1:
+      varibs = tree_map(lambda x: x[0], self.varibs)
+    else:
+      varibs = self.varibs
+    expected = {k for k in varibs if '/enc/slotcontrast/' in f'/{k}/'}
+    featdec = {k for k in varibs if '/dec/featdec/' in f'/{k}/'}
+    if not featdec:
+      # Featrec head disabled: a pickle converted with the MLPDecoder weights
+      # is still usable — drop them instead of failing.
+      dropped = [k for k in converted if '/dec/featdec/' in f'/{k}/']
+      if dropped:
+        converted = {k: v for k, v in converted.items() if k not in dropped}
+        print(f'Featrec head disabled; ignoring {len(dropped)} '
+              'MLPDecoder arrays from the slotcontrast checkpoint.')
+    expected |= featdec
+    missing = expected - set(converted)
+    extra = set(converted) - expected
+    assert not missing and not extra, (
+        f'slotcontrast checkpoint mismatch. missing: {sorted(missing)[:5]} '
+        f'extra: {sorted(extra)[:5]} (was the pickle converted with '
+        f'--prefix agent/wm/enc/slotcontrast [+ --decoder-prefix '
+        f'agent/wm/dec/featdec] and matching depth/variant?)')
+    for key, value in converted.items():
+      have = tuple(varibs[key].shape)
+      want = tuple(value.shape)
+      assert have == want, (
+          f'shape mismatch for {key}: model {have} vs checkpoint {want} '
+          '(check n_slots/slot_dim/variant in encoder.slotcontrast)')
+    varibs = {**varibs, **{k: jnp.asarray(v) for k, v in converted.items()}}
+    if len(self.train_devices) == 1:
+      self.varibs = jax.device_put(varibs, self.train_devices[0])
+    else:
+      self.varibs = jax.device_put_replicated(varibs, self.train_devices)
+    print(f'Loaded {len(converted)} slotcontrast params from {path}')
 
   def save(self):
     if len(self.train_devices) > 1:

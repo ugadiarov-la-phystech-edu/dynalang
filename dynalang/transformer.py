@@ -226,7 +226,7 @@ class TransformerEncoder(nj.Module):
 
   def __init__(
       self, num_layers, d_model, nhead, feedforward_units=1024,
-      dropout=0.1, norm_first=False, norm=False):
+      dropout=0.1, norm_first=False, norm=False, remat=False):
     self._num_layers = num_layers
     self._d_model = d_model
     self._nhead = nhead
@@ -234,21 +234,28 @@ class TransformerEncoder(nj.Module):
     self._dropout = dropout
     self._norm_first = norm_first
     self._norm = norm
+    self._remat = remat
 
   def __call__(
       self, src, mask=None, src_key_padding_mask=None, training=False):
     seq_len = src.shape[1]
     pe = sinusoidal_positional_encoding(seq_len, self._d_model)
-    x = src + pe[None, :, :]
+    # astype: the f32 encoding must not promote an f16 stream to f32.
+    x = src + pe[None, :, :].astype(src.dtype)
     x = _dropout(x, self._dropout, training)
     for i in range(self._num_layers):
-      x = self.get(
+      layer = self.get(
           f'layer_{i}', TransformerEncoderLayer,
           self._d_model, self._nhead, self._feedforward_units,
-          self._dropout, self._norm_first)(
-              x, src_mask=mask,
-              src_key_padding_mask=src_key_padding_mask,
-              training=training)
+          self._dropout, self._norm_first)
+      apply = lambda h, layer=layer: layer(
+          h, src_mask=mask, src_key_padding_mask=src_key_padding_mask,
+          training=training)
+      if self._remat and not nj.creating():
+        # Rematerialize: store only the layer boundary, recompute the layer's
+        # internals (attention, feedforward hidden) in the backward pass.
+        apply = jax.checkpoint(apply)
+      x = apply(x)
     if self._norm:
       x = self.get('norm', Norm, 'layer')(x)
     return x
@@ -396,8 +403,9 @@ class ObjectCentricDynamicsTransformer(nj.Module):
     assert dim == self._d_model, (dim, self._d_model)
 
     # Temporal positional encoding, shared across slots of the same step.
+    # astype: the f32 encoding must not promote an f16 stream to f32.
     pe = sinusoidal_positional_encoding(T, self._d_model)
-    x = x + pe[None, :, None, :]
+    x = x + pe[None, :, None, :].astype(x.dtype)
     x = _dropout(x, self._dropout, training)
 
     # Flatten time and slots into one joint token sequence: (B, T*num_slots, D).
