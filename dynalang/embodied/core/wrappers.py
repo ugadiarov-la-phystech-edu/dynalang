@@ -319,7 +319,7 @@ class ResizeImage(base.Wrapper):
     self._size = size
     self._keys = [
         k for k, v in env.obs_space.items()
-        if len(v.shape) > 1 and v.shape[:2] != size]
+        if len(v.shape) in (2, 3) and v.shape[:2] != size]
     print(f'Resizing keys {",".join(self._keys)} to {self._size}.')
     if self._keys:
       from PIL import Image
