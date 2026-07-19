@@ -83,7 +83,7 @@ defaults:
   envs: {amount: 4, parallel: process, length: 0, reset: True, restart: True, discretize: 0, eval_amount: 4}
   wrapper: {length: 0, reset: True, discretize: 0, checks: False, timeout_reward: 0.0}
   env:
-    atari: {size: [64, 64], repeat: 4, sticky: True, gray: True, actions: all, lives: unused, noops: 0, pooling: 2, aggregate: max, resize: pillow, use_object_slots: False, num_slots: 4}
+    atari: {size: [64, 64], repeat: 4, sticky: True, gray: True, actions: all, lives: unused, noops: 0, pooling: 2, aggregate: max, resize: pillow, use_object_slots: False, num_slots: 4, slot_out_size: [64, 64]}
     atari100k: {size: [64, 64], repeat: 4, sticky: False, gray: False, actions: needed, lives: unused, noops: 30, resize: pillow}
     dmlab: {size: [64, 64], repeat: 4, episodic: True}
     minecraft: {size: [64, 64], break_speed: 100.0, logs: False}
@@ -272,6 +272,7 @@ atari_object_slots:
   env.atari.use_object_slots: True
   env.atari.num_slots: 4
   env.atari.gray: True
+  env.atari.slot_out_size: [64, 64]  # smaller (e.g. [32, 32]) = cheaper CNN
   octssm: {num_slots: 4, deter: 1024, units: 1024, stoch: 32, classes: 32, tf_context_length: 16, tf_layers: 4, tf_heads: 8, feedforward_units: 1536, dropout: 0.0, action_mode: none}
   encoder: {mlp_keys: '$^', cnn_keys: '$^'}
   decoder: {mlp_keys: '$^', cnn_keys: '$^'}

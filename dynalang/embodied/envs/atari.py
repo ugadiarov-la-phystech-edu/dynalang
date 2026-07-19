@@ -21,7 +21,7 @@ class Atari(embodied.Env):
       self, name, repeat=4, size=(84, 84), gray=True, noops=0, lives='unused',
       sticky=True, actions='all', length=108000, pooling=2, aggregate='max',
       resize='pillow', autostart=False, clip_reward=False, seed=None,
-      use_object_slots=False, num_slots=4, **unused):
+      use_object_slots=False, num_slots=4, slot_out_size=None, **unused):
     del unused
     lives = self._normalize_lives(lives)
     assert lives in ('unused', 'discount', 'reset'), lives
@@ -35,7 +35,7 @@ class Atari(embodied.Env):
       name = 'jamesbond'
 
     self.repeat = repeat
-    self.size = size
+    self.size = tuple(size)
     self.gray = gray
     self.noops = noops
     self.lives = lives
@@ -49,6 +49,10 @@ class Atari(embodied.Env):
     self.rng = np.random.default_rng(seed)
     self.use_object_slots = use_object_slots
     self.num_slots = num_slots
+    # Independent size for slot masks; defaults to the main image size.
+    self.slot_out_size = (
+        tuple(slot_out_size) if slot_out_size is not None else self.size)
+    assert self.slot_out_size[0] == self.slot_out_size[1], self.slot_out_size
 
     with self.LOCK:
       self.ale = ale_py.ALEInterface()
@@ -96,7 +100,7 @@ class Atari(embodied.Env):
     }
     if self.use_object_slots:
       spaces['slot_image'] = embodied.Space(
-          np.uint8, (self.num_slots, *self.size, 3))
+          np.uint8, (self.num_slots, *self.slot_out_size, 3))
     return spaces
 
   @property
@@ -189,21 +193,24 @@ class Atari(embodied.Env):
       obs['slot_image'] = slot_image
     return obs
 
-  def _resize(self, image):
-    if image.shape[:2] == self.size:
+  def _resize(self, image, size=None):
+    size = tuple(size) if size is not None else self.size
+    if image.shape[:2] == size:
       return image
     if self.resize == 'opencv':
       import cv2
-      return cv2.resize(image, self.size, interpolation=cv2.INTER_AREA)
+      return cv2.resize(image, size, interpolation=cv2.INTER_AREA)
     from PIL import Image
     image = Image.fromarray(image)
-    image = image.resize(self.size, Image.BILINEAR)
+    image = image.resize(size, Image.BILINEAR)
     return np.array(image)
 
   def _resize_slots(self, slots):
-    if slots.shape[1:3] == self.size:
+    if slots.shape[1:3] == self.slot_out_size:
       return slots
-    return np.stack([self._resize(slots[i]) for i in range(slots.shape[0])])
+    return np.stack([
+        self._resize(slots[i], self.slot_out_size)
+        for i in range(slots.shape[0])])
 
   def close(self):
     return None
