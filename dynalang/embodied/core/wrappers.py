@@ -317,9 +317,12 @@ class ResizeImage(base.Wrapper):
   def __init__(self, env, size=(64, 64)):
     super().__init__(env)
     self._size = size
-    self._keys = [
-        k for k, v in env.obs_space.items()
-        if len(v.shape) > 1 and v.shape[:2] != size]
+    self._keys = []
+    for key, space in env.obs_space.items():
+      if len(space.shape) == 4 and space.shape[1:3] != size:
+        self._keys.append(key)
+      elif len(space.shape) in (2, 3) and space.shape[:2] != size:
+        self._keys.append(key)
     print(f'Resizing keys {",".join(self._keys)} to {self._size}.')
     if self._keys:
       from PIL import Image
@@ -329,8 +332,12 @@ class ResizeImage(base.Wrapper):
   def obs_space(self):
     spaces = self.env.obs_space
     for key in self._keys:
-      shape = self._size + spaces[key].shape[2:]
-      spaces[key] = spacelib.Space(np.uint8, shape)
+      shape = spaces[key].shape
+      if len(shape) == 4:
+        spaces[key] = spacelib.Space(
+            np.uint8, (shape[0], *self._size, shape[-1]))
+      else:
+        spaces[key] = spacelib.Space(np.uint8, self._size + shape[2:])
     return spaces
 
   def step(self, action):
@@ -340,10 +347,11 @@ class ResizeImage(base.Wrapper):
     return obs
 
   def _resize(self, image):
+    if image.ndim == 4:
+      return np.stack([self._resize(image[i]) for i in range(image.shape[0])])
     image = self._Image.fromarray(image)
     image = image.resize(self._size, self._Image.NEAREST)
-    image = np.array(image)
-    return image
+    return np.array(image)
 
 class PadImage(base.Wrapper):
 

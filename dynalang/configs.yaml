@@ -83,7 +83,7 @@ defaults:
   envs: {amount: 4, parallel: process, length: 0, reset: True, restart: True, discretize: 0, eval_amount: 4}
   wrapper: {length: 0, reset: True, discretize: 0, checks: False, timeout_reward: 0.0}
   env:
-    atari: {size: [64, 64], repeat: 4, sticky: True, gray: True, actions: all, lives: unused, noops: 0, pooling: 2, aggregate: max, resize: pillow}
+    atari: {size: [64, 64], repeat: 4, sticky: True, gray: True, actions: all, lives: unused, noops: 0, pooling: 2, aggregate: max, resize: pillow, use_object_slots: False, num_slots: 4, slot_out_size: [64, 64]}
     atari100k: {size: [64, 64], repeat: 4, sticky: False, gray: False, actions: needed, lives: unused, noops: 30, resize: pillow}
     dmlab: {size: [64, 64], repeat: 4, episodic: True}
     minecraft: {size: [64, 64], break_speed: 100.0, logs: False}
@@ -116,6 +116,9 @@ defaults:
       num_trashcans: 2
       p_teleport: 0.05
       p_unsafe: 0.
+      use_object_slots: False
+      num_slots: 8
+      slot_tile_size: 32
     langroom:
       length: 200
       vocab_size: 15
@@ -261,6 +264,40 @@ atari100k:
   actor_eval_sample: True
   encoder: {mlp_keys: '$^', cnn_keys: 'image'}
   decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+atari_object_slots:
+
+  task: atari_pong
+  rssm_type: octssm
+  env.atari.use_object_slots: True
+  env.atari.num_slots: 4
+  env.atari.gray: True
+  env.atari.slot_out_size: [64, 64]  # smaller (e.g. [32, 32]) = cheaper CNN
+  octssm: {num_slots: 4, deter: 1024, units: 1024, stoch: 32, classes: 32, tf_context_length: 16, tf_layers: 4, tf_heads: 8, feedforward_units: 1536, dropout: 0.0, action_mode: none}
+  encoder: {mlp_keys: '$^', cnn_keys: '$^'}
+  decoder: {mlp_keys: '$^', cnn_keys: '$^'}
+  envs.amount: 8
+  run:
+    steps: 5.5e7
+    eval_eps: 10
+    train_ratio: 64
+    log_keys_video: [image, slot_image]
+
+homegrid_object_slots:
+
+  task: homegrid_task
+  rssm_type: octssm
+  env.homegrid.use_object_slots: True
+  env.homegrid.num_slots: 8
+  octssm: {num_slots: 8, deter: 1024, units: 1024, stoch: 32, classes: 32, tf_context_length: 16, tf_layers: 4, tf_heads: 8, feedforward_units: 1536, dropout: 0.0, action_mode: slot}
+  encoder: {mlp_keys: 'token$', cnn_keys: '$^'}
+  decoder: {mlp_keys: 'token$', cnn_keys: '$^'}
+  .*\.vec_keys: token$
+  .*\.img_keys: image
+  .*\.vec_dist: onehot
+  run:
+    train_ratio: 32
+    log_keys_video: [image, slot_image]
 
 crafter:
 
