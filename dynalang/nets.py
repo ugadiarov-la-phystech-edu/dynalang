@@ -906,6 +906,9 @@ class MultiDecoder(nj.Module):
 
     if self.cnn_shapes:
       feat = features
+      # sum over slots into one vector before decoding a single image.
+      if self.slot_shapes:
+        feat = feat.sum(axis=-2)
       if drop_loss_indices is not None:
         feat = feat[:, drop_loss_indices]
       flat = feat.reshape([-1, feat.shape[-1]])
