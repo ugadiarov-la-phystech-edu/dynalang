@@ -975,16 +975,11 @@ class MultiDecoder(nj.Module):
       dists['slot'] = jaxutils.MSEDist(slot_mean, 2, 'sum')
 
     if self.cnn_shapes:
-      n_image_slots = 1 if self.slot_based else 0
-      text_slots = self.n_text_slots
-      start = self.n_object_slots + n_image_slots
-      end = features.shape[-2] - text_slots if text_slots else features.shape[-2]
-      if self.slot_based and end > start:
-        feat = features[..., start:end, :].reshape(features.shape[:-2] + (-1,))
-      elif self.slot_based:
-        feat = features[..., :1, :].reshape(features.shape[:-2] + (-1,))
-      else:
-        feat = features
+      feat = features
+      # Slot latents are (..., num_slots, feat); sum over slots into one
+      # vector before decoding a single full-frame image.
+      if self.slot_based:
+        feat = feat.sum(axis=-2)
       if drop_loss_indices is not None:
         feat = feat[:, drop_loss_indices]
       flat = feat.reshape([-1, feat.shape[-1]])
@@ -997,17 +992,15 @@ class MultiDecoder(nj.Module):
           for (key, shape), mean in zip(self.cnn_shapes.items(), means)})
     if self.mlp_shapes:
       if self.slot_based:
-        n_image_slots = 1 if self.cnn_shapes else 0
-        text_start = self.n_object_slots + n_image_slots
-        mlp_features = features[..., text_start:, :].reshape(
-            features.shape[:-2] + (-1,))
-      else:
-        if self.slot_shapes:
-          n_obj_slots = self.slot_shapes['slot'][0]
-          mlp_features = features[..., n_obj_slots:, :].reshape(
+        # Text is the trailing slot(s). Sum-based image decode does not
+        # reserve a dedicated image-slot index.
+        if self.n_text_slots:
+          mlp_features = features[..., -self.n_text_slots:, :].reshape(
               features.shape[:-2] + (-1,))
         else:
-          mlp_features = features
+          mlp_features = features.mean(axis=-2)
+      else:
+        mlp_features = features
       dists.update(self._mlp(mlp_features))
     return dists
 
