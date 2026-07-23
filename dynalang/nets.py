@@ -490,12 +490,15 @@ class ObjectCentricTSSM(TSSM):
     prior = self._prior(post['deter'], sample=False, post=post)
     dyn = self.get_dist(sg(post)).kl_divergence(self.get_dist(prior))
     rep = self.get_dist(post).kl_divergence(self.get_dist(sg(prior)))
-    dyn = dyn.mean(-1)  # (B,)
-    rep = rep.mean(-1)  # (B,)
+    # Raw (unclamped) KL, averaged over slots. Logged as a diagnostic (scale 0)
+    dyn_raw = dyn.mean(-1)  # (B,)
+    rep_raw = rep.mean(-1)  # (B,)
     if free:
       dyn = jnp.maximum(dyn, free)
       rep = jnp.maximum(rep, free)
-    return {'dyn': dyn, 'rep': rep}, prior
+    dyn = dyn.mean(-1)  # (B,)
+    rep = rep.mean(-1)  # (B,)
+    return {'dyn': dyn, 'rep': rep, 'dyn_raw': dyn_raw, 'rep_raw': rep_raw}, prior
 
 
 class TokenRSSM(nj.Module):
