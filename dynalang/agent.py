@@ -234,6 +234,8 @@ class WorldModel(nj.Module):
     scales.update({k: vector for k in self.heads['decoder'].mlp_shapes})
     scales.update({k: vector for k in self.heads['decoder'].slot_shapes})
     scales.update({k: image for k in self.heads['decoder'].slot_image_shapes})
+    # Diagnostic-only losses (logged, but excluded from the model loss).
+    scales.update({'dyn_raw': 0.0, 'rep_raw': 0.0})
     self.scales = scales
 
   def initial(self, batch_size):
