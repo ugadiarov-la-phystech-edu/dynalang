@@ -31,6 +31,10 @@ defaults:
     initialize_twice: True
     flatten_slots: False
 
+    token_mode: slots # slots (default slotcontrast) or object_centric (oat-vla)
+    pool_features: backbone # backbone (raw DINO feats) or features (projected)
+    pool: hard # soft (mask-weighted avg) or hard (argmax then avg as in oat-vla)
+
   jax:
     platform: gpu
     jit: True
@@ -227,9 +231,8 @@ dmlab:
 
 homegrid:
   task: homegrid_task
-  .*\.vec_keys: token$
-  .*\.img_keys: image
-  .*\.vec_dist: onehot
+  encoder: {mlp_keys: 'token$', cnn_keys: 'image'}
+  decoder: {mlp_keys: 'token$', cnn_keys: 'image', vector_dist: onehot}
 
 atari:
 

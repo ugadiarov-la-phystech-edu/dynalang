@@ -272,7 +272,10 @@ def make_slot_extractor(config):
       checkpoint_path=slot_config.checkpoint_path,
       image_size=image_size,
       device=slot_config.get('device', 'cuda'),
-      backbone_input_size=slot_config.get('backbone_input_size', 0)
+      backbone_input_size=slot_config.get('backbone_input_size', 0),
+      token_mode=slot_config.get('token_mode', 'slots'),
+      pool_features=slot_config.get('pool_features', 'backbone'),
+      pool=slot_config.get('pool', 'soft'),
   )
   
   return extractor

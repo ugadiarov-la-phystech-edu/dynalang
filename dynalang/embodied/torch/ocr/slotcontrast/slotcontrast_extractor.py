@@ -20,13 +20,22 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
     - Returns numpy slots (n_slots, dim) float32
     """
     
-    def __init__(self, config_path, checkpoint_path, image_size, device, backbone_input_size=0):
+    def __init__(self, config_path, checkpoint_path, image_size, device, backbone_input_size=0,
+                 token_mode='slots', pool_features='backbone', pool='soft', eps=1e-8):
         torch.nn.Module.__init__(self)
         self._device = torch.device(device)
         self._config_path = config_path
         self._checkpoint_path = checkpoint_path
         self._image_size = image_size
         self._backbone_input_size = backbone_input_size
+        assert token_mode in ('slots', 'object_centric')
+        assert pool_features in ('backbone', 'features')
+        assert pool in ('soft', 'hard')
+        self._token_mode = token_mode
+        self._pool_features = pool_features
+        self._pool = pool
+        self._eps = eps
+        self._out_dim = None
 
         config = configuration.load_config(config_path)
         self._model_config = config.model
@@ -88,12 +97,23 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
         self.requires_grad_(False)
         self.eval()
 
+        # In object-centric mode the output dim equals the pooled feature dim
+        # (e.g. 384 for raw DINO features), which differs from slot_dim. Determine
+        # it with a dummy forward so `dim` is correct before the first real call.
+        if self._token_mode == 'object_centric':
+            size = self.backbone_input_size or self._image_size
+            with torch.no_grad():
+                dummy = torch.zeros(1, 3, size, size, device=self._device)
+                self._out_dim = self._forward_torch(dummy).shape[-1]
+
     @property
     def n_slots(self):
         return self._model_config.initializer.n_slots
 
     @property
     def dim(self):
+        if self._token_mode == 'object_centric':
+            return self._out_dim
         return self._model_config.initializer.dim
 
     @property
@@ -153,7 +173,8 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
         encoder_output = self.encoder(encoder_input)
         features = encoder_output["features"]
 
-        slots_initial = previous_slots
+        # In object-centric mode we only use slot attention for its masks, so the slots are re-initialized every frame 
+        slots_initial = None if self._token_mode == 'object_centric' else previous_slots
         if slots_initial is None:
             slots_initial = self.initializer(batch_size=batch_size)
 
@@ -164,4 +185,38 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
         if self._input_type == "video":
             slots = slots[:, 0]  # (B, 1, n_slots, dim) -> (B, n_slots, dim)
 
-        return slots
+        if self._token_mode == 'slots':
+            return slots
+        masks = processor_output["corrector"]["masks"] #(B, [T,] n_slots, n_patches)
+        # Patch features to pool: raw DINO (backbone) or projected FrameEncoder feats.
+        pool_feats = (
+            encoder_output["backbone_features"]
+            if self._pool_features == "backbone"
+            else features
+        )
+        if self._input_type == "video":
+            masks = masks[:, 0]
+            pool_feats = pool_feats[:, 0]
+
+        return self._pool_tokens(masks, pool_feats)
+
+    def _pool_tokens(self, masks, features):
+        """Pool patch features into one token per object mask.
+
+        Args:
+            masks: (B, n_slots, n_patches)
+            features: (B, n_patches, dim)
+        Returns:
+            tokens: (B, n_slots, dim)
+        """
+        if self._pool == "hard":
+            # Assign each patch to its argmax object, then average pool.
+            assign = masks.argmax(dim=1)  # (B, n_patches)
+            weights = F.one_hot(assign, num_classes=masks.shape[1]).float()
+            weights = weights.permute(0, 2, 1)  # (B, n_slots, n_patches)
+        else:
+            # Soft (mask-weighted) average pooling.
+            weights = masks
+        denom = weights.sum(dim=-1, keepdim=True) + self._eps  # (B, n_slots, 1)
+        tokens = torch.einsum("bsf, bfd -> bsd", weights, features) / denom
+        return tokens
