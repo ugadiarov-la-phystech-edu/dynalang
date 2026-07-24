@@ -1002,8 +1002,12 @@ class MultiDecoder(nj.Module):
           key: self._make_image_dist(key, mean)
           for (key, shape), mean in zip(self.cnn_shapes.items(), means)})
     if self.mlp_shapes:
-      # Text was appended to every slot; average over slots for the MLP head.
-      if features.shape[-2] > 1:
+      # Decode text from the image slot (text is also appended to every slot).
+      if self.image_slot_size > 0:
+        mlp_features = features[
+            ..., n_obj_slots:n_obj_slots + n_image_slot, :].reshape(
+            features.shape[:-2] + (-1,))
+      elif features.shape[-2] > 1:
         mlp_features = features.mean(axis=-2)
       else:
         mlp_features = features.reshape(features.shape[:-2] + (-1,))
