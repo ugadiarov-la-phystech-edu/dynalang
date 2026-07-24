@@ -510,6 +510,26 @@ class WorldModel(nj.Module):
     metrics.update({f'{k}_loss_std': v.std() for k, v in losses.items()})
     metrics['model_loss_mean'] = model_loss.mean()
     metrics['model_loss_std'] = model_loss.std()
+    # Per-slot KL diagnostics for the object-centric RSSM
+    if self.config.rssm_type == 'octssm':
+      kl = self.rssm.get_dist(post).kl_divergence(
+          self.rssm.get_dist(prior))  # (B, T, num_slots)
+      per_slot = kl.mean(axis=tuple(range(kl.ndim - 1)))  # (num_slots,)
+      for i in range(per_slot.shape[0]):
+        metrics[f'kl/slot_{i}'] = per_slot[i]
+    # Per-slot reconstruction loss. MSEDist sums the slot axis into the total
+    # loss, hiding which slots reconstruct well. Recompute the squared error,
+    # sum over feature/spatial dims (matching the 'sum' aggregation), and keep
+    # the slot axis (index 2: (B, T, num_slots, ...)) before averaging over B,T.
+    for key in ('slot', 'slot_image'):
+      if key in dists and key in data:
+        mode = dists[key].mode().astype(jnp.float32)
+        target = data[key].astype(jnp.float32)
+        se = (mode - target) ** 2
+        se = se.sum(axis=tuple(range(3, se.ndim)))  # (B, T, num_slots)
+        per_slot = se.mean(axis=(0, 1))  # (num_slots,)
+        for i in range(per_slot.shape[0]):
+          metrics[f'{key}_loss/slot_{i}'] = per_slot[i]
     metrics['reward_max_data'] = jnp.abs(data['reward']).max()
     metrics['reward_max_pred'] = jnp.abs(dists['reward'].mean()).max()
     if 'reward' in dists and not self.config.jax.debug_nans:
