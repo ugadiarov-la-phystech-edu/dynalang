@@ -155,6 +155,48 @@ class MSEDist:
     return -loss
 
 
+class WeightedMSEDist:
+  """MSE where foreground pixels (nonzero target) are up-weighted.
+
+  Foreground is derived from the target: any pixel with a nonzero channel is
+  treated as object, background is the exact-zero (masked-out) region. Object
+  pixels get weight ``fg_weight``, background stays at 1.0. This prevents the
+  "predict all-black" shortcut on sparse masked slot images (e.g. the tiny
+  Pong ball), while still penalizing hallucinations in the background.
+
+  With ``fg_weight == 1.0`` this reduces exactly to ``MSEDist``.
+  """
+
+  def __init__(self, mode, dims, fg_weight=1.0, agg='sum'):
+    self._mode = mode
+    self._dims = tuple([-x for x in range(1, dims + 1)])
+    self._fg_weight = fg_weight
+    self._agg = agg
+    self.batch_shape = mode.shape[:len(mode.shape) - dims]
+    self.event_shape = mode.shape[len(mode.shape) - dims:]
+
+  def mode(self):
+    return self._mode
+
+  def mean(self):
+    return self._mode
+
+  def log_prob(self, value):
+    assert self._mode.shape == value.shape, (self._mode.shape, value.shape)
+    distance = ((self._mode - value) ** 2)
+    # Foreground: any nonzero channel in the target (last axis is channels).
+    fg = (jnp.abs(value) > 0).any(-1, keepdims=True)
+    weight = 1.0 + (self._fg_weight - 1.0) * fg.astype(distance.dtype)
+    distance = distance * weight
+    if self._agg == 'mean':
+      loss = distance.mean(self._dims)
+    elif self._agg == 'sum':
+      loss = distance.sum(self._dims)
+    else:
+      raise NotImplementedError(self._agg)
+    return -loss
+
+
 class SymlogDist:
 
   def __init__(self, mode, dims, dist='mse', agg='sum', tol=1e-8):
