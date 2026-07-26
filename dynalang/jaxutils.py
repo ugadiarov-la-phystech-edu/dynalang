@@ -156,22 +156,41 @@ class MSEDist:
 
 
 class WeightedMSEDist:
-  """MSE where foreground pixels (nonzero target) are up-weighted.
+  """MSE tailored to sparse masked slot images with two selectable modes.
 
   Foreground is derived from the target: any pixel with a nonzero channel is
-  treated as object, background is the exact-zero (masked-out) region. Object
-  pixels get weight ``fg_weight``, background stays at 1.0. This prevents the
-  "predict all-black" shortcut on sparse masked slot images (e.g. the tiny
-  Pong ball), while still penalizing hallucinations in the background.
+  treated as object, the exact-zero (masked-out) region is background.
 
-  With ``fg_weight == 1.0`` this reduces exactly to ``MSEDist``.
+  Mode A -- foreground up-weighting (``bg_weight is None``):
+    Object pixels get weight ``fg_weight``, background stays at 1.0, then the
+    event dims are reduced by ``agg`` (sum/mean). This fixes the
+    foreground-vs-background balance *within* a slot but, with ``sum``, dense
+    slots still dominate sparse ones across the slot axis. ``fg_weight == 1.0``
+    reduces exactly to ``MSEDist``.
+
+  Mode B -- per-slot foreground normalization (``bg_weight`` set):
+    Each slot's loss is the *mean* squared error over its object pixels plus a
+    small anchor on the background::
+
+        L_slot = mean_fg(err**2) + bg_weight * mean_bg(err**2)
+
+    Normalizing by the per-slot foreground pixel count makes a 1-pixel ball and
+    a 500-pixel scene contribute comparably, removing the density imbalance
+    that ``sum`` aggregation creates across slots. ``norm_dims`` is the number
+    of trailing image dims (H, W, C) to normalize over per slot; any remaining
+    event dims (e.g. the slot axis) are summed afterwards to keep the same
+    (B, T) loss shape as ``MSEDist``.
   """
 
-  def __init__(self, mode, dims, fg_weight=1.0, agg='sum'):
+  def __init__(self, mode, dims, fg_weight=1.0, agg='sum', bg_weight=None,
+               norm_dims=3, eps=1e-3):
     self._mode = mode
     self._dims = tuple([-x for x in range(1, dims + 1)])
     self._fg_weight = fg_weight
     self._agg = agg
+    self._bg_weight = bg_weight
+    self._norm_dims = norm_dims
+    self._eps = eps
     self.batch_shape = mode.shape[:len(mode.shape) - dims]
     self.event_shape = mode.shape[len(mode.shape) - dims:]
 
@@ -185,8 +204,21 @@ class WeightedMSEDist:
     assert self._mode.shape == value.shape, (self._mode.shape, value.shape)
     distance = ((self._mode - value) ** 2)
     # Foreground: any nonzero channel in the target (last axis is channels).
-    fg = (jnp.abs(value) > 0).any(-1, keepdims=True)
-    weight = 1.0 + (self._fg_weight - 1.0) * fg.astype(distance.dtype)
+    fg = (jnp.abs(value) > 0).any(-1, keepdims=True).astype(distance.dtype)
+    if self._bg_weight is not None:
+      # Per-slot foreground normalization. Reduce only the trailing image dims
+      # (H, W, C) so each slot is normalized independently, then sum whatever
+      # event dims are left (the slot axis) to match MSEDist's (B, T) output.
+      img_ax = tuple([-x for x in range(1, self._norm_dims + 1)])
+      bg = 1.0 - fg
+      fg_err = (distance * fg).sum(img_ax) / (fg.sum(img_ax) + self._eps)
+      bg_err = (distance * bg).sum(img_ax) / (bg.sum(img_ax) + self._eps)
+      loss = fg_err + self._bg_weight * bg_err
+      leftover = len(self._dims) - self._norm_dims
+      if leftover > 0:
+        loss = loss.sum(tuple(range(-leftover, 0)))
+      return -loss
+    weight = 1.0 + (self._fg_weight - 1.0) * fg
     distance = distance * weight
     if self._agg == 'mean':
       loss = distance.mean(self._dims)

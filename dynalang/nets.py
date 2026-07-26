@@ -901,7 +901,8 @@ class MultiDecoder(nj.Module):
       self, shapes, inputs=['tensor'], cnn_keys=r'.*', mlp_keys=r'.*',
       mlp_layers=4, mlp_units=512, cnn='resize', cnn_depth=48, cnn_blocks=2,
       image_dist='mse', vector_dist='mse', resize='stride', bins=255,
-      outscale=1.0, minres=4, cnn_sigmoid=False, slot_fg_weight=1.0, **kw):
+      outscale=1.0, minres=4, cnn_sigmoid=False, slot_fg_weight=1.0,
+      slot_bg_weight=-1.0, **kw):
     excluded = ('is_first', 'is_last', 'is_terminal', 'reward')
     shapes = {k: v for k, v in shapes.items() if k not in excluded}
     self.slot_shapes = {k: v for k, v in shapes.items() if k == 'slot'}
@@ -952,6 +953,7 @@ class MultiDecoder(nj.Module):
     self._inputs = Input(inputs, dims='deter')
     self._image_dist = image_dist
     self._slot_fg_weight = slot_fg_weight
+    self._slot_bg_weight = slot_bg_weight
     self.slot_based = bool(self.slot_shapes or self.slot_image_shapes)
     self.n_object_slots = (
         (self.slot_image_shapes['slot_image'][0] if self.slot_image_shapes else 0)
@@ -968,7 +970,12 @@ class MultiDecoder(nj.Module):
       flat = obj_features.reshape([-1, obj_features.shape[-1]])
       output = self._slot_cnn(flat)
       output = output.reshape(obj_features.shape[:-1] + output.shape[1:])
-      if self._slot_fg_weight != 1.0:
+      if self._slot_bg_weight >= 0.0:
+        # Per-slot foreground-normalized loss (density-balanced across slots).
+        dists['slot_image'] = jaxutils.WeightedMSEDist(
+            output.astype(f32), 4, agg='sum',
+            bg_weight=self._slot_bg_weight, norm_dims=3)
+      elif self._slot_fg_weight != 1.0:
         dists['slot_image'] = jaxutils.WeightedMSEDist(
             output.astype(f32), 4, self._slot_fg_weight, 'sum')
       else:
