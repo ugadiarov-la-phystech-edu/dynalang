@@ -10,9 +10,16 @@ Ported modules (parity source of truth in parentheses):
   - two_layer_mlp projection  (modules/networks.py via encoders.FrameEncoder)
   - SlotAttention corrector   (modules/groupers.py)
 
-Deliberately skipped (never affect extracted slots): the transformer
-predictor (its output is discarded for T=1), decoders, dynamics, and the
-`vit_block_keys12` feature.
+Also ported (use_predictor=True — video-model semantics):
+  - TransformerEncoder predictor  (modules/networks.py TransformerEncoder /
+                                   TransformerEncoderLayer / Attention)
+    transports slots_t -> the slot-attention init at t+1, exactly the
+    LatentProcessor + ScanOverTime recurrence the video checkpoints were
+    trained with (state_predicted carried, corrector output emitted).
+
+Deliberately skipped (never affect extracted slots): decoders, dynamics,
+and the `vit_block_keys12` feature. With use_predictor=False the predictor
+is skipped too and the extractor-style recurrence below applies.
 
 Parity-critical conventions:
   - LayerNorm eps differs per layer group: 1e-6 (timm ViT), 1e-5 (torch
@@ -179,12 +186,13 @@ class SlotAttention(nj.Module):
     self._n_iters = n_iters
     self._eps = eps
 
-  def __call__(self, slots, features):
+  def __call__(self, slots, features, n_iters=None):
+    n_iters = self._n_iters if n_iters is None else n_iters
     scale = self._dim ** -0.5
     features = self.get('norm_features', LayerNorm, 1e-5)(features)
     keys = self.get('to_k', PLinear, self._dim, bias=False)(features)
     values = self.get('to_v', PLinear, self._dim, bias=False)(features)
-    for _ in range(self._n_iters):
+    for _ in range(n_iters):
       # NOTE: torch groupers.SlotAttention.step() reassigns
       # `slots = norm_slots(slots)` before to_q, so the GRU hidden state is
       # the NORMED slots, not the raw ones.
@@ -206,6 +214,73 @@ class SlotAttention(nj.Module):
       x = jax.nn.relu(x)
       x = self.get('mlp_fc2', PLinear, self._dim)(x)
       slots = slots + x
+    return slots
+
+
+class PredictorAttention(nj.Module):
+  """SlotContrast networks.Attention (fused qkv, rows [q;k;v]) as used by the
+  video predictor. Parity-critical quirk: the reference divides q by
+  `self.scale` (= head_dim**-0.5) in networks.py:516, so the attention logits
+  are MULTIPLIED by sqrt(head_dim) — not divided as in standard attention.
+  The checkpoints were trained this way; replicate it exactly."""
+
+  def __init__(self, dim, heads):
+    assert dim % heads == 0, (dim, heads)
+    self._dim = dim
+    self._heads = heads
+
+  def __call__(self, x):
+    batch, length, dim = x.shape
+    heads = self._heads
+    head_dim = dim // heads
+    qkv = self.get('qkv', PLinear, 3 * dim)(x)
+    qkv = qkv.reshape(batch, length, 3, heads, head_dim)
+    q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+    q = q * (head_dim ** 0.5)  # sic — see class docstring
+    attn = jnp.einsum('bnhd,bmhd->bhnm', q, k)
+    attn = jax.nn.softmax(attn.astype(f32), axis=-1).astype(attn.dtype)
+    out = jnp.einsum('bhnm,bmhd->bnhd', attn, v)
+    out = out.reshape(batch, length, dim)
+    return self.get('out_proj', PLinear, dim)(out)
+
+
+class PredictorBlock(nj.Module):
+  """SlotContrast networks.TransformerEncoderLayer with norm_first=True:
+  pre-norm self-attention + pre-norm ReLU MLP (hidden = 4*dim by default),
+  LayerNorm eps 1e-5, no LayerScale (initial_residual_scale=None), dropout 0
+  (inference)."""
+
+  def __init__(self, dim, heads, hidden=None):
+    self._dim = dim
+    self._heads = heads
+    self._hidden = 4 * dim if hidden is None else hidden
+
+  def __call__(self, x):
+    y = self.get('norm1', LayerNorm, 1e-5)(x)
+    y = self.get('attn', PredictorAttention, self._dim, self._heads)(y)
+    x = x + y
+    y = self.get('norm2', LayerNorm, 1e-5)(x)
+    y = self.get('linear1', PLinear, self._hidden)(y)
+    y = jax.nn.relu(y)
+    y = self.get('linear2', PLinear, self._dim)(y)
+    return x + y
+
+
+class TransformerPredictor(nj.Module):
+  """SlotContrast networks.TransformerEncoder — the video-model predictor
+  that transports slots_t into the slot-attention initialization for t+1."""
+
+  def __init__(self, dim, n_blocks=1, heads=4, hidden=None):
+    self._dim = dim
+    self._n_blocks = n_blocks
+    self._heads = heads
+    self._hidden = hidden
+
+  def __call__(self, slots):
+    for i in range(self._n_blocks):
+      slots = self.get(
+          f'block{i}', PredictorBlock,
+          self._dim, self._heads, self._hidden)(slots)
     return slots
 
 
@@ -457,13 +532,16 @@ class SlotContrastEncoder(nj.Module):
   __call__ modes:
     single step: images (B, H, W, C), is_first (B,)   -> slots (B, S, D)
     sequence:    images (B, T, H, W, C), is_first (B, T) -> slots (B, T, S, D)
-  Returns (slots, carry) where carry is the last timestep's slots (float32),
-  to be fed back as `carry` on the next call (policy path).
+  Returns (slots, carry) where carry is the recurrent state to feed back on
+  the next call (policy path), float32: the last timestep's slots in legacy
+  mode, predictor(slots) (state_predicted) with use_predictor=True.
   Images are floats in [0, 1] (after Agent.preprocess's /255)."""
 
   def __init__(self, variant='dino_v1_s8', input_size=224, n_slots=8,
                slot_dim=64, depth=12, dim=384, heads=6, hidden_mult=2,
-               force_f32=True, remat=True, chunk=0, sg_backbone=False):
+               force_f32=True, remat=True, chunk=0, sg_backbone=False,
+               use_predictor=False, predictor_blocks=1, predictor_heads=4,
+               sa_iters=2, sa_first_iters=3):
     spec = VARIANTS[variant]
     self._variant = variant
     self._sg_backbone = sg_backbone
@@ -477,6 +555,18 @@ class SlotContrastEncoder(nj.Module):
     self._force_f32 = force_f32
     self._remat = remat
     self._chunk = chunk
+    # Video-model recurrence (use_predictor=True): the LatentProcessor +
+    # ScanOverTime semantics the video checkpoints were trained with — the
+    # corrector runs sa_first_iters at episode starts (first_step_corrector_
+    # args) and sa_iters elsewhere, and the carry is predictor(slots), i.e.
+    # state_predicted. With use_predictor=False the legacy extractor
+    # semantics apply (initialize_twice, 3 iterations everywhere,
+    # carry=slots), keeping existing configs and pickles bit-identical.
+    self._use_predictor = use_predictor
+    self._predictor_blocks = predictor_blocks
+    self._predictor_heads = predictor_heads
+    self._sa_iters = sa_iters
+    self._sa_first_iters = sa_first_iters
     self._patch = spec['patch']
     self._native_grid = spec['native_grid']
     self._layerscale = spec['layerscale']
@@ -553,16 +643,35 @@ class SlotContrastEncoder(nj.Module):
         'corrector', SlotAttention,
         self._slot_dim, 4 * self._slot_dim, n_iters=3)
 
+  def _predictor(self):
+    return self.get(
+        'predictor', TransformerPredictor,
+        self._slot_dim, self._predictor_blocks, self._predictor_heads)
+
   def step(self, prev_slots, feats, is_first):
     """One recurrent step. feats (B, P, D), prev_slots (B, S, D), is_first (B,).
-    Episode start: SA3(SA3(learned_init)) (initialize_twice); else SA3(prev).
-    The SA passes are cheap next to the ViT, so both branches are always
-    computed and selected with a where()."""
+    Returns (slots, carry) — the emitted slots and the state to feed back at
+    the next step. The SA/predictor passes are cheap next to the ViT, so both
+    branches are always computed and selected with a where().
+
+    use_predictor=True (video-model semantics, LatentProcessor+ScanOverTime):
+      episode start: SA(learned_init, sa_first_iters); else SA(prev, sa_iters)
+      where prev is the carried state_predicted; carry = predictor(slots).
+    use_predictor=False (legacy extractor semantics):
+      episode start: SA3(SA3(learned_init)) (initialize_twice); else SA3(prev);
+      carry = slots."""
     corrector = self._corrector()
     init = self._learned_init(feats.shape[0], feats.dtype)
+    prev = prev_slots.astype(feats.dtype)
+    if self._use_predictor:
+      first = corrector(init, feats, n_iters=self._sa_first_iters)
+      cont = corrector(prev, feats, n_iters=self._sa_iters)
+      slots = switch(is_first, first, cont)
+      return slots, self._predictor()(slots)
     first = corrector(corrector(init, feats), feats)
-    cont = corrector(prev_slots.astype(feats.dtype), feats)
-    return switch(is_first, first, cont)
+    cont = corrector(prev, feats)
+    slots = switch(is_first, first, cont)
+    return slots, slots
 
   def __call__(self, images, is_first, carry=None, return_features=False):
     """With return_features additionally returns the raw backbone features
@@ -572,10 +681,10 @@ class SlotContrastEncoder(nj.Module):
       feats, raw = feats
       if carry is None:
         carry = self.initial(images.shape[0])
-      slots = self.step(carry, feats, is_first)
+      slots, carry = self.step(carry, feats, is_first)
       if return_features:
-        return slots, slots.astype(f32), raw
-      return slots, slots.astype(f32)
+        return slots, carry.astype(f32), raw
+      return slots, carry.astype(f32)
     assert len(images.shape) == 5, images.shape
     batch, length = images.shape[:2]
     flat = images.reshape((batch * length,) + images.shape[2:])
@@ -587,8 +696,8 @@ class SlotContrastEncoder(nj.Module):
     # Scan over time like RSSM.observe: (B, T, ...) -> (T, B, ...).
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
     def scan_step(prev, inputs):
-      slots = self.step(prev, *inputs)
-      return slots, slots
+      slots, next_carry = self.step(prev, *inputs)
+      return next_carry, slots
     carry, slots = nj.scan(
         scan_step, carry, (swap(feats), swap(is_first)))
     slots = swap(slots)  # (B, T, S, D)

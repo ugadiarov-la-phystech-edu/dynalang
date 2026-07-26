@@ -19,12 +19,16 @@ Checkpoint key namespace (SlotContrast lightning ckpt, `input_type: video`):
   encoder.module.backbone.model.*        (timm ViT)
   encoder.module.output_transform.layers.{0,1,3}.*
   processor.module.corrector.*
+  processor.module.predictor.blocks.N.*  (TransformerEncoder, optional —
+                                          converted when predictor_blocks
+                                          is passed to convert_all)
   decoder.module.{pos_emb, mlp.layers.{0,2,...}}   (MLPDecoder, optional)
 Skipped on purpose (never affect extracted slots):
-  processor.module.predictor.*, encoder.module.backbone.model.norm.*,
-  image_decoder.*, dynamics_predictor.*, and the target/teacher
-  copies some checkpoints carry. decoder.* is skipped unless a
-  decoder_prefix is passed to convert_all (featrec fine-tuning).
+  encoder.module.backbone.model.norm.*, image_decoder.*,
+  dynamics_predictor.*, and the target/teacher copies some checkpoints
+  carry. decoder.* is skipped unless a decoder_prefix is passed to
+  convert_all (featrec fine-tuning); processor.module.predictor.* is
+  skipped unless predictor_blocks is passed (use_predictor mode).
 For `input_type: image` checkpoints the `.module` segment is absent; keys are
 normalized with _strip_module() before mapping.
 """
@@ -121,6 +125,24 @@ def convert_slot_attention(sd, tkey, jkey):
   return out
 
 
+def convert_predictor(sd, tkey, jkey, n_blocks=1):
+  """networks.TransformerEncoder (the video predictor) ->
+  slot_nets.TransformerPredictor. Per block: norm1/norm2 (nn.LayerNorm),
+  self_attn.{qkv,out_proj} (fused custom Attention), linear1/linear2 (the
+  nn.TransformerEncoderLayer feedforward)."""
+  out = {}
+  for i in range(n_blocks):
+    tb, jb = _join(tkey, f'blocks.{i}'), f'{jkey}/block{i}'
+    out.update(convert_layernorm(sd, f'{tb}.norm1', f'{jb}/norm1'))
+    out.update(convert_layernorm(sd, f'{tb}.norm2', f'{jb}/norm2'))
+    out.update(convert_linear(sd, f'{tb}.self_attn.qkv', f'{jb}/attn/qkv'))
+    out.update(convert_linear(
+        sd, f'{tb}.self_attn.out_proj', f'{jb}/attn/out_proj'))
+    out.update(convert_linear(sd, f'{tb}.linear1', f'{jb}/linear1'))
+    out.update(convert_linear(sd, f'{tb}.linear2', f'{jb}/linear2'))
+  return out
+
+
 def convert_vit_block(sd, tkey, jkey, layerscale):
   """timm Block -> slot_nets.ViTBlock."""
   out = {}
@@ -154,11 +176,12 @@ def convert_vit(sd, tkey, jkey, depth=12, layerscale=False, feature_block=None):
 
 
 def convert_all(state_dict, variant, prefix, depth=12,
-                decoder_prefix=None, decoder_hidden=3):
+                decoder_prefix=None, decoder_hidden=3, predictor_blocks=None):
   """Full SlotContrast checkpoint -> flat ninjax dict under `prefix`
   (e.g. 'agent/wm/enc/slotcontrast'). `variant` in slot_nets.VARIANTS.
   With decoder_prefix (e.g. 'agent/wm/dec/featdec') the MLPDecoder weights
-  are converted too, for the featrec fine-tuning head."""
+  are converted too, for the featrec fine-tuning head. With predictor_blocks
+  the video predictor transformer is converted (use_predictor mode)."""
   from . import slot_nets
   layerscale = slot_nets.VARIANTS[variant]['layerscale']
   sd = {_strip_module(k): np.asarray(v) for k, v in state_dict.items()}
@@ -170,13 +193,18 @@ def convert_all(state_dict, variant, prefix, depth=12,
       sd, 'encoder.output_transform', f'{prefix}/proj'))
   out.update(convert_slot_attention(
       sd, 'processor.corrector', f'{prefix}/corrector'))
+  if predictor_blocks:
+    out.update(convert_predictor(
+        sd, 'processor.predictor', f'{prefix}/predictor',
+        n_blocks=predictor_blocks))
   if decoder_prefix:
     out.update(convert_mlp_decoder(
         sd, 'decoder', decoder_prefix, n_hidden=decoder_hidden))
   return out
 
 
-def unconsumed_keys(state_dict, variant, depth=12, decoder_hidden=None):
+def unconsumed_keys(state_dict, variant, depth=12, decoder_hidden=None,
+                    predictor_blocks=None):
   """Torch keys neither mapped by convert_all nor on the known skip-list.
   Non-empty result means the checkpoint has structure we don't understand —
   the converter should fail loudly rather than silently drop weights."""
@@ -208,6 +236,12 @@ def unconsumed_keys(state_dict, variant, depth=12, decoder_hidden=None):
     consumed.add(f'{corr}.gru.{name}')
   for layer in ('layers.0', 'layers.1', 'layers.3'):
     consumed.update({f'{corr}.mlp.{layer}.weight', f'{corr}.mlp.{layer}.bias'})
+  if predictor_blocks:
+    for i in range(predictor_blocks):
+      b = f'processor.predictor.blocks.{i}'
+      for name in ('norm1', 'norm2', 'self_attn.qkv', 'self_attn.out_proj',
+                   'linear1', 'linear2'):
+        consumed.update({f'{b}.{name}.weight', f'{b}.{name}.bias'})
   if decoder_hidden is not None:
     consumed.add('decoder.pos_emb')
     for i in range(decoder_hidden + 1):
@@ -217,6 +251,12 @@ def unconsumed_keys(state_dict, variant, depth=12, decoder_hidden=None):
   for key in state_dict:
     norm = _strip_module(key)
     if norm in consumed:
+      continue
+    if predictor_blocks and norm.startswith('processor.predictor.'):
+      # Converting the predictor: unexpected predictor structure (e.g. more
+      # blocks than predictor_blocks) must fail loudly, not fall through to
+      # the skip-list.
+      leftover.append(key)
       continue
     if SKIP_PATTERN.search(norm):
       continue
@@ -234,7 +274,7 @@ def decoder_expected_keys(decoder_prefix, n_hidden=3):
   return keys
 
 
-def expected_keys(variant, prefix, depth=12):
+def expected_keys(variant, prefix, depth=12, predictor_blocks=None):
   """The exact ninjax key set convert_all produces (== the key set
   slot_nets.SlotContrastEncoder creates at init). Used by the converter CLI
   and the jaxagent load hook to assert full coverage."""
@@ -265,6 +305,13 @@ def expected_keys(variant, prefix, depth=12):
                f'{corr}/gru/b_ih', f'{corr}/gru/b_hh'})
   for name in ('mlp_fc1', 'mlp_fc2'):
     keys.update({f'{corr}/{name}/kernel', f'{corr}/{name}/bias'})
+  if predictor_blocks:
+    for i in range(predictor_blocks):
+      b = f'{prefix}/predictor/block{i}'
+      for name in ('norm1', 'norm2'):
+        keys.update({f'{b}/{name}/scale', f'{b}/{name}/bias'})
+      for name in ('attn/qkv', 'attn/out_proj', 'linear1', 'linear2'):
+        keys.update({f'{b}/{name}/kernel', f'{b}/{name}/bias'})
   return keys
 
 
@@ -284,13 +331,17 @@ def fresh_state_dict(config, seed=0):
   from embodied.torch.ocr.slotcontrast import modules
   torch.manual_seed(seed)
   mc = config.model
+  predictor = None
+  if mc.get('predictor') is not None:
+    predictor = modules.build_module(mc.predictor)
   parts = [
       ('initializer', modules.build_initializer(mc.initializer)),
       ('encoder', modules.MapOverTime(
           modules.build_encoder(mc.encoder, 'FrameEncoder'))),
       ('processor', modules.ScanOverTime(modules.build_video(
           mc.latent_processor, 'LatentProcessor',
-          corrector=modules.build_grouper(mc.grouper), predictor=None))),
+          corrector=modules.build_grouper(mc.grouper),
+          predictor=predictor))),
   ]
   if mc.get('decoder') is not None:
     parts.append(('decoder', modules.MapOverTime(

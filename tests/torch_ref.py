@@ -27,10 +27,13 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 
 class TorchSlotContrast:
   """initializer + encoder + corrector from a SlotContrast config yaml,
-  randomly initialized (pretrained=False), eval mode. The predictor is
-  omitted: its output never reaches the extracted slots."""
+  randomly initialized (pretrained=False), eval mode. With
+  use_predictor=False the predictor is omitted (extractor semantics: its
+  output never reaches the extracted slots); with use_predictor=True the
+  config's transformer predictor is built into the LatentProcessor (video
+  semantics, see video_style_rollout)."""
 
-  def __init__(self, variant, seed=0):
+  def __init__(self, variant, seed=0, use_predictor=False):
     from embodied.torch.ocr.slotcontrast import configuration, modules
     torch.manual_seed(seed)
     config = configuration.load_config(str(CONFIGS[variant]))
@@ -40,15 +43,32 @@ class TorchSlotContrast:
     self.initializer = modules.build_initializer(model_config.initializer)
     encoder = modules.build_encoder(model_config.encoder, 'FrameEncoder')
     grouper = modules.build_grouper(model_config.grouper)
+    predictor = None
+    if use_predictor:
+      predictor = modules.build_module(model_config.predictor)
     self.encoder = modules.MapOverTime(encoder)
-    self.processor = modules.ScanOverTime(modules.build_video(
+    self.latent_processor = modules.build_video(
         model_config.latent_processor, 'LatentProcessor',
-        corrector=grouper, predictor=None))
+        corrector=grouper, predictor=predictor)
+    self.processor = modules.ScanOverTime(self.latent_processor)
     self.normalization = torchvision.transforms.Normalize(
         mean=IMAGENET_MEAN, std=IMAGENET_STD)
     for module in (self.initializer, self.encoder, self.processor):
       module.eval()
       module.requires_grad_(False)
+
+  def frame_features(self, images):
+    """uint8 (B, H, W, C) -> projected features (B, P, D), the corrector
+    input (same preprocessing as __call__)."""
+    x = torch.as_tensor(
+        images.transpose(0, 3, 1, 2), dtype=torch.float32) / 255.0
+    if x.shape[-1] != self.input_size:
+      x = F.interpolate(
+          x, size=(self.input_size, self.input_size),
+          mode='bilinear', align_corners=False)
+    x = self.normalization(x)
+    with torch.no_grad():
+      return self.encoder(x.unsqueeze(1))['features'][:, 0]
 
   def state_dict_numpy(self):
     """Combined state dict with the checkpoint's key namespace
@@ -82,6 +102,32 @@ class TorchSlotContrast:
         slots = torch.as_tensor(previous_slots, dtype=torch.float32)
       out = self.processor(slots, features)
     return out['state'][:, 0].numpy()
+
+
+def video_style_rollout(model, images, is_first):
+  """LatentProcessor + ScanOverTime video semantics over a (B, T, H, W, C)
+  uint8 sequence, with per-element episode resets: elements with is_first
+  run the first-step corrector path (first_step_corrector_args, time_step=0)
+  from the learned init; the rest run the default corrector (time_step>0)
+  from the carried state_predicted. Returns (slots (B, T, S, D), final carry
+  (B, S, D)). The model must be built with use_predictor=True."""
+  assert model.latent_processor.predictor is not None
+  batch, length = images.shape[:2]
+  outputs = []
+  with torch.no_grad():
+    init = model.initializer(batch_size=batch)
+    prev = torch.zeros_like(init)  # mirrors the JAX zeros carry
+    for t in range(length):
+      feats = model.frame_features(images[:, t])
+      first = torch.as_tensor(
+          np.asarray(is_first[:, t], bool))[:, None, None]
+      out_first = model.latent_processor(init, feats, 0)
+      out_cont = model.latent_processor(prev, feats, 1)
+      slots = torch.where(first, out_first['state'], out_cont['state'])
+      prev = torch.where(
+          first, out_first['state_predicted'], out_cont['state_predicted'])
+      outputs.append(slots.numpy().copy())
+  return np.stack(outputs, axis=1), prev.numpy()
 
 
 def env_style_rollout(model, images, is_first, initialize_twice=True):

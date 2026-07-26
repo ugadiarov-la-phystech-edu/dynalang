@@ -22,7 +22,7 @@ shift
 # Trained SlotContrast checkpoint + its settings yaml.
 sc_config=${SC_CONFIG:-/home/ugadiarov/slotcontrast_ckpt/homegrid/homegrid_7slots_150k.yaml}
 sc_ckpt=${SC_CKPT:-/home/ugadiarov/slotcontrast_ckpt/homegrid/homegrid_7slots_150k.ckpt}
-pkl=checkpoints/slotcontrast_homegrid7_150k_jax.pkl
+pkl=checkpoints/slotcontrast_homegrid7_150k_pred_jax.pkl
 
 export COMET_API_KEY=g4L2fxT5u66seUlbZYZrsQPce
 export COMET_PROJECT_NAME=homegrid

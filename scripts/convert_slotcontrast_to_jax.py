@@ -49,6 +49,9 @@ def main():
                       help='ninjax prefix for the MLPDecoder (featrec head)')
   parser.add_argument('--no-decoder', action='store_true',
                       help='skip the MLPDecoder weights (old behavior)')
+  parser.add_argument('--no-predictor', action='store_true',
+                      help='skip the video predictor transformer weights '
+                           '(old behavior; use_predictor=False configs)')
   args = parser.parse_args()
   assert bool(args.checkpoint) != args.fresh, (
       'pass exactly one of --checkpoint or --fresh')
@@ -85,9 +88,18 @@ def main():
     assert str(decoder_cfg.name) == 'MLPDecoder', decoder_cfg.name
     decoder_hidden = len(decoder_cfg.hidden_dims)
 
+  predictor_cfg = OmegaConf.select(config, 'model.predictor')
+  with_predictor = not args.no_predictor and predictor_cfg is not None
+  predictor_blocks = None
+  if with_predictor:
+    assert str(predictor_cfg.name).endswith('TransformerEncoder'), (
+        predictor_cfg.name)
+    predictor_blocks = int(predictor_cfg.n_blocks)
+
   leftover = slot_convert.unconsumed_keys(
       state_dict, variant,
-      decoder_hidden=decoder_hidden if with_decoder else None)
+      decoder_hidden=decoder_hidden if with_decoder else None,
+      predictor_blocks=predictor_blocks)
   assert not leftover, (
       'Checkpoint keys neither mapped nor on the known skip-list '
       f'(unknown structure, refusing to convert): {leftover}')
@@ -95,8 +107,10 @@ def main():
   converted = slot_convert.convert_all(
       state_dict, variant, args.prefix,
       decoder_prefix=args.decoder_prefix if with_decoder else None,
-      decoder_hidden=decoder_hidden)
-  expected = slot_convert.expected_keys(variant, args.prefix)
+      decoder_hidden=decoder_hidden,
+      predictor_blocks=predictor_blocks)
+  expected = slot_convert.expected_keys(
+      variant, args.prefix, predictor_blocks=predictor_blocks)
   if with_decoder:
     expected |= slot_convert.decoder_expected_keys(
         args.decoder_prefix, decoder_hidden)
@@ -110,6 +124,8 @@ def main():
     pickle.dump(converted, f)
   total = sum(int(np.prod(v.shape)) for v in converted.values())
   print(f'variant: {variant}')
+  print(f'predictor: {predictor_blocks or 0} block(s), '
+        f'decoder: {"yes" if with_decoder else "no"}')
   print(f'wrote {len(converted)} arrays ({total / 1e6:.2f}M params) '
         f'under prefix {args.prefix!r} to {args.output}')
 

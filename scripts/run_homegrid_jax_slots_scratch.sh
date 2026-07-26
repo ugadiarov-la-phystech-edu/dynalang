@@ -21,7 +21,7 @@ shift
 
 # Reference SlotContrast settings yaml (architecture only, no weights used).
 sc_config=${SC_CONFIG:-/home/ugadiarov/slotcontrast_ckpt/homegrid/homegrid_7slots_150k.yaml}
-fresh_pkl=checkpoints/slotcontrast_fresh_homegrid7_seed${seed}_jax.pkl
+fresh_pkl=checkpoints/slotcontrast_fresh_homegrid7_seed${seed}_pred_jax.pkl
 
 export COMET_API_KEY=g4L2fxT5u66seUlbZYZrsQPce
 export COMET_PROJECT_NAME=homegrid
