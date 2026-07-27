@@ -91,39 +91,44 @@ class BatchSlotExtractorEnv(BatchEnv):
     if self._use_previous_slots:
       is_first = obs['is_first']
       slots = np.zeros_like(self._previous_slots)
+      # This is what should be threaded through as `previous_slots` on the
+      # next step to correctly use the trained transition model.
+      carry = np.zeros_like(self._previous_slots)
       
       if is_first.any():
         first_images = images[is_first]
-        first_slots = self._slot_extractor.get_slots(
+        first_slots, first_carry = self._slot_extractor.get_slots(
             first_images,
             previous_slots=None,
-            to_numpy=True
+            to_numpy=True,
         )
         slots[is_first] = first_slots
+        carry[is_first] = first_carry
         
         if self._initialize_twice:
-          self._previous_slots[is_first] = first_slots
-          second_slots = self._slot_extractor.get_slots(
+          second_slots, second_carry = self._slot_extractor.get_slots(
               first_images,
-              previous_slots=first_slots,
-              to_numpy=True
+              previous_slots=first_carry,
+              to_numpy=True,
           )
           slots[is_first] = second_slots
+          carry[is_first] = second_carry
       
       if not is_first.all():
         continuing_images = images[~is_first]
-        continuing_prev_slots = self._previous_slots[~is_first]
-        continuing_slots = self._slot_extractor.get_slots(
+        continuing_prev_carry = self._previous_slots[~is_first]
+        continuing_slots, continuing_carry = self._slot_extractor.get_slots(
             continuing_images,
-            previous_slots=continuing_prev_slots,
-            to_numpy=True
+            previous_slots=continuing_prev_carry,
+            to_numpy=True,
         )
         slots[~is_first] = continuing_slots
+        carry[~is_first] = continuing_carry
       
-      self._previous_slots = slots.copy()
+      self._previous_slots = carry.copy()
     
     else:
-      slots = self._slot_extractor.get_slots(
+      slots, _ = self._slot_extractor.get_slots(
           images,
           previous_slots=None,
           to_numpy=True

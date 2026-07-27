@@ -106,10 +106,16 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
         
         Args:
             images: numpy array (B, H, W, C) uint8 [0, 255]
-            previous_slots: numpy array (B, n_slots, dim) or None
+            previous_slots: numpy array (B, n_slots, dim) or None. This is
+                the recurrent carry state (the predictor's output from the
+                previous call)
         
         Returns:
-            slots: numpy array (B, n_slots, dim) float32
+            slots: numpy array (B, n_slots, dim) float32 (post-correction
+                state, suitable as an observation)
+            predicted: numpy array (B, n_slots, dim) float32 (predictor
+                output, the correct value to pass back in as
+                `previous_slots` on the next call)
         """
         # Convert numpy to torch
         batch_images = torch.as_tensor(
@@ -135,10 +141,10 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
             )
         
         # Forward pass
-        slots = self._forward_torch(batch_images, previous_slots)
+        slots, predicted = self._forward_torch(batch_images, previous_slots)
         
         # Convert to numpy
-        return slots.detach().cpu().numpy()
+        return slots.detach().cpu().numpy(), predicted.detach().cpu().numpy()
 
     def _forward_torch(self, image, previous_slots=None):
         """Internal forward pass with torch tensors."""
@@ -157,11 +163,19 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
         if slots_initial is None:
             slots_initial = self.initializer(batch_size=batch_size)
 
-        processor_output = self.processor(slots_initial, features)
-        slots = processor_output["state"]
-
-        # Remove the fake time dimension
         if self._input_type == "video":
-            slots = slots[:, 0]  # (B, 1, n_slots, dim) -> (B, n_slots, dim)
+            # We always feed one frame at a time (T=1), so ScanOverTime's own
+            # internal step counter would always start at 0 and incorrectly
+            # trigger `first_step_corrector_args` on every single call, not
+            # just on genuine first frames of an episode. Call the wrapped
+            # LatentProcessor directly with the *true* time step instead:
+            # 0 only when there is no recurrent state to warm-start from
+            # (i.e. a real first frame), non-zero for continuing frames.
+            time_step = 0 if previous_slots is None else 1
+            processor_output = self.processor.module(slots_initial, features[:, 0], time_step)
+        else:
+            processor_output = self.processor(slots_initial, features)
+        slots = processor_output["state"]
+        predicted = processor_output["state_predicted"]
 
-        return slots
+        return slots, predicted
