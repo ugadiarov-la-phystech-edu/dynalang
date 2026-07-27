@@ -522,20 +522,13 @@ def patch_timm_for_fx_tracing():
     # Monkey patch method in vision transformer
     timm.models.vision_transformer.resample_abs_pos_embed = resample_abs_pos_embed
 
-    # During torch.fx symbolic tracing (used by torchvision.create_feature_extractor),
-    # shape values like H = x.shape[2] are Proxy objects, not ints.
-    # timm's _assert(H % patch_size == 0, msg) then receives a Proxy as `condition`
-    # and crashes. Fix: skip the assertion when condition is not a plain bool.
-    def _assert_proxy_safe(condition, error_str: str):
-        if isinstance(condition, bool) and not condition:
-            raise AssertionError(error_str)
 
     for mod_path in ("timm.layers.patch_embed", "timm.models.layers.helpers"):
         try:
             import importlib
             mod = importlib.import_module(mod_path)
             if hasattr(mod, "_assert"):
-                mod._assert = _assert_proxy_safe
+                mod._assert = torch._assert
         except ImportError:
             pass
 
