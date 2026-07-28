@@ -2,6 +2,7 @@ import re
 
 import embodied
 import numpy as np
+from . import slot_viz
 
 
 def train_custom_eval(
@@ -108,6 +109,7 @@ def train_custom_eval(
     if should_log(step):
       agg = metrics.result()
       report = agent.report(batch[0])
+      slot_viz.add_slot_mask_report(train_env, report, batch[0])
       report = {k: v for k, v in report.items() if 'train/' + k not in agg}
       logger.add(agg)
       logger.add(report, prefix='report')
