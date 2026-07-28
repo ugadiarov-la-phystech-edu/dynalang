@@ -797,6 +797,18 @@ class MultiEncoder(nj.Module):
     print('Encoder CNN shapes:', self.cnn_shapes)
     print('Encoder MLP shapes:', self.mlp_shapes)
     print('Encoder Slot shapes:', self.slot_shapes)
+    self._slot_dim = (
+        list(self.slot_shapes.values())[0][-1]
+        if self.slot_shapes else mlp_units)
+    if self.slot_shapes:
+      self.n_output_slots = list(self.slot_shapes.values())[0][0]
+    else:
+      self.n_output_slots = 0
+    if self.cnn_shapes:
+      self.n_output_slots += 1
+      print(f'Encoder image slot: CNN -> dim {self._slot_dim}')
+    if not self.n_output_slots and self.mlp_shapes:
+      self.n_output_slots = 1
     cnn_kw = {**kw, 'minres': minres, 'name': 'cnn'}
     mlp_kw = {**kw, 'symlog_inputs': symlog_inputs, 'name': 'mlp'}
     if cnn == 'resnet':
@@ -813,18 +825,24 @@ class MultiEncoder(nj.Module):
     data = {
         k: v.reshape((-1,) + v.shape[len(batch_dims):])
         for k, v in data.items()}
-    result = {}
+    slots = None
+    text = None
 
-    if 'slot' in data:
-      result['slot'] = data['slot'].reshape(batch_dims + data['slot'].shape[1:])
-      
+    if self.slot_shapes and 'slot' in data:
+      slots = data['slot'].reshape(batch_dims + data['slot'].shape[1:])
+
     if self.cnn_shapes:
       inputs = jnp.concatenate([data[k] for k in self.cnn_shapes], -1)
       output = self._cnn(inputs)
       output = output.reshape((output.shape[0], -1))
       if zero_cnn:
         output = jnp.zeros_like(output)
-      result['image'] = output.reshape(batch_dims + output.shape[1:])
+      image = output.reshape(batch_dims + output.shape[1:])
+      image = self.get(
+          'enc_img_slot', Linear, self._slot_dim, act='none')(image)
+      image_slot = image[..., None, :]
+      slots = image_slot if slots is None else jnp.concatenate(
+          [slots, image_slot], axis=-2)
 
     if self.mlp_shapes:
       inputs = [
@@ -835,18 +853,18 @@ class MultiEncoder(nj.Module):
       output = self._mlp(inputs)
       if zero_mlp:
         output = jnp.zeros_like(output)
-      result['text'] = output.reshape(batch_dims + output.shape[1:])
+      text = output.reshape(batch_dims + output.shape[1:])
 
-    # Merge text into the visual representation so downstream models see one tensor
-    if 'slot' in result and 'text' in result:
-      slot_dim = result['slot'].shape[-1]
-      text_slot = self.get('text_slot_proj', Linear, slot_dim)(result['text'])
-      result['slot'] = jnp.concatenate(
-          [result['slot'], text_slot[..., None, :]], axis=-2)
-    elif 'image' in result and 'text' in result:
-      result['image'] = jnp.concatenate([result['image'], result['text']], axis=-1)
+    # Append the same text features to every slot (object + image).
+    if slots is not None and text is not None:
+      text = jnp.broadcast_to(
+          text[..., None, :],
+          slots.shape[:-1] + (text.shape[-1],))
+      slots = jnp.concatenate([slots, text], axis=-1)
+    elif text is not None:
+      slots = text[..., None, :]
 
-    return result['slot'] if 'slot' in result else result['image']
+    return slots
 
 
 
@@ -893,19 +911,21 @@ class MultiDecoder(nj.Module):
   def __call__(self, inputs, drop_loss_indices=None):
     features = self._inputs(inputs)
     dists = {}
-    
+    n_obj_slots = self.slot_shapes['slot'][0] if self.slot_shapes else 0
+
     if self.slot_shapes:
       shape = self.slot_shapes['slot']
-      n_obj_slots = shape[0]
-      # features may have more slots than the ground truth (e.g. +1 text slot);
-      # reconstruct only the first n_obj_slots entries.
+      # Reconstruct object slots only; text is concatenated on the feature dim.
       obj_features = features[..., :n_obj_slots, :]
       projector = self.get('slot_proj', Linear, shape[-1], act='none')
       slot_mean = projector(obj_features)
       dists['slot'] = jaxutils.MSEDist(slot_mean, 2, 'sum')
 
     if self.cnn_shapes:
-      feat = features
+      # The CNN reconstruction is conditioned only on the global image slot,
+      # which follows the object slots.
+      feat = features[..., n_obj_slots:n_obj_slots + 1, :].reshape(
+          features.shape[:-2] + (-1,))
       if drop_loss_indices is not None:
         feat = feat[:, drop_loss_indices]
       flat = feat.reshape([-1, feat.shape[-1]])
@@ -917,13 +937,15 @@ class MultiDecoder(nj.Module):
           key: self._make_image_dist(key, mean)
           for (key, shape), mean in zip(self.cnn_shapes.items(), means)})
     if self.mlp_shapes:
-      if self.slot_shapes:
-        # Text observations are encoded as the last slot
-        n_obj_slots = self.slot_shapes['slot'][0]
-        mlp_features = features[..., n_obj_slots:, :].reshape(
+      # Decode text from the image slot (text is also appended to every slot).
+      if self.cnn_shapes:
+        mlp_features = features[
+            ..., n_obj_slots:n_obj_slots + 1, :].reshape(
             features.shape[:-2] + (-1,))
+      elif features.shape[-2] > 1:
+        mlp_features = features.mean(axis=-2)
       else:
-        mlp_features = features
+        mlp_features = features.reshape(features.shape[:-2] + (-1,))
       dists.update(self._mlp(mlp_features))
     return dists
 

@@ -449,3 +449,10 @@ slotcontrast:
   # Slots are handled specially; mlp_keys='$^' disables vector MLP (override for text).
   encoder: {mlp_keys: '$^', cnn_keys: '$^'}
   decoder: {mlp_keys: '$^', cnn_keys: '$^'}
+
+# Add one global CNN image slot and append the token embedding to every
+# object/image slot. Apply after `slotcontrast` in --configs.
+cnn_image_text_slots:
+  encoder: {mlp_keys: 'token$', cnn_keys: 'image'}
+  decoder: {mlp_keys: 'token$', cnn_keys: 'image'}
+  decoder.vector_dist: onehot
