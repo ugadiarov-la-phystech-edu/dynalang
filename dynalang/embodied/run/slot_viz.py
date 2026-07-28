@@ -11,6 +11,7 @@ sees/predicts slot vectors, never patch features. Runs as a plain-Python
 post-processing step since it needs torch calls that can't happen inside
 the jitted agent.report().
 """
+import jax
 import numpy as np
 
 
@@ -176,19 +177,31 @@ def add_slot_mask_report(env, report, batch, seq_idx=0, max_frames=60):
   if model_slot_raw is None:
     return report
 
-  images = np.asarray(batch['image'])[seq_idx][:max_frames]
-  model_slot_raw = np.asarray(model_slot_raw)
   if seq_idx >= model_slot_raw.shape[0]:
     return report
-  model_slots = model_slot_raw[seq_idx][:max_frames].astype(np.float32)
 
   if 'slot' in batch:
-    real_slots = np.asarray(batch['slot'])[seq_idx][:max_frames].astype(np.float32)
+    slot_key = 'slot'
   elif 'flatten_slots' in batch:
-    flat = np.asarray(batch['flatten_slots'])[seq_idx][:max_frames].astype(np.float32)
-    real_slots = flat.reshape(-1, extractor.n_slots, extractor.dim)
+    slot_key = 'flatten_slots'
   else:
     return report
+
+  # Reporting intentionally crosses the JAX device boundary. Slice first so
+  # only one short sequence is copied instead of the full training batch.
+  with jax.transfer_guard('allow'):
+    images_device = batch['image'][seq_idx, :max_frames]
+    real_slots_device = batch[slot_key][seq_idx, :max_frames]
+    images = jax.device_get(images_device)
+    model_slots = jax.device_get(
+        model_slot_raw[seq_idx, :max_frames])
+    real_slots = jax.device_get(real_slots_device)
+
+  images = np.asarray(images)
+  model_slots = np.asarray(model_slots, dtype=np.float32)
+  real_slots = np.asarray(real_slots, dtype=np.float32)
+  if 'flatten_slots' in batch:
+    real_slots = real_slots.reshape(-1, extractor.n_slots, extractor.dim)
 
   t_len = min(len(images), len(real_slots), len(model_slots))
   images, real_slots, model_slots = images[:t_len], real_slots[:t_len], model_slots[:t_len]
