@@ -5,6 +5,7 @@ import shutil
 
 import embodied
 from embodied.core import path
+from . import slot_viz
 
 import numpy as np
 
@@ -108,6 +109,7 @@ def train(agent, env, replay, logger, args):
     if should_log(step):
       agg = metrics.result()
       report = agent.report(batch[0])
+      slot_viz.add_slot_mask_report(env, report, batch[0])
       report = {k: v for k, v in report.items() if 'train/' + k not in agg}
       logger.add(agg)
       logger.add(report, prefix='report')

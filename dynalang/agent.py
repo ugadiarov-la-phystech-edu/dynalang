@@ -395,6 +395,15 @@ class WorldModel(nj.Module):
       error = (model - truth + 1) / 2
       video = jnp.concatenate([truth, model, error], 2)
       report[f'openl_{key}'] = jaxutils.video_grid(video)
+    if self.heads['decoder'].slot_shapes:
+      # embodied/run/slot_viz.py decodes these raw
+      # reconstructed vectors back into spatial masks via the frozen
+      # SlotContrast decoder, for a pixel-level comparison against the real
+      # masks (report/openl_slots_grid_*).
+      model = jnp.concatenate(
+          [recon['slot'].mode()[:, :5], openl['slot'].mode()], 1)
+      # Raw (unnormalized) reconstructed slot vectors, useful for visualization
+      report['model_slot_raw'] = model
     # 1 step prediction loss for text
     # Calculate text ppl over entire batch and seq len for more context
     # Above is buggy - observe takes in prev_actions, ac taken into this state (see loss)

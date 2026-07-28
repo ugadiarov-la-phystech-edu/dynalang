@@ -65,6 +65,12 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
 
         self._input_type = input_type
 
+        # Visualization only: the frozen decoder that maps a slot
+        # vector back to per-patch (reconstruction, masks).
+        self.decoder = None
+        if self._model_config.get("decoder") is not None:
+            self.decoder = modules.build_decoder(self._model_config.decoder)
+
         # Load checkpoint weights
         state_dict = torch.load(
             self._checkpoint_path, weights_only=False, map_location='cpu'
@@ -72,11 +78,15 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
         if 'state_dict' in state_dict:
             state_dict = state_dict['state_dict']
 
-        # Filter to only the modules we have (initializer, encoder, processor)
+        prefixes = ['initializer.', 'encoder.', 'processor.']
+        if self.decoder is not None:
+            prefixes.append('decoder.')
         filtered_state_dict = {}
         for key, value in state_dict.items():
-            for prefix in ('initializer.', 'encoder.', 'processor.'):
+            for prefix in prefixes:
                 if key.startswith(prefix):
+                    if prefix == 'decoder.':
+                        key = key.replace('decoder.module.', 'decoder.', 1)
                     filtered_state_dict[key] = value
                     break
 
@@ -179,3 +189,21 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
         predicted = processor_output["state_predicted"]
 
         return slots, predicted
+
+    def decode_masks(self, slots):
+        """Visualization only. Runs an arbitrary (B, n_slots, dim) or
+        (n_slots, dim) slot-vector array through the frozen decoder and
+        returns the per-slot per-patch masks it implies, shape
+        (B, n_slots, n_patches) or (n_slots, n_patches).
+        """
+        if self.decoder is None:
+            raise RuntimeError(
+                'SlotContrastExtractor has no decoder loaded (checkpoint '
+                'config has no `model.decoder`).')
+        squeeze = (slots.ndim == 2)
+        if squeeze:
+            slots = slots[None]
+        slots_t = torch.as_tensor(slots, dtype=torch.float32, device=self._device)
+        with torch.no_grad():
+            masks = self.decoder(slots_t)["masks"].detach().cpu().numpy()
+        return masks[0] if squeeze else masks

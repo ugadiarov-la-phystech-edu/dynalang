@@ -227,9 +227,9 @@ dmlab:
 
 homegrid:
   task: homegrid_task
-  .*\.vec_keys: token$
-  .*\.img_keys: image
-  .*\.vec_dist: onehot
+  .*\.mlp_keys: token$
+  .*\.cnn_keys: image
+  decoder.vector_dist: onehot
 
 atari:
 
