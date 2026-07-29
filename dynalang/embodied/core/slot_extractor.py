@@ -42,6 +42,11 @@ class SlotExtractor(ABC):
   def dim(self) -> int:
     """Dimension of one slot."""
     pass
+
+  @property
+  def carry_dim(self) -> int:
+    """Dimension of the recurrent carry state."""
+    return self.dim
   
   @property
   def backbone_input_size(self) -> Optional[int]:
@@ -58,11 +63,18 @@ class SlotExtractor(ABC):
     
     Args:
       images: Batch of images, shape (B, H, W, C) or (B, C, H, W)
-      previous_slots: Previous slots for recurrent initialization,
-                     shape (B, n_slots, dim) or None
+      previous_slots: Recurrent carry state for initialization, shape
+                     (B, n_slots, carry_dim) or None. This should be the
+                     `predicted` value returned by the previous call,
+                     not the `slots` observation it returned.
     
     Returns:
-      slots: Extracted slots, shape (B, n_slots, dim)
+      slots: Extracted slots, shape (B, n_slots, dim), suitable as an
+        observation.
+      predicted: The recurrent carry state, shape (B, n_slots, carry_dim),
+        suitable as `previous_slots` on the next call. For models
+        without a separate transition/predictor step, this can simply
+        equal `slots`.
     """
     pass
   
@@ -79,11 +91,15 @@ class SlotExtractor(ABC):
     Args:
       images: Images in format (H, W, C) or (B, H, W, C),
               dtype uint8 [0, 255]
-      previous_slots: Previous slots (n_slots, dim) or (B, n_slots, dim)
+      previous_slots: Recurrent carry (n_slots, dim) or (B, n_slots, dim).
+              This should be the `predicted` value returned by a previous
+              call
       to_numpy: Convert result to numpy array
     
     Returns:
       slots: shape (n_slots, dim) or (B, n_slots, dim)
+      predicted: shape (n_slots, carry_dim) or (B, n_slots, carry_dim),
+              the carry to pass back in as `previous_slots` on the next call
     """
     # Determine single image or batch
     one_image = len(images.shape) == 3
@@ -99,23 +115,19 @@ class SlotExtractor(ABC):
       batch_prev_slots = previous_slots
     
     # Call slot extraction
-    slots = self(batch_images, previous_slots=batch_prev_slots)
-    
-    # Remove batch dimension if single image
-    if one_image:
-      if HAS_JAX and isinstance(slots, jnp.ndarray):
-        slots = slots[0]
-      else:
-        slots = slots[0]
-    
-    # Convert to numpy if needed
-    if to_numpy:
-      if HAS_JAX and isinstance(slots, jnp.ndarray):
-        slots = np.array(slots)
-      elif hasattr(slots, 'detach'):  # PyTorch tensor
-        slots = slots.detach().cpu().numpy()
-    
-    return slots
+    slots, predicted = self(batch_images, previous_slots=batch_prev_slots)
+
+    def _postprocess(x):
+      if one_image:
+        x = x[0]
+      if to_numpy:
+        if HAS_JAX and isinstance(x, jnp.ndarray):
+          x = np.array(x)
+        elif hasattr(x, 'detach'):  # PyTorch tensor
+          x = x.detach().cpu().numpy()
+      return x
+
+    return _postprocess(slots), _postprocess(predicted)
 
 
 class DummySlotExtractor(SlotExtractor):
@@ -148,4 +160,5 @@ class DummySlotExtractor(SlotExtractor):
     if previous_slots is not None:
       slots = 0.8 * previous_slots + 0.2 * slots
     
-    return slots
+    # No separate transition model: carry state equals the observation.
+    return slots, slots

@@ -81,10 +81,11 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
         if 'state_dict' in state_dict:
             state_dict = state_dict['state_dict']
 
-        # Filter to only the modules we have (initializer, encoder, processor)
+        # Filter to only the modules used for extraction.
+        prefixes = ('initializer.', 'encoder.', 'processor.')
         filtered_state_dict = {}
         for key, value in state_dict.items():
-            for prefix in ('initializer.', 'encoder.', 'processor.'):
+            for prefix in prefixes:
                 if key.startswith(prefix):
                     filtered_state_dict[key] = value
                     break
@@ -104,7 +105,7 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
             size = self.backbone_input_size or self._image_size
             with torch.no_grad():
                 dummy = torch.zeros(1, 3, size, size, device=self._device)
-                self._out_dim = self._forward_torch(dummy).shape[-1]
+                self._out_dim = self._forward_torch(dummy)[0].shape[-1]
 
     @property
     def n_slots(self):
@@ -117,6 +118,10 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
         return self._model_config.initializer.dim
 
     @property
+    def carry_dim(self):
+        return self._model_config.initializer.dim
+
+    @property
     def backbone_input_size(self):
         return self._backbone_input_size if self._backbone_input_size else None
 
@@ -126,10 +131,15 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
         
         Args:
             images: numpy array (B, H, W, C) uint8 [0, 255]
-            previous_slots: numpy array (B, n_slots, dim) or None
+            previous_slots: numpy array (B, n_slots, carry_dim) or None. This is
+                the recurrent carry state (the predictor's output from the
+                previous call)
         
         Returns:
-            slots: numpy array (B, n_slots, dim) float32
+            slots: numpy array (B, n_slots, dim) float32, containing either
+                corrected slots or pooled object-centric tokens
+            predicted: numpy array (B, n_slots, carry_dim) float32 (predictor
+                output, the correct value to pass back in as `previous_slots`)
         """
         # Convert numpy to torch
         batch_images = torch.as_tensor(
@@ -155,10 +165,10 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
             )
         
         # Forward pass
-        slots = self._forward_torch(batch_images, previous_slots)
+        slots, predicted = self._forward_torch(batch_images, previous_slots)
         
         # Convert to numpy
-        return slots.detach().cpu().numpy()
+        return slots.detach().cpu().numpy(), predicted.detach().cpu().numpy()
 
     def _forward_torch(self, image, previous_slots=None):
         """Internal forward pass with torch tensors."""
@@ -173,21 +183,34 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
         encoder_output = self.encoder(encoder_input)
         features = encoder_output["features"]
 
-        # In object-centric mode we only use slot attention for its masks, so the slots are re-initialized every frame 
+        # Object-centric tokens use slot attention only for masks, so initialize
+        # independently for every frame instead of threading recurrent state.
         slots_initial = None if self._token_mode == 'object_centric' else previous_slots
         if slots_initial is None:
             slots_initial = self.initializer(batch_size=batch_size)
 
-        processor_output = self.processor(slots_initial, features)
-        slots = processor_output["state"]
-
-        # Remove the fake time dimension
         if self._input_type == "video":
-            slots = slots[:, 0]  # (B, 1, n_slots, dim) -> (B, n_slots, dim)
+            # We always feed one frame at a time (T=1), so ScanOverTime's own
+            # internal step counter would always start at 0 and incorrectly
+            # trigger `first_step_corrector_args` on every single call, not
+            # just on genuine first frames of an episode. Call the wrapped
+            # LatentProcessor directly with the *true* time step instead:
+            # 0 only when there is no recurrent state to warm-start from
+            # (i.e. a real first frame), non-zero for continuing frames.
+            time_step = (
+                0 if self._token_mode == 'object_centric' or previous_slots is None
+                else 1
+            )
+            processor_output = self.processor.module(slots_initial, features[:, 0], time_step)
+        else:
+            processor_output = self.processor(slots_initial, features)
+        slots = processor_output["state"]
+        predicted = processor_output["state_predicted"]
 
         if self._token_mode == 'slots':
-            return slots
-        masks = processor_output["corrector"]["masks"] #(B, [T,] n_slots, n_patches)
+            return slots, predicted
+
+        masks = processor_output["corrector"]["masks"]
         # Patch features to pool: raw DINO (backbone) or projected FrameEncoder feats.
         pool_feats = (
             encoder_output["backbone_features"]
@@ -195,10 +218,9 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
             else features
         )
         if self._input_type == "video":
-            masks = masks[:, 0]
             pool_feats = pool_feats[:, 0]
 
-        return self._pool_tokens(masks, pool_feats)
+        return self._pool_tokens(masks, pool_feats), predicted
 
     def _pool_tokens(self, masks, features):
         """Pool patch features into one token per object mask.
