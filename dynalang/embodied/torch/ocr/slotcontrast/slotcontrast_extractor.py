@@ -183,9 +183,11 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
         encoder_output = self.encoder(encoder_input)
         features = encoder_output["features"]
 
-        # Object-centric tokens use slot attention only for masks, so initialize
-        # independently for every frame instead of threading recurrent state.
-        slots_initial = None if self._token_mode == 'object_centric' else previous_slots
+        # Reuse the latent predictor state across frames to keep object masks
+        # and slot identities temporally consistent. Object-centric mode still
+        # returns pooled patch features as observations; only its mask-producing
+        # latent state is recurrent.
+        slots_initial = previous_slots
         if slots_initial is None:
             slots_initial = self.initializer(batch_size=batch_size)
 
@@ -197,10 +199,7 @@ class SlotContrastExtractor(torch.nn.Module, SlotExtractor):
             # LatentProcessor directly with the *true* time step instead:
             # 0 only when there is no recurrent state to warm-start from
             # (i.e. a real first frame), non-zero for continuing frames.
-            time_step = (
-                0 if self._token_mode == 'object_centric' or previous_slots is None
-                else 1
-            )
+            time_step = 0 if previous_slots is None else 1
             processor_output = self.processor.module(slots_initial, features[:, 0], time_step)
         else:
             processor_output = self.processor(slots_initial, features)
