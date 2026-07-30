@@ -15,7 +15,9 @@ defaults:
   dataset_excluded_keys: ["info", "language_info"]
   eval_dir: ''
   loggers: ["terminal", "comet"]
-  logger: {terminal: {filter: '.*'}, comet: {filter: '.*'}}
+  logger:
+    terminal: {filter: '.*'}
+    comet: {filter: '.*', video_dir: '/tmp', keep_videos: False}
   text_dataset: ''
 
   # Slot Extractor
