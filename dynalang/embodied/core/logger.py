@@ -341,7 +341,8 @@ class CometOutput:
         self._experiment.log_metrics(metrics, step=step)
 
       if video_paths:
-        flushed = experiment.flush()
+        flushed = experiment.flush(timeout=60)
+        print(f'Comet flush completed: {flushed}')
         if not flushed:
           print(f'Comet flush failed; keeping videos: {video_paths}')
     finally:
