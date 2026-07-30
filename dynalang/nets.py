@@ -874,7 +874,8 @@ class MultiDecoder(nj.Module):
       self, shapes, inputs=['tensor'], cnn_keys=r'.*', mlp_keys=r'.*',
       mlp_layers=4, mlp_units=512, cnn='resize', cnn_depth=48, cnn_blocks=2,
       image_dist='mse', vector_dist='mse', resize='stride', bins=255,
-      outscale=1.0, minres=4, cnn_sigmoid=False, **kw):
+      outscale=1.0, minres=4, cnn_sigmoid=False, mlp_input='auto', **kw):
+    assert mlp_input in ('auto', 'image_slot', 'mean'), mlp_input
     excluded = ('is_first', 'is_last', 'is_terminal', 'reward')
     shapes = {k: v for k, v in shapes.items() if k not in excluded}
     self.slot_shapes = {k: v for k, v in shapes.items() if k == 'slot'}
@@ -907,6 +908,7 @@ class MultiDecoder(nj.Module):
           self.mlp_shapes, mlp_layers, mlp_units, **mlp_kw, name='mlp')
     self._inputs = Input(inputs, dims='deter')
     self._image_dist = image_dist
+    self._mlp_input = mlp_input
 
   def __call__(self, inputs, drop_loss_indices=None):
     features = self._inputs(inputs)
@@ -937,8 +939,16 @@ class MultiDecoder(nj.Module):
           key: self._make_image_dist(key, mean)
           for (key, shape), mean in zip(self.cnn_shapes.items(), means)})
     if self.mlp_shapes:
-      # Decode text from the image slot (text is also appended to every slot).
-      if self.cnn_shapes:
+      # By default, preserve the historical behavior: use the image slot when
+      # present and otherwise average object slots. This can be overridden so
+      # vector/text predictions aggregate all slots even with image decoding.
+      mlp_input = (
+          'image_slot' if self._mlp_input == 'auto' and self.cnn_shapes
+          else 'mean' if self._mlp_input == 'auto'
+          else self._mlp_input)
+      if mlp_input == 'image_slot':
+        assert self.cnn_shapes, (
+            "decoder.mlp_input='image_slot' requires a decoded CNN input")
         mlp_features = features[
             ..., n_obj_slots:n_obj_slots + 1, :].reshape(
             features.shape[:-2] + (-1,))
