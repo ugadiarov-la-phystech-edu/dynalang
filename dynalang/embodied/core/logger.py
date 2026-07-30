@@ -265,9 +265,14 @@ class TensorBoardOutput(AsyncOutput):
 
 
 class CometOutput:
-  def __init__(self, name, config, fps, pattern=r'.*'):
+  def __init__(
+      self, name, config, fps, pattern=r'.*', video_dir='/tmp',
+      keep_videos=False):
     self._pattern = re.compile(pattern)
     self._fps = fps
+    self._video_dir = os.path.abspath(os.path.expanduser(video_dir))
+    self._keep_videos = keep_videos
+    os.makedirs(self._video_dir, exist_ok=True)
     import comet_ml
 
     run_id = os.getenv('COMET_RUN_ID', None)
@@ -296,59 +301,49 @@ class CometOutput:
   def __call__(self, summaries):
     bystep = collections.defaultdict(lambda: collections.defaultdict(list))
     experiment = self._experiment
-    video_paths = []
-    flushed = False
-    try:
-      for step, name, value in summaries:
-        if not self._pattern.search(name):
-          continue
-        if isinstance(value, str):
-            # Comet is not happy with logging of strings
-            continue
-        elif len(value.shape) == 0:
-          bystep[step][name].append(float(value))
-        elif len(value.shape) == 1:
-          experiment.log_histogram_3d(value, name=name, step=step)
-        elif len(value.shape) in (2, 3):
-          value = value[..., None] if len(value.shape) == 2 else value
-          assert value.shape[3] in [1, 3, 4], value.shape
-          if value.dtype != np.uint8:
-            value = (255 * np.clip(value, 0, 1)).astype(np.uint8)
-          value = np.transpose(value, [2, 0, 1])
-          experiment.log_image(value, name=name, step=step)
-        elif len(value.shape) == 4:
-          from moviepy.editor import ImageSequenceClip
-          # Sanity check that the channel dimension is the last
-          assert value.shape[3] in [1, 3, 4], f"Invalid shape: {value.shape}"
-          if value.shape[3] == 1:
-            value = np.repeat(value, 3, axis=3)
-          elif value.shape[3] == 4:
-            value = value[..., :3]
-          # If the video is a float, convert it to uint8
-          if np.issubdtype(value.dtype, np.floating):
-            value = np.clip(255 * value, 0, 255).astype(np.uint8)
-          value = list(value)
-          clip = ImageSequenceClip(value, fps=self._fps)
-          path = f'/tmp/{uuid.uuid4()}.mp4'
+    for step, name, value in summaries:
+      if not self._pattern.search(name):
+        continue
+      if isinstance(value, str):
+        # Comet is not happy with logging of strings
+        continue
+      elif len(value.shape) == 0:
+        bystep[step][name].append(float(value))
+      elif len(value.shape) == 1:
+        experiment.log_histogram_3d(value, name=name, step=step)
+      elif len(value.shape) in (2, 3):
+        value = value[..., None] if len(value.shape) == 2 else value
+        assert value.shape[3] in [1, 3, 4], value.shape
+        if value.dtype != np.uint8:
+          value = (255 * np.clip(value, 0, 1)).astype(np.uint8)
+        value = np.transpose(value, [2, 0, 1])
+        experiment.log_image(value, name=name, step=step)
+      elif len(value.shape) == 4:
+        from moviepy.editor import ImageSequenceClip
+        # Sanity check that the channel dimension is the last
+        assert value.shape[3] in [1, 3, 4], f"Invalid shape: {value.shape}"
+        if value.shape[3] == 1:
+          value = np.repeat(value, 3, axis=3)
+        elif value.shape[3] == 4:
+          value = value[..., :3]
+        # If the video is a float, convert it to uint8
+        if np.issubdtype(value.dtype, np.floating):
+          value = np.clip(255 * value, 0, 255).astype(np.uint8)
+        value = list(value)
+        clip = ImageSequenceClip(value, fps=self._fps)
+        path = os.path.join(self._video_dir, f'{uuid.uuid4()}.mp4')
+        try:
           clip.write_videofile(path)
-          video_paths.append(path)
           result = experiment.log_video(path, name=name, step=step)
           print(f'Comet video logged: {name}: {result}')
+        finally:
+          if not self._keep_videos and os.path.exists(path):
+            os.remove(path)
 
-      for step, metrics in bystep.items():
-        metrics = {name: np.mean(value) for name, value in metrics.items()}
-        metrics['global_step'] = step
-        self._experiment.log_metrics(metrics, step=step)
-
-      if video_paths:
-        flushed = experiment.flush(timeout=60)
-        print(f'Comet flush completed: {flushed}')
-        if not flushed:
-          print(f'Comet flush failed; keeping videos: {video_paths}')
-    finally:
-      if flushed:
-        for path in video_paths:
-          os.remove(path)
+    for step, metrics in bystep.items():
+      metrics = {name: np.mean(value) for name, value in metrics.items()}
+      metrics['global_step'] = step
+      self._experiment.log_metrics(metrics, step=step)
 
 
 class WandBOutput:
