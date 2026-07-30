@@ -191,7 +191,11 @@ def make_logger(parsed, logdir, step, config):
     outputs.append(embodied.logger.TerminalOutput(config.logger.terminal.filter))
 
   if 'comet' in config.loggers:
-    outputs.append(embodied.logger.CometOutput(config.logdir, config, config.run.log_fps, config.logger.comet.filter))
+    outputs.append(embodied.logger.CometOutput(
+        config.logdir, config, config.run.log_fps,
+        config.logger.comet.filter,
+        config.logger.comet.video_dir,
+        config.logger.comet.keep_videos))
 
   logger = embodied.Logger(step, outputs, multiplier)
   if config.use_wandb:
