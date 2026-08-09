@@ -66,8 +66,12 @@ class Agent(nj.Module):
   def policy(self, obs, state, mode='train'):
     self.config.jax.jit and print('Tracing policy function.')
     obs = self.preprocess(obs)
-    (prev_latent, prev_action), task_state, expl_state = state
-    embed = self.wm.encoder(obs)
+    (prev_latent, prev_action, enc_state), task_state, expl_state = state
+    embed, enc_extra = self.wm.encoder(
+        obs, slot_carry=enc_state.get('slot'), return_extra=True)
+    enc_state = dict(enc_state)
+    if 'slot_carry' in enc_extra:
+      enc_state['slot'] = enc_extra['slot_carry']
     if self.config.rssm_type == "token":
       latent = self.wm.rssm.obs_step(
           prev_latent, prev_action, embed, obs["token"], obs['is_first'])
@@ -79,7 +83,7 @@ class Agent(nj.Module):
     expl_outs, expl_state = self.expl_behavior.policy(latent, expl_state)
     outs = {'eval': task_outs, 'explore': expl_outs, 'train': task_outs}[mode]
     act = {k: v for k, v in outs.items() if k in self.act_space}
-    state = ((latent, act), task_state, expl_state)
+    state = ((latent, act, enc_state), task_state, expl_state)
     act = {
         k: jnp.argmax(act[k], -1).astype(jnp.int32) if s.discrete else act[k]
         for k, s in self.act_space.items()}
@@ -178,9 +182,9 @@ class WorldModel(nj.Module):
       self.rssm = nets.TSSM(**config.tssm, name='rssm')
     elif self.config.rssm_type == 'octssm':
       octssm_cfg = dict(config.octssm)
-      if self.encoder.slot_shapes:
+      if self.encoder.out_slots:
         # Auto-derive num_slots from encoder output 
-        base_slots = list(self.encoder.slot_shapes.values())[0][0]
+        base_slots = self.encoder.out_slots[0]
         n_text = 1 if len(self.encoder.mlp_shapes) > 0 else 0
         octssm_cfg['num_slots'] = base_slots + n_text
         print(f'WorldModel: auto-set octssm.num_slots = '
@@ -217,8 +221,13 @@ class WorldModel(nj.Module):
     else:
       raise NotImplementedError(f'cont_head.typ: {self.config.cont_head.typ}')
     
+    decoder_cfg = dict(config.decoder)
+    if decoder_cfg.get('slot_recon'):
+      assert self.encoder.out_slots, (
+          'decoder.slot_recon needs a slot-shaped encoder output')
+      decoder_cfg['slot_layout'] = self.encoder.out_slots
     self.heads = {
-        'decoder': nets.MultiDecoder(shapes, **config.decoder, name='dec'),
+        'decoder': nets.MultiDecoder(shapes, **decoder_cfg, name='dec'),
         'reward': reward_head,
         'cont': cont_head}
     self.opt = jaxutils.Optimizer(name='model_opt', **config.model_opt)
@@ -228,6 +237,13 @@ class WorldModel(nj.Module):
     scales.update({k: vector for k in self.heads['decoder'].mlp_shapes})
     scales.update({k: vector for k in self.heads['decoder'].slot_shapes})
     self.scales = scales
+    # STICA-style autoencoder loss: reconstruct pixels straight from the
+    # encoder slots, bypassing the RSSM bottleneck. Without it the slot binding
+    # has no direct pressure to decompose the scene.
+    self._slot_ae = (
+        self.scales.get('slot_ae', 0.0) > 0
+        and self.heads['decoder'].has_slot_recon)
+    self._slot_image_key = config.encoder.slot_image_key
 
   def initial(self, batch_size):
     prev_latent = self.rssm.initial(batch_size)
@@ -235,13 +251,22 @@ class WorldModel(nj.Module):
         k: jnp.zeros(
             (batch_size, *v.shape, int(v.high)) if v.discrete else (batch_size, *v.shape))
         for k, v in self.act_space.items()}
-    return prev_latent, prev_action
+    enc_state = {}
+    if self.encoder.slot_carry_shape:
+      enc_state['slot'] = self.encoder.initial_slots(batch_size)
+    return prev_latent, prev_action, enc_state
 
   def train(self, data, state):
     for key in [x for x in self.config.zero_data_keys if x]:
       data[key] = jnp.zeros_like(data[key])
     modules = [self.encoder, self.rssm, *self.heads.values()]
 
+    if self.config.skip_mlp_training or self.config.skip_cnn_training:
+      # These select the raw-image CNN / vector MLP submodules by hand, which
+      # do not exist on the learned slot encoder path.
+      assert not self.encoder.slot_carry_shape, (
+          'skip_cnn_training / skip_mlp_training are not supported with '
+          'encoder.slot_source=learned')
     if self.config.skip_mlp_training:
       assert not self.config.skip_cnn_training
       enc = self.encoder._cnn
@@ -261,12 +286,14 @@ class WorldModel(nj.Module):
     return state, outs, metrics
 
   def loss(self, data, state):
-    embed = self.encoder(
+    prev_latent, prev_action, enc_state = state
+    embed, enc_extra = self.encoder(
       data,
       zero_mlp=self.config.zero_mlp,
-      zero_cnn=self.config.zero_cnn)
+      zero_cnn=self.config.zero_cnn,
+      slot_carry=enc_state.get('slot'),
+      return_extra=True)
 
-    prev_latent, prev_action = state
     prev_actions = {
         k: jnp.concatenate([prev_action[k][:, None], data[k][:, :-1]], 1)
         for k in self.act_space}
@@ -319,13 +346,20 @@ class WorldModel(nj.Module):
       loss = -dist.log_prob(data[key].astype(jnp.float32))
       assert loss.shape == embed.shape[:2], (key, loss.shape)
       losses[key] = loss
+    if self._slot_ae:
+      ae_dist, _ = self.heads['decoder'].slot_image_dist(embed, proj='ae')
+      truth = data[self._slot_image_key].astype(jnp.float32)
+      losses['slot_ae'] = -ae_dist.log_prob(truth)
     scaled = {k: v * self.scales[k] for k, v in losses.items()}
     model_loss = sum(scaled.values())
     out = {'embed':  embed, 'post': post, 'prior': prior}
     out.update({f'{k}_loss': v for k, v in losses.items()})
     last_latent = {k: v[:, -1] for k, v in post.items()}
     last_action = {k: data[k][:, -1] for k in self.act_space}
-    state = last_latent, last_action
+    last_enc = dict(enc_state)
+    if 'slot_carry' in enc_extra:
+      last_enc['slot'] = enc_extra['slot_carry']
+    state = last_latent, last_action, last_enc
     metrics = self._metrics(data, dists, post, prior, losses, model_loss)
     return model_loss.mean() + lm_loss, (state, out, metrics)
 
@@ -386,9 +420,8 @@ class WorldModel(nj.Module):
     # - logit, stoch (batch, prefix_len, rssm.stoch, rssm.classes)
     start = {k: v[:, -1] for k, v in context.items()}
     recon = self.heads['decoder'](context)
-    openl = self.heads['decoder'](
-        self.rssm.imagine({k: data[k][:6, 5:] for k in act_keys}, start),
-    )
+    traj = self.rssm.imagine({k: data[k][:6, 5:] for k in act_keys}, start)
+    openl = self.heads['decoder'](traj)
     for key in self.heads['decoder'].cnn_shapes.keys():
       truth = data[key][:6].astype(jnp.float32)
       model = jnp.concatenate([recon[key].mode()[:, :5], openl[key].mode()], 1)
@@ -404,6 +437,41 @@ class WorldModel(nj.Module):
           [recon['slot'].mode()[:, :5], openl['slot'].mode()], 1)
       # Raw (unnormalized) reconstructed slot vectors, useful for visualization
       report['model_slot_raw'] = model
+    if self.heads['decoder'].has_slot_recon:
+      # Lay each slot's alpha mask and render out side by side, so it is visible
+      # whether the binding decomposes the scene or collapses. Rows stack the
+      # encoder's own decomposition over the one the world model predicts (5
+      # posterior steps then imagined ones, as in openl_image), plus their
+      # difference, which shows where the dynamics loses track of a slot.
+      dec = self.heads['decoder']
+      nseq = 3
+      nimag = min(5, list(traj.values())[0].shape[1])
+      wm_latent = {
+          k: jnp.concatenate([v[:nseq, :5], traj[k][:nseq, :nimag]], 1)
+          for k, v in context.items() if k in traj}
+      outs = {'wm': dec.slot_decode(wm_latent, proj='wm')}
+      if self._slot_ae:
+        # The 'ae' projection only exists when the autoencoder loss trains it.
+        outs['ae'] = dec.slot_decode(embed[:nseq, :5 + nimag], proj='ae')
+
+      def slot_strip(x):
+        # (B, T, K, H, W, C) -> (B, T, H, K * W, C)
+        B, T, K, H, W, C = x.shape
+        return x.transpose((0, 1, 3, 2, 4, 5)).reshape((B, T, H, K * W, C))
+      def masks_of(out):
+        return slot_strip(jnp.repeat(out['slot_masks'].astype(jnp.float32), 3, -1))
+      def renders_of(out):
+        m = out['slot_masks'].astype(jnp.float32)
+        r = out['slot_recons'].astype(jnp.float32) + 0.5
+        return slot_strip(r * m + (1 - m) * 0.5)
+
+      order = [k for k in ('ae', 'wm') if k in outs]
+      masks = [masks_of(outs[k]) for k in order]
+      if len(masks) == 2:
+        masks.append((masks[1] - masks[0] + 1) / 2)
+      report['slot_masks'] = jaxutils.video_grid(jnp.concatenate(masks, 2))
+      report['slot_renders'] = jaxutils.video_grid(
+          jnp.concatenate([renders_of(outs[k]) for k in order], 2))
     # 1 step prediction loss for text
     # Calculate text ppl over entire batch and seq len for more context
     # Above is buggy - observe takes in prev_actions, ac taken into this state (see loss)

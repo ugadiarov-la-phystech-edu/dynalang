@@ -137,8 +137,8 @@ defaults:
   token_rssm: {deter: 4096, units: 1024, stoch: 32, classes: 32, vocab: 32100, act: silu, norm: layer, unimix: 0.01, unroll: False, action_clip: 1.0, bottleneck: -1, winit: normal, fan: avg, prior_layers: 3}
   tssm: {deter: 1024, units: 1024, stoch: 32, classes: 32, tf_context_length: 16, tf_layers: 4, tf_heads: 8, feedforward_units: 1536, dropout: 0.0, act: silu, norm: layer, unimix: 0.01, unroll: False, action_clip: 1.0, action_mode: concat, winit: normal, fan: avg}
   octssm: {num_slots: 8, deter: 1024, units: 1024, stoch: 32, classes: 32, tf_context_length: 16, tf_layers: 4, tf_heads: 8, feedforward_units: 1536, dropout: 0.0, unimix: 0.01, unroll: False, action_clip: 1.0, action_mode: none, winit: normal, fan: avg}
-  encoder: {mlp_keys: '.*', cnn_keys: '.*', act: silu, norm: layer, mlp_layers: 5, mlp_units: 1024, cnn: resnet, cnn_depth: 96, cnn_blocks: 0, resize: stride, winit: normal, fan: avg}
-  decoder: {mlp_keys: '.*', cnn_keys: '.*', act: silu, norm: layer, mlp_layers: 5, mlp_units: 1024, cnn: resnet, cnn_depth: 96, cnn_blocks: 0, image_dist: mse, vector_dist: symlog_mse, inputs: [deter, stoch], resize: stride, winit: normal, fan: avg, outscale: 1.0, minres: 4, cnn_sigmoid: False}
+  encoder: {mlp_keys: '.*', cnn_keys: '.*', act: silu, norm: layer, mlp_layers: 5, mlp_units: 1024, cnn: resnet, cnn_depth: 96, cnn_blocks: 0, resize: stride, winit: normal, fan: avg, slot_source: obs, slot_image_key: image, slot_attention: {num_slots: 7, slot_size: 64, mlp_size: 128, num_iters: 2, first_iters: 3, feat_res: 16, cnn_depth: 64, cnn_layers: 4, cnn_kernel: 5, act: relu, norm: none}}
+  decoder: {mlp_keys: '.*', cnn_keys: '.*', act: silu, norm: layer, mlp_layers: 5, mlp_units: 1024, cnn: resnet, cnn_depth: 96, cnn_blocks: 0, image_dist: mse, vector_dist: symlog_mse, inputs: [deter, stoch], resize: stride, winit: normal, fan: avg, outscale: 1.0, minres: 4, cnn_sigmoid: False, slot_recon: False, slot_width: 64, slot_decoder: {depth: 64, layers: 4, kernel: 5, res: 8, bg_logit: 3.0, background: append, act: relu, norm: none}}
   reward_head:
     typ: mlp
     mlp: {layers: 5, units: 1024, act: silu, norm: layer, dist: symexp_twohot, outscale: 0.0, outnorm: False, inputs: [deter, stoch], winit: normal, fan: avg, bins: 255}
@@ -147,7 +147,7 @@ defaults:
     typ: mlp
     mlp: {layers: 5, units: 1024, act: silu, norm: layer, dist: binary, outscale: 1.0, outnorm: False, inputs: [deter, stoch], winit: normal, fan: avg}
     transformer: {layers: 2, heads: 8, ffup: 4, act: silu, norm: layer, dropout: 0.1, output: binary}
-  loss_scales: {image: 1.0, vector: 1.0, reward: 1.0, cont: 1.0, dyn: 0.5, rep: 0.1, actor: 1.0, critic: 1.0, slowreg: 1.0, token: 1.0, lm: 0.0}
+  loss_scales: {image: 1.0, vector: 1.0, reward: 1.0, cont: 1.0, dyn: 0.5, rep: 0.1, actor: 1.0, critic: 1.0, slowreg: 1.0, token: 1.0, lm: 0.0, slot_ae: 0.0}
   rssm_loss: {free: 1.0}
   model_opt: {opt: adam, lr: 1e-4, eps: 1e-8, clip: 1000.0, wd: 0.0, warmup: 0, lateclip: 0.0, frozen_keys: '^$'}
   skip_cnn_training: False
@@ -451,3 +451,26 @@ slotcontrast:
   # Slots are handled specially; mlp_keys='$^' disables vector MLP (override for text).
   encoder: {mlp_keys: '$^', cnn_keys: '$^'}
   decoder: {mlp_keys: '$^', cnn_keys: '$^'}
+
+# Trainable CNN + slot attention encoder in the style of STICA, replacing the
+# frozen SlotContrast extractor. Slots are learned end to end from pixels; the
+# spatial-broadcast decoder provides the reconstruction signal that makes the
+# binding decompose the scene. Combine with the `octssm` preset.
+stica_slots:
+  use_slot_extractor: False
+  encoder:
+    slot_source: learned
+    slot_image_key: image
+    cnn_keys: 'image'
+    # first_iters is the binding depth at a reset, where slots start from the
+    # learned init instead of the previous frame; num_iters is the depth
+    # everywhere else. Because is_first is traced, first_iters iterations are
+    # computed on every step and only the reset steps use the deeper result, so
+    # first_iters: 0 ("same as num_iters") is the faster setting.
+    slot_attention: {num_slots: 7, slot_size: 64, mlp_size: 128, num_iters: 2, first_iters: 3, feat_res: 16, cnn_depth: 64, cnn_layers: 4, cnn_kernel: 5, act: relu, norm: none}
+  decoder:
+    cnn_keys: 'image'
+    slot_recon: True
+    slot_width: 64
+    slot_decoder: {depth: 64, layers: 4, kernel: 5, res: 8, bg_logit: 3.0, background: append, act: relu, norm: none}
+  loss_scales.slot_ae: 1.0

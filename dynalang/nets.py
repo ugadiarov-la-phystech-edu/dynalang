@@ -781,10 +781,14 @@ class MultiEncoder(nj.Module):
       self, shapes, cnn_keys=r'.*', mlp_keys=r'.*', mlp_layers=4,
       mlp_units=512, cnn='resize', cnn_depth=48,
       cnn_blocks=2, resize='stride',
-      symlog_inputs=False, minres=4, **kw):
+      symlog_inputs=False, minres=4,
+      slot_source='obs', slot_image_key='image', slot_attention={}, **kw):
     excluded = ('is_first', 'is_last')
     shapes = {k: v for k, v in shapes.items() if (
         k not in excluded and not k.startswith('log_'))}
+    assert slot_source in ('obs', 'learned'), slot_source
+    self._slot_source = slot_source
+    self._slot_image_key = slot_image_key
     self.slot_shapes = {k: v for k, v in shapes.items() if k == 'slot'}
     self.cnn_shapes = {k: v for k, v in shapes.items() if (
         len(v) == 3 and re.match(cnn_keys, k) and k != 'slot')}
@@ -793,10 +797,30 @@ class MultiEncoder(nj.Module):
     assert not ("token" in self.mlp_shapes and \
                 "token_embed" in self.mlp_shapes), \
       "Probably shouldn't have both token and token_embed, use token$?"
+    if slot_source == 'learned':
+      assert not self.slot_shapes, (
+          'slot_source=learned computes slots from images; remove obs["slot"] '
+          'by disabling the frozen slot extractor.')
+      assert slot_image_key in shapes, (
+          f'slot_source=learned needs obs["{slot_image_key}"], got '
+          f'{sorted(shapes)}')
+      # slot_attention wins over the shared encoder kwargs, so the slot stack
+      # can keep STICA's relu / no-norm convs while the rest of the encoder
+      # follows the global act/norm settings.
+      self._slot_enc = SlotAttentionEncoder(
+          **{**kw, **slot_attention}, name='slotenc')
+      self._slot_image_shape = shapes[slot_image_key]
+      # The learned encoder replaces the raw-image CNN path rather than
+      # running alongside it.
+      self.cnn_shapes = {
+          k: v for k, v in self.cnn_shapes.items() if k != slot_image_key}
     self.shapes = {**self.cnn_shapes, **self.mlp_shapes, **self.slot_shapes}
+    if slot_source == 'learned':
+      self.shapes[slot_image_key] = shapes[slot_image_key]
     print('Encoder CNN shapes:', self.cnn_shapes)
     print('Encoder MLP shapes:', self.mlp_shapes)
     print('Encoder Slot shapes:', self.slot_shapes)
+    print('Encoder slot source:', slot_source)
     cnn_kw = {**kw, 'minres': minres, 'name': 'cnn'}
     mlp_kw = {**kw, 'symlog_inputs': symlog_inputs, 'name': 'mlp'}
     if cnn == 'resnet':
@@ -807,13 +831,50 @@ class MultiEncoder(nj.Module):
       self._mlp = MLP(None, mlp_layers, mlp_units, dist='none', **mlp_kw)
     self.preprocessors = {}
 
-  def __call__(self, data, zero_mlp=False, zero_cnn=False):
+  @property
+  def out_slots(self):
+    """(num_object_slots, slot_dim) of the emitted slot tensor, or None.
+
+    Describes the encoder output regardless of whether slots come from the
+    frozen extractor or from the learned slot attention encoder. The text slot,
+    when present, is appended on top of these.
+    """
+    if self._slot_source == 'learned':
+      return (self._slot_enc.num_slots, self._slot_enc.slot_size)
+    if self.slot_shapes:
+      return tuple(self.slot_shapes['slot'])
+    return None
+
+  @property
+  def slot_carry_shape(self):
+    if self._slot_source != 'learned':
+      return None
+    return (self._slot_enc.num_slots, self._slot_enc.slot_size)
+
+  def initial_slots(self, batch_size):
+    assert self._slot_source == 'learned'
+    return self._slot_enc.initial(batch_size)
+
+  def __call__(
+      self, data, zero_mlp=False, zero_cnn=False, slot_carry=None,
+      return_extra=False):
     some_key, some_shape = list(self.shapes.items())[0]
     batch_dims = data[some_key].shape[:-len(some_shape)]
+    extra = {}
+    result = {}
+
+    if self._slot_source == 'learned':
+      # Needs the unflattened (batch, time) layout to carry slots over time.
+      slots, carry = self._slot_enc(
+          data[self._slot_image_key], data['is_first'], slot_carry)
+      if zero_cnn:
+        slots = jnp.zeros_like(slots)
+      result['slot'] = slots
+      extra['slot_carry'] = carry
+
     data = {
         k: v.reshape((-1,) + v.shape[len(batch_dims):])
         for k, v in data.items()}
-    result = {}
 
     if 'slot' in data:
       result['slot'] = data['slot'].reshape(batch_dims + data['slot'].shape[1:])
@@ -846,7 +907,8 @@ class MultiEncoder(nj.Module):
     elif 'image' in result and 'text' in result:
       result['image'] = jnp.concatenate([result['image'], result['text']], axis=-1)
 
-    return result['slot'] if 'slot' in result else result['image']
+    embed = result['slot'] if 'slot' in result else result['image']
+    return (embed, extra) if return_extra else embed
 
 
 
@@ -856,7 +918,9 @@ class MultiDecoder(nj.Module):
       self, shapes, inputs=['tensor'], cnn_keys=r'.*', mlp_keys=r'.*',
       mlp_layers=4, mlp_units=512, cnn='resize', cnn_depth=48, cnn_blocks=2,
       image_dist='mse', vector_dist='mse', resize='stride', bins=255,
-      outscale=1.0, minres=4, cnn_sigmoid=False, **kw):
+      outscale=1.0, minres=4, cnn_sigmoid=False,
+      slot_layout=None, slot_recon=False, slot_width=64, slot_decoder={},
+      **kw):
     excluded = ('is_first', 'is_last', 'is_terminal', 'reward')
     shapes = {k: v for k, v in shapes.items() if k not in excluded}
     self.slot_shapes = {k: v for k, v in shapes.items() if k == 'slot'}
@@ -872,11 +936,26 @@ class MultiDecoder(nj.Module):
     print('Decoder Slot shapes:', self.slot_shapes)
     cnn_kw = {**kw, 'minres': minres, 'sigmoid': cnn_sigmoid}
     mlp_kw = {**kw, 'dist': vector_dist, 'outscale': outscale, 'bins': bins}
+    self._slot_layout = tuple(slot_layout) if slot_layout else None
+    self._slot_recon = slot_recon
+    self._slot_width = slot_width
+    self._slot_kw = kw
+    self._slot_cnn = None
     if self.cnn_shapes:
       shapes = list(self.cnn_shapes.values())
       assert all(x[:-1] == shapes[0][:-1] for x in shapes)
       shape = shapes[0][:-1] + (sum(x[-1] for x in shapes),)
-      if cnn == 'resnet':
+      if slot_recon:
+        assert self._slot_layout, 'slot_recon needs slot_layout'
+        assert len(self.cnn_shapes) == 1, (
+            'slot_recon composes a single image; restrict decoder.cnn_keys, '
+            f'got {sorted(self.cnn_shapes)}')
+        # Replaces the flat CNN decoder: pixels are composed from per-slot
+        # renders instead of a single latent vector.
+        self._slot_cnn = SlotImageDecoder(
+            shape, **{**kw, 'sigmoid': cnn_sigmoid, **slot_decoder},
+            name='slotdec')
+      elif cnn == 'resnet':
         self._cnn = ImageDecoderResnet(
             shape, cnn_depth, cnn_blocks, resize, **cnn_kw, name='cnn')
       elif cnn == 'style':
@@ -889,6 +968,48 @@ class MultiDecoder(nj.Module):
           self.mlp_shapes, mlp_layers, mlp_units, **mlp_kw, name='mlp')
     self._inputs = Input(inputs, dims='deter')
     self._image_dist = image_dist
+
+  @property
+  def has_slot_recon(self):
+    return self._slot_cnn is not None
+
+  @property
+  def n_obj_slots(self):
+    """Number of leading object slots, excluding appended text slots."""
+    if self._slot_layout:
+      return self._slot_layout[0]
+    if self.slot_shapes:
+      return self.slot_shapes['slot'][0]
+    return None
+
+  def decode_slot_image(self, slots, proj='wm'):
+    """Compose an image from slot vectors via the spatial-broadcast decoder.
+
+    Exposed so the same decoder weights can also reconstruct straight from the
+    encoder slots, which is what actually trains the slot binding. The two call
+    sites feed different widths (encoder slots vs. deter+stoch features), so
+    each gets its own input projection into the shared deconv stack.
+    """
+    assert self._slot_cnn is not None, 'decoder.slot_recon is disabled'
+    slots = slots[..., :self.n_obj_slots, :]
+    slots = self.get(
+        f'slot_in_{proj}', Linear, self._slot_width, **self._slot_kw)(slots)
+    return self._slot_cnn(slots)
+
+  def slot_image_dist(self, slots, proj='wm'):
+    """Image distribution reconstructed from slots, plus the raw decoder outputs."""
+    key = list(self.cnn_shapes)[0]
+    out = self.decode_slot_image(slots, proj=proj)
+    return self._make_image_dist(key, out['image']), out
+
+  def slot_decode(self, inputs, proj='wm'):
+    """Per-slot renders and masks from either a slot tensor or a latent dict.
+
+    Lets callers visualize the decomposition of world model latents without
+    reaching into the input concatenation.
+    """
+    slots = self._inputs(inputs) if isinstance(inputs, dict) else inputs
+    return self.decode_slot_image(slots, proj=proj)
 
   def __call__(self, inputs, drop_loss_indices=None):
     features = self._inputs(inputs)
@@ -908,18 +1029,21 @@ class MultiDecoder(nj.Module):
       feat = features
       if drop_loss_indices is not None:
         feat = feat[:, drop_loss_indices]
-      flat = feat.reshape([-1, feat.shape[-1]])
-      output = self._cnn(flat)
-      output = output.reshape(feat.shape[:-1] + output.shape[1:])
+      if self._slot_cnn is not None:
+        output = self.decode_slot_image(feat, proj='wm')['image']
+      else:
+        flat = feat.reshape([-1, feat.shape[-1]])
+        output = self._cnn(flat)
+        output = output.reshape(feat.shape[:-1] + output.shape[1:])
       split_indices = np.cumsum([v[-1] for v in self.cnn_shapes.values()][:-1])
       means = jnp.split(output, split_indices, -1)
       dists.update({
           key: self._make_image_dist(key, mean)
           for (key, shape), mean in zip(self.cnn_shapes.items(), means)})
     if self.mlp_shapes:
-      if self.slot_shapes:
-        # Text observations are encoded as the last slot
-        n_obj_slots = self.slot_shapes['slot'][0]
+      n_obj_slots = self.n_obj_slots
+      if n_obj_slots is not None:
+        # Text observations are encoded as the trailing slot(s).
         mlp_features = features[..., n_obj_slots:, :].reshape(
             features.shape[:-2] + (-1,))
       else:
@@ -1109,6 +1233,292 @@ class ImageDecoderStyle(nj.Module):
     else:
       x = x + 0.5
     return x
+
+
+def soft_position_grid(resolution):
+  """Coordinate grid [1, H, W, 4] holding (y, x, 1 - y, 1 - x)."""
+  ranges = [jnp.linspace(0.0, 1.0, num=res) for res in resolution]
+  grid = jnp.stack(jnp.meshgrid(*ranges, indexing='ij'), axis=-1)
+  grid = grid.reshape((1,) + tuple(resolution) + (len(resolution),))
+  return jnp.concatenate([grid, 1.0 - grid], axis=-1)
+
+
+class SoftPositionEmbed(nj.Module):
+  """Learned linear projection of a coordinate grid, added to a feature map."""
+
+  def __init__(self, resolution, winit='normal', fan='avg'):
+    self._resolution = tuple(resolution)
+    self._kw = dict(winit=winit, fan=fan)
+
+  def __call__(self, x):
+    grid = cast(soft_position_grid(self._resolution))
+    proj = self.get('proj', Linear, x.shape[-1], **self._kw)(grid)
+    return x + proj
+
+
+class SlotAttention(nj.Module):
+  """Iterative slot attention with a GRU update (Locatello et al., 2020)."""
+
+  def __init__(self, slot_size, mlp_size, eps=1e-6, winit='normal', fan='avg'):
+    self._slot_size = slot_size
+    self._mlp_size = mlp_size
+    self._eps = eps
+    self._kw = dict(winit=winit, fan=fan)
+
+  def __call__(self, inputs, slots, num_iters, snapshot_at=()):
+    """Refine slots against inputs.
+
+    Args:
+      inputs: (B, N, C) flattened features.
+      slots: (B, K, slot_size) initial slots.
+      num_iters: number of refinement iterations to run.
+      snapshot_at: iteration counts at which to also record (slots, attn), so
+        callers can pick between binding depths without re-running the module.
+
+    Returns:
+      (slots, attn) after `num_iters`, and a dict of the requested snapshots.
+    """
+    inputs = self.get('norm_inputs', Norm, 'layer')(inputs)
+    k = self.get('project_k', Linear, self._slot_size, bias=False, **self._kw)(inputs)
+    v = self.get('project_v', Linear, self._slot_size, bias=False, **self._kw)(inputs)
+    scale = self._slot_size ** -0.5
+    attn = None
+    snapshots = {}
+    for step in range(1, num_iters + 1):
+      prev = slots
+      q = self.get('norm_q', Norm, 'layer')(slots)
+      q = self.get('project_q', Linear, self._slot_size, bias=False, **self._kw)(q)
+      # (B, N, K): each input location distributes itself over the slots.
+      logits = scale * jnp.einsum('bnc,bkc->bnk', k, q)
+      attn = jax.nn.softmax(logits.astype(f32), axis=-1).astype(logits.dtype)
+      weights = attn + self._eps
+      weights = weights / weights.sum(axis=1, keepdims=True)
+      updates = jnp.einsum('bnk,bnc->bkc', weights, v)
+      slots = self._gru(updates, prev)
+      residual = self.get('norm_mlp', Norm, 'layer')(slots)
+      residual = self.get(
+          'mlp1', Linear, self._mlp_size, act='relu', **self._kw)(residual)
+      residual = self.get('mlp2', Linear, self._slot_size, **self._kw)(residual)
+      slots = slots + residual
+      if step in snapshot_at:
+        snapshots[step] = (slots, attn)
+    return (slots, attn), snapshots
+
+  def _gru(self, x, state):
+    kw = {**self._kw, 'act': 'none', 'units': 3 * self._slot_size}
+    parts = self.get('gru', Linear, **kw)(jnp.concatenate([x, state], -1))
+    reset, cand, update = jnp.split(parts, 3, -1)
+    reset = jax.nn.sigmoid(reset)
+    cand = jnp.tanh(reset * cand)
+    update = jax.nn.sigmoid(update - 1)
+    return update * cand + (1 - update) * state
+
+
+class SlotAttentionEncoder(nj.Module):
+  """CNN + soft position embedding + slot attention, as in STICA.
+
+  Unlike STICA the slots are carried across time instead of being re-bound from
+  scratch at every frame, which keeps slot identity stable for the downstream
+  dynamics model and avoids needing permutation matching in the losses.
+
+  The carry is only meaningful within a sequence and during policy rollouts. In
+  training it is handed in from the previous batch to mirror how the RSSM
+  threads prev_latent, but the replay sampler forces is_first at t=0 of every
+  sampled sequence, so the incoming carry is always replaced by the learned
+  initialization there.
+  """
+
+  def __init__(
+      self, num_slots=7, slot_size=64, mlp_size=128, num_iters=2,
+      first_iters=3, feat_res=16, cnn_depth=64, cnn_layers=4, cnn_kernel=5,
+      norm='none', act='relu', winit='normal', fan='avg'):
+    # first_iters is how many refinement iterations the cold start at t=0 gets.
+    # Set it to 0 for "same as num_iters", which is cheaper; see bind().
+    first_iters = first_iters or num_iters
+    self._num_slots = num_slots
+    self._slot_size = slot_size
+    self._feat_res = feat_res
+    self._cnn_depth = cnn_depth
+    self._cnn_layers = cnn_layers
+    self._cnn_kernel = cnn_kernel
+    self._num_iters = num_iters
+    self._first_iters = first_iters
+    self._norm = norm
+    self._act = act
+    self._kw = dict(winit=winit, fan=fan)
+    self._sa = SlotAttention(slot_size, mlp_size, **self._kw, name='sa')
+
+  @property
+  def num_slots(self):
+    return self._num_slots
+
+  @property
+  def slot_size(self):
+    return self._slot_size
+
+  def initial(self, batch_size):
+    init = self.get(
+        'init_slots', Initializer('normal', fan='avg'),
+        (self._num_slots, self._slot_size))
+    return cast(jnp.repeat(init[None], batch_size, 0))
+
+  def features(self, image):
+    """image: (N, H, W, C) in [0, 1] -> (N, feat_res**2, slot_size)."""
+    x = cast(image) - 0.5
+    # Stride only as much as needed to reach the requested feature resolution;
+    # remaining layers stay at stride 1 like STICA's encoder.
+    strided = max(0, int(round(np.log2(x.shape[-2] / self._feat_res))))
+    assert strided <= self._cnn_layers, (
+        f'Cannot downsample {x.shape[-2]} to {self._feat_res} with '
+        f'{self._cnn_layers} conv layers.')
+    for i in range(self._cnn_layers):
+      last = i == self._cnn_layers - 1
+      x = self.get(
+          f'conv{i}', Conv2D, self._cnn_depth, self._cnn_kernel,
+          stride=2 if i < strided else 1, norm=self._norm,
+          act='none' if last else self._act, **self._kw)(x)
+    assert x.shape[-3:-1] == (self._feat_res, self._feat_res), x.shape
+    x = self.get('pos', SoftPositionEmbed, (self._feat_res, self._feat_res))(x)
+    x = x.reshape((x.shape[0], -1, x.shape[-1]))
+    x = self.get('out_norm', Norm, 'layer')(x)
+    x = self.get('out1', Linear, self._slot_size, act='relu', **self._kw)(x)
+    x = self.get('out2', Linear, self._slot_size, **self._kw)(x)
+    return x
+
+  def bind(self, features, slots, is_first=None):
+    """Single-step slot binding. features: (N, num_inputs, slot_size).
+
+    A binding that restarts from the learned initialization gets first_iters
+    refinement iterations, more than the num_iters spent on one warm-started
+    from the previous frame. Since `is_first` is traced, both depths have to be
+    computed and then selected, so the extra iterations run on *every* step
+    while only the reset steps use them. The replay sampler forces is_first at
+    t=0 of every sequence, so those are exactly one step in batch_length: the
+    cold binding is what the dynamics model sees first and its result
+    propagates through the carry, but it is not cheap. Set first_iters=0 to
+    spend num_iters everywhere and drop the overhead.
+    """
+    deep, shallow = self._first_iters, self._num_iters
+    if is_first is None or deep == shallow:
+      (slots, _), _ = self._sa(features, slots, shallow)
+      return slots
+    _, snapshots = self._sa(
+        features, slots, max(deep, shallow), snapshot_at=(deep, shallow))
+    return jaxutils.switch(is_first, snapshots[deep][0], snapshots[shallow][0])
+
+  def __call__(self, image, is_first, prev_slots=None):
+    """Bind slots over a sequence.
+
+    Args:
+      image: (B, T, H, W, C) or (B, H, W, C) for a single step.
+      is_first: (B, T) or (B,), resets the carried slots.
+      prev_slots: (B, K, slot_size) carry from the previous call.
+
+    Returns:
+      slots: same leading dims as `image`, trailing (K, slot_size).
+      carry: (B, K, slot_size) slots after the last step.
+    """
+    single = image.ndim == 4
+    if single:
+      image, is_first = image[:, None], is_first[:, None]
+    B, T = image.shape[:2]
+    feats = self.features(image.reshape((B * T,) + image.shape[2:]))
+    feats = feats.reshape((B, T) + feats.shape[1:])
+    init = self.initial(B)
+    # The carry crosses a lax.scan boundary, so its dtype must match what the
+    # body produces.
+    prev_slots = init if prev_slots is None else cast(prev_slots)
+
+    def step(carry, inp):
+      reset = inp['is_first']
+      slots = jaxutils.switch(reset, init, carry['slot'])
+      return {'slot': self.bind(inp['feat'], slots, reset)}
+
+    outs = jaxutils.scan(
+        step,
+        {'feat': feats.swapaxes(0, 1), 'is_first': is_first.swapaxes(0, 1)},
+        {'slot': prev_slots},
+        unroll=False)
+    slots = outs['slot'].swapaxes(0, 1)
+    carry = slots[:, -1]
+    if single:
+      slots = slots[:, 0]
+    return cast(slots), cast(carry)
+
+
+class SlotImageDecoder(nj.Module):
+  """Spatial-broadcast decoder: each slot paints an RGB image plus an alpha mask.
+
+  Follows STICA's decoder, including the learned background canvas and the
+  `bg_logit` bias that keeps the background mask from being starved early in
+  training.
+
+  `background` controls the background canvas:
+    'append'  - add it as an extra canvas, so every encoder slot paints pixels.
+    'replace' - overwrite slot 0 with it, exactly as STICA does. Note this
+                leaves the encoder's slot 0 without any reconstruction
+                gradient, so it is only meaningful if the dynamics model is
+                also told to ignore that slot.
+    'none'    - no background canvas.
+  """
+
+  def __init__(
+      self, shape, depth=64, layers=4, kernel=5, res=8, bg_logit=0.0,
+      background='append', norm='none', act='relu', sigmoid=False,
+      winit='normal', fan='avg'):
+    assert background in ('append', 'replace', 'none'), background
+    self._shape = tuple(shape)
+    self._depth = depth
+    self._layers = layers
+    self._kernel = kernel
+    self._res = res
+    self._bg_logit = bg_logit
+    self._background = background
+    self._norm = norm
+    self._act = act
+    self._sigmoid = sigmoid
+    self._kw = dict(winit=winit, fan=fan)
+
+  def __call__(self, slots):
+    """slots: (..., K, slot_size) -> dict of image, per-slot recons and masks."""
+    batch_shape = slots.shape[:-2]
+    D = slots.shape[-1]
+    slots = cast(slots).reshape((-1, slots.shape[-2], D))
+    if self._background != 'none':
+      bg = self.get('bg_slot', Initializer('normal', fan='avg'), (1, D))
+      bg = jnp.repeat(cast(bg)[None], slots.shape[0], 0)
+      rest = slots[:, 1:] if self._background == 'replace' else slots
+      slots = jnp.concatenate([bg, rest], 1)
+    K = slots.shape[1]
+    x = slots.reshape((-1, 1, 1, D))
+    x = jnp.tile(x, (1, self._res, self._res, 1))
+    x = self.get('pos', SoftPositionEmbed, (self._res, self._res))(x)
+    size = self._res
+    for i in range(self._layers):
+      stride = 2 if size < self._shape[0] else 1
+      x = self.get(
+          f'deconv{i}', Conv2D, self._depth, self._kernel, stride=stride,
+          transp=True, norm=self._norm, act=self._act, **self._kw)(x)
+      size *= stride
+    channels = self._shape[-1]
+    x = self.get('out', Conv2D, channels + 1, 1, **self._kw)(x)
+    assert x.shape[-3:-1] == self._shape[:-1], (x.shape, self._shape)
+    x = x.reshape((-1, K, *self._shape[:-1], channels + 1))
+    recons, logits = x[..., :channels], x[..., channels:]
+    if self._background != 'none' and self._bg_logit:
+      bg_logit = jnp.full_like(logits[:, :1], self._bg_logit)
+      logits = jnp.concatenate([bg_logit, logits[:, 1:]], 1)
+    masks = jax.nn.softmax(logits.astype(f32), axis=1).astype(logits.dtype)
+    image = (recons * masks).sum(1)
+    if self._sigmoid:
+      image = jax.nn.sigmoid(image)
+    else:
+      image = image + 0.5
+    reshape = lambda x: x.reshape(batch_shape + x.shape[1:])
+    return {
+        'image': reshape(image),
+        'slot_recons': reshape(recons),
+        'slot_masks': reshape(masks)}
 
 
 class AggregationTransformerHead(nj.Module):
