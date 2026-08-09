@@ -941,6 +941,11 @@ class MultiDecoder(nj.Module):
     self._slot_width = slot_width
     self._slot_kw = kw
     self._slot_cnn = None
+    assert not (slot_recon and not self.cnn_shapes), (
+        'decoder.slot_recon is on but decoder.cnn_keys matches no image key, '
+        'so nothing would reconstruct pixels and the slot binding would get no '
+        f'gradient. Point cnn_keys at an image or set slot_recon=False; got '
+        f'cnn_keys over {sorted(shapes)}')
     if self.cnn_shapes:
       shapes = list(self.cnn_shapes.values())
       assert all(x[:-1] == shapes[0][:-1] for x in shapes)
