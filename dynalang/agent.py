@@ -342,10 +342,14 @@ class WorldModel(nj.Module):
       lm_loss = 0
 
     losses.update(rssm_losses)
+    slot_pred = dists.pop('slot_pred', None)
     for key, dist in dists.items():
       loss = -dist.log_prob(data[key].astype(jnp.float32))
       assert loss.shape == embed.shape[:2], (key, loss.shape)
       losses[key] = loss
+    if slot_pred is not None:
+      losses['slot_pred'] = -slot_pred.log_prob(
+          sg(embed).astype(jnp.float32))
     if self._slot_ae:
       ae_dist, _ = self.heads['decoder'].slot_image_dist(embed, proj='ae')
       truth = data[self._slot_image_key].astype(jnp.float32)
@@ -422,9 +426,28 @@ class WorldModel(nj.Module):
     recon = self.heads['decoder'](context)
     traj = self.rssm.imagine({k: data[k][:6, 5:] for k in act_keys}, start)
     openl = self.heads['decoder'](traj)
-    for key in self.heads['decoder'].cnn_shapes.keys():
+    dec = self.heads['decoder']
+
+    wm_out = None
+    if dec.has_slot_recon:
+      # Per-slot renders of what the world model believes, over the report
+      # timeline: 5 posterior steps then imagined ones.
+      def wm_render(latent, out):
+        if dec.has_wm_recon:
+          return dec.slot_decode(latent, proj='wm')
+        return dec.decode_slot_image(out['slot_pred'].mode(), proj='ae')
+      head, tail = wm_render(context, recon), wm_render(traj, openl)
+      wm_out = {
+          k: jnp.concatenate([head[k][:, :5], tail[k]], 1) for k in head}
+
+    for key in dec.cnn_shapes.keys():
       truth = data[key][:6].astype(jnp.float32)
-      model = jnp.concatenate([recon[key].mode()[:, :5], openl[key].mode()], 1)
+      if dec.has_wm_recon:
+        model = jnp.concatenate([recon[key].mode()[:, :5], openl[key].mode()], 1)
+      elif wm_out is not None:
+        model = wm_out['image'].astype(jnp.float32)
+      else:
+        continue
       error = (model - truth + 1) / 2
       video = jnp.concatenate([truth, model, error], 2)
       report[f'openl_{key}'] = jaxutils.video_grid(video)
@@ -437,22 +460,17 @@ class WorldModel(nj.Module):
           [recon['slot'].mode()[:, :5], openl['slot'].mode()], 1)
       # Raw (unnormalized) reconstructed slot vectors, useful for visualization
       report['model_slot_raw'] = model
-    if self.heads['decoder'].has_slot_recon:
+    if wm_out is not None:
       # Lay each slot's alpha mask and render out side by side, so it is visible
       # whether the binding decomposes the scene or collapses. Rows stack the
-      # encoder's own decomposition over the one the world model predicts (5
-      # posterior steps then imagined ones, as in openl_image), plus their
-      # difference, which shows where the dynamics loses track of a slot.
-      dec = self.heads['decoder']
-      nseq = 3
-      nimag = min(5, list(traj.values())[0].shape[1])
-      wm_latent = {
-          k: jnp.concatenate([v[:nseq, :5], traj[k][:nseq, :nimag]], 1)
-          for k, v in context.items() if k in traj}
-      outs = {'wm': dec.slot_decode(wm_latent, proj='wm')}
+      # encoder's own decomposition over the one the world model predicts, plus
+      # their difference, which shows where the dynamics loses track of a slot.
+      nseq, nframes = 3, 5 + min(5, list(traj.values())[0].shape[1])
+      crop = lambda x: x[:nseq, :nframes]
+      outs = {'wm': {k: crop(v) for k, v in wm_out.items()}}
       if self._slot_ae:
         # The 'ae' projection only exists when the autoencoder loss trains it.
-        outs['ae'] = dec.slot_decode(embed[:nseq, :5 + nimag], proj='ae')
+        outs['ae'] = dec.slot_decode(embed[:nseq, :nframes], proj='ae')
 
       def slot_strip(x):
         # (B, T, K, H, W, C) -> (B, T, H, K * W, C)

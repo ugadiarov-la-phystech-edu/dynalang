@@ -920,7 +920,7 @@ class MultiDecoder(nj.Module):
       image_dist='mse', vector_dist='mse', resize='stride', bins=255,
       outscale=1.0, minres=4, cnn_sigmoid=False,
       slot_layout=None, slot_recon=False, slot_width=64, slot_decoder={},
-      **kw):
+      wm_recon=True, slot_pred=False, **kw):
     excluded = ('is_first', 'is_last', 'is_terminal', 'reward')
     shapes = {k: v for k, v in shapes.items() if k not in excluded}
     self.slot_shapes = {k: v for k, v in shapes.items() if k == 'slot'}
@@ -940,7 +940,12 @@ class MultiDecoder(nj.Module):
     self._slot_recon = slot_recon
     self._slot_width = slot_width
     self._slot_kw = kw
+    self._wm_recon = wm_recon
+    self._slot_pred = slot_pred
     self._slot_cnn = None
+    assert wm_recon or slot_pred or not self.cnn_shapes, (
+        'decoder.wm_recon is off, so the world model gets no reconstruction '
+        'target; enable decoder.slot_pred to give it one in slot space')
     assert not (slot_recon and not self.cnn_shapes), (
         'decoder.slot_recon is on but decoder.cnn_keys matches no image key, '
         'so nothing would reconstruct pixels and the slot binding would get no '
@@ -977,6 +982,11 @@ class MultiDecoder(nj.Module):
   @property
   def has_slot_recon(self):
     return self._slot_cnn is not None
+
+  @property
+  def has_wm_recon(self):
+    """Whether __call__ emits an image distribution for the world model loss."""
+    return bool(self.cnn_shapes) and self._wm_recon
 
   @property
   def n_obj_slots(self):
@@ -1030,7 +1040,15 @@ class MultiDecoder(nj.Module):
       slot_mean = projector(obj_features)
       dists['slot'] = jaxutils.MSEDist(slot_mean, 2, 'sum')
 
-    if self.cnn_shapes:
+    if self._slot_pred:
+      # Cheap stand-in for decoding pixels out of the posterior: predict the
+      # encoder's own slots instead. The caller supplies a stop-gradient target,
+      # so this trains the dynamics without pulling on the slot binding.
+      width = self._slot_layout[-1] if self._slot_layout else features.shape[-1]
+      mean = self.get('slot_pred', Linear, width, act='none')(features)
+      dists['slot_pred'] = jaxutils.MSEDist(mean, 2, 'sum')
+
+    if self.cnn_shapes and self._wm_recon:
       feat = features
       if drop_loss_indices is not None:
         feat = feat[:, drop_loss_indices]
