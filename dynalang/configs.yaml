@@ -420,6 +420,23 @@ transformer_heads:
   actor.typ: transformer
   critic.typ: transformer
 
+stica_world_model:
+  octssm.deter: 256
+  octssm.units: 256
+  octssm.stoch: 16
+  octssm.classes: 8
+  octssm.tf_layers: 10
+  octssm.tf_heads: 4
+  octssm.feedforward_units: 1024
+  octssm.tf_context_length: 16
+  octssm.action_mode: slot
+  reward_head.typ: mlp
+  reward_head.mlp.layers: 4
+  reward_head.mlp.units: 256
+  cont_head.typ: mlp
+  cont_head.mlp.layers: 4
+  cont_head.mlp.units: 256
+
 stica_actor_critic:
   actor.typ: transformer
   actor.transformer.units: 256
