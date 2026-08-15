@@ -1123,6 +1123,7 @@ class AggregationTransformerHead(nj.Module):
       aggregation_method='last',
       **kw):
     from .transformer import TransformerEncoder
+    assert aggregation_method in ('mean', 'last', 'cls'), aggregation_method
     
     self._space = space
     if isinstance(space, dict):
@@ -1184,6 +1185,13 @@ class AggregationTransformerHead(nj.Module):
     
     if x.shape[-1] != self._units:
       x = self.get('in_proj', Linear, self._units)(x)
+
+    if self._aggregation_method == 'cls':
+      cls_token = self.get(
+          'cls_token', jnp.zeros, (self._units,), f32)
+      cls_token = jnp.broadcast_to(
+          cls_token[None, None, :], (x.shape[0], 1, self._units))
+      x = jnp.concatenate([cls_token, x], axis=1)
     
     x = jaxutils.cast_to_compute(x)
     
@@ -1194,7 +1202,7 @@ class AggregationTransformerHead(nj.Module):
     elif self._aggregation_method == 'last':
       x = x[:, -1]  # [B*T, units]
     elif self._aggregation_method == 'cls':
-      x = x[:, 0]  # [B*T, units]
+      x = x[:, 0]  # [B*T, units], learned CLS token
     else:
       raise NotImplementedError(f'aggregation_method: {self._aggregation_method}')
     
