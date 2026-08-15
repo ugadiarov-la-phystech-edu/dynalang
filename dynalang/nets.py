@@ -1120,7 +1120,7 @@ class AggregationTransformerHead(nj.Module):
       self, space, output='mse', layers=2, units=512, heads=8, ffup=4,
       act='silu', norm='layer', dropout=0.1,
       inputs=['tensor'], dims=None, bdims=None,
-      aggregation_method='last',
+      aggregation_method='last', post_layers=0, post_units=512,
       **kw):
     from .transformer import TransformerEncoder
     assert aggregation_method in ('mean', 'last', 'cls'), aggregation_method
@@ -1138,6 +1138,10 @@ class AggregationTransformerHead(nj.Module):
     self._ffup = ffup
     self._dropout = dropout
     self._aggregation_method = aggregation_method
+    self._post_layers = post_layers
+    self._post_units = post_units
+    self._post_act = act
+    self._post_norm = norm
     self._bdims = bdims 
     
     self._inputs = Input(inputs, dims=dims)
@@ -1205,6 +1209,11 @@ class AggregationTransformerHead(nj.Module):
       x = x[:, 0]  # [B*T, units], learned CLS token
     else:
       raise NotImplementedError(f'aggregation_method: {self._aggregation_method}')
+
+    for i in range(self._post_layers):
+      x = self.get(
+          f'post_mlp_{i}', Linear, self._post_units,
+          act=self._post_act, norm=self._post_norm)(x)
     
     x = x.reshape((*bshape, x.shape[-1])) #[B*T, units] → [B, T, units]
     if isinstance(self._shape, dict):

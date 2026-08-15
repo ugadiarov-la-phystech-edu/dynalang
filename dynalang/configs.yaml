@@ -160,11 +160,11 @@ defaults:
   actor:
     typ: mlp
     mlp: {layers: 5, units: 1024, act: silu, norm: layer, minstd: 0.1, maxstd: 1.0, outscale: 1.0, outnorm: False, unimix: 0.01, inputs: [deter, stoch], winit: normal, fan: avg, symlog_inputs: False}
-    transformer: {layers: 3, units: 512, heads: 8, ffup: 4, aggregation_method: last, act: silu, norm: layer, dropout: 0.1, minstd: 0.1, maxstd: 1.0, unimix: 0.01}
+    transformer: {layers: 3, units: 512, heads: 8, ffup: 4, aggregation_method: last, post_layers: 0, post_units: 512, act: silu, norm: layer, dropout: 0.1, minstd: 0.1, maxstd: 1.0, unimix: 0.01}
   critic:
     typ: mlp
     mlp: {layers: 5, units: 1024, act: silu, norm: layer, dist: symexp_twohot, outscale: 0.0, outnorm: False, inputs: [deter, stoch], winit: normal, fan: avg, bins: 255, symlog_inputs: False}
-    transformer: {layers: 3, units: 512, heads: 8, ffup: 4, aggregation_method: last, act: silu, norm: layer, dropout: 0.1, output: symexp_twohot, bins: 255}
+    transformer: {layers: 3, units: 512, heads: 8, ffup: 4, aggregation_method: last, post_layers: 0, post_units: 512, act: silu, norm: layer, dropout: 0.1, output: symexp_twohot, bins: 255}
   actor_opt: {opt: adam, lr: 3e-5, eps: 1e-5, clip: 100.0, wd: 0.0, warmup: 0, lateclip: 0.0}
   critic_opt: {opt: adam, lr: 3e-5, eps: 1e-5, clip: 100.0, wd: 0.0, warmup: 0, lateclip: 0.0}
   actor_dist_disc: onehot
@@ -427,12 +427,16 @@ stica_actor_critic:
   actor.transformer.heads: 4
   actor.transformer.ffup: 2
   actor.transformer.aggregation_method: cls
+  actor.transformer.post_layers: 4
+  actor.transformer.post_units: 512
   critic.typ: transformer
   critic.transformer.units: 256
   critic.transformer.layers: 10
   critic.transformer.heads: 4
   critic.transformer.ffup: 2
   critic.transformer.aggregation_method: cls
+  critic.transformer.post_layers: 4
+  critic.transformer.post_units: 512
 
 min_debug:
 
