@@ -216,14 +216,17 @@ class RSSM(nj.Module):
       return {'logit': logit, 'mask': mask}
 
 class TSSM(nj.Module):
+  _reward_modes = ('none', 'concat')
 
   def __init__(
       self, deter=512, units=512, stoch=32, classes=32, tf_context_length=16,
       tf_layers=4, tf_heads=8, feedforward_units=1024, dropout=0.0,
       unroll=False, unimix=0.01, action_clip=1.0, action_mode='concat',
+      reward_mode='none', reward_mask_prob=0.0, reward_predicted_prob=0.0,
       winit='normal', **kw):
     assert deter == units, (deter, units)
     assert action_mode in ('none', 'concat', 'cross_attn'), action_mode
+    assert reward_mode in self._reward_modes, (reward_mode, self._reward_modes)
     from .transformer import TransformerEncoder, TransformerDecoder
     self._deter = deter
     self._units = units
@@ -234,6 +237,9 @@ class TSSM(nj.Module):
     self._unimix = unimix
     self._action_clip = action_clip
     self._action_mode = action_mode
+    self._reward_mode = reward_mode
+    self._reward_mask_prob = reward_mask_prob
+    self._reward_predicted_prob = reward_predicted_prob
     self._kw = {'units': units, 'winit': winit, **kw}
     if action_mode == 'cross_attn':
       self._decoder = TransformerDecoder(
@@ -246,6 +252,31 @@ class TSSM(nj.Module):
           feedforward_units=feedforward_units, dropout=dropout,
           norm_first=True, norm=True, name='encoder')
 
+  @property
+  def uses_reward(self):
+    return self._reward_mode != 'none'
+
+  def _reward_features(self, prev_state, stochastic, rewfn):
+    """Features for the previous reward: (symlog value, known flag).
+
+    The known flag lets a masked-out reward be distinguished from a reward
+    that is genuinely zero, so masking says 'unknown' rather than 'no reward'.
+    """
+    reward = cast(prev_state['reward'])
+    if stochastic and self._reward_predicted_prob > 0 and rewfn is not None:
+      predicted = sg(cast(rewfn(prev_state)))
+      use_pred = jax.random.uniform(
+          nj.rng(), reward.shape) < self._reward_predicted_prob
+      reward = jnp.where(use_pred, predicted, reward)
+    value = jaxutils.symlog(reward)
+    known = jnp.ones_like(value)
+    if stochastic and self._reward_mask_prob > 0:
+      masked = jax.random.uniform(
+          nj.rng(), reward.shape) < self._reward_mask_prob
+      value = jnp.where(masked, jnp.zeros_like(value), value)
+      known = jnp.where(masked, jnp.zeros_like(known), known)
+    return jnp.stack([value, known], -1)
+
   def initial(self, batch_size):
     state = dict(
         deter=jnp.zeros([batch_size, self._deter], f32),
@@ -256,12 +287,15 @@ class TSSM(nj.Module):
     if self._action_mode == 'cross_attn':
       state['action_context'] = jnp.zeros(
           [batch_size, self._tf_context_length, self._units], f32)
+    if self.uses_reward:
+      state['reward'] = jnp.zeros([batch_size], f32)
     deter = self.get('initial', jnp.zeros, state['deter'][0].shape, f32)
     state['deter'] = jnp.repeat(jnp.tanh(deter)[None], batch_size, 0)
     state['stoch'] = self._prior(cast(state['deter']), sample=True)['stoch']
     return cast(state)
 
-  def observe(self, embed, action, is_first, state=None):
+  def observe(self, embed, action, is_first, state=None, reward=None,
+              rewfn=None):
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
     if isinstance(action, dict):
       state = state or self.initial(list(action.values())[0].shape[0])
@@ -269,13 +303,19 @@ class TSSM(nj.Module):
     else:
       state = state or self.initial(action.shape[0])
       action = swap(action)
-    inputs = action, swap(embed), swap(is_first)
+    if self.uses_reward:
+      assert reward is not None, (
+          f'reward_mode={self._reward_mode} needs rewards passed to observe()')
+      inputs = action, swap(embed), swap(is_first), swap(reward)
+    else:
+      inputs = action, swap(embed), swap(is_first)
     post = jaxutils.scan(
-        lambda prev, inp: self.obs_step(prev, *inp), inputs, state, self._unroll)
+        lambda prev, inp: self.obs_step(prev, *inp, rewfn=rewfn),
+        inputs, state, self._unroll)
     post = {k: swap(v) for k, v in post.items()}
     return post
 
-  def imagine(self, action, state=None):
+  def imagine(self, action, state=None, rewfn=None):
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
     if isinstance(action, dict):
       state = state or self.initial(list(action.values())[0].shape[0])
@@ -283,32 +323,45 @@ class TSSM(nj.Module):
     else:
       state = state or self.initial(action.shape[0])
       action = swap(action)
-    prior = jaxutils.scan(self.img_step, action, state, self._unroll)
+    prior = jaxutils.scan(
+        lambda prev, act: self.img_step(prev, act, rewfn=rewfn),
+        action, state, self._unroll)
     prior = {k: swap(v) for k, v in prior.items()}
     return prior
 
-  def obs_step(self, prev_state, prev_action, embed, is_first, training=True):
+  def obs_step(self, prev_state, prev_action, embed, is_first, reward=None,
+               training=True, rewfn=None):
     prev_action = jaxutils.concat_dict(prev_action)
     prev_state, prev_action = tree_map(
         lambda prev, init: jaxutils.switch(is_first, init, prev),
         (prev_state, prev_action),
         (self.initial(len(is_first)), jnp.zeros_like(prev_action)))
-    next_state = self._step(prev_state, prev_action, training=training)
+    next_state = self._step(
+        prev_state, prev_action, training=training, rewfn=rewfn)
     deter = next_state['deter']
     x = jnp.concatenate([deter, embed], -1)
     x = self.get('obs_out', Linear, **self._kw)(x)
     stats = self._stats('obs_stats', x)
     stoch = self.get_dist(stats).sample(seed=nj.rng())
     post = {'stoch': stoch, **next_state, **stats}
+    if self.uses_reward:
+      # The reward observed at this step, consumed as an input one step later.
+      post['reward'] = reward
     return cast(post)
   
-  def img_step(self, prev_state, prev_action):
+  def img_step(self, prev_state, prev_action, rewfn=None):
     prev_action = jaxutils.concat_dict(prev_action)
-    next_state = self._step(prev_state, prev_action)
+    next_state = self._step(prev_state, prev_action, imagine=True)
     prior = self._prior(next_state['deter'], sample=True)
-    return cast({**prior, **next_state})
+    out = {**prior, **next_state}
+    if self.uses_reward:
+      out['reward'] = (
+          rewfn(out) if rewfn is not None
+          else jnp.zeros_like(prev_state['reward']))
+    return cast(out)
 
-  def _step(self, prev_state, prev_action, training=True):
+  def _step(self, prev_state, prev_action, training=True, rewfn=None,
+            imagine=False):
     prev_action = cast(prev_action)
     if self._action_clip > 0.0:
       prev_action *= sg(self._action_clip / jnp.maximum(
@@ -316,10 +369,13 @@ class TSSM(nj.Module):
     batch_shape = prev_state['deter'].shape[:-1]
     stoch_flat = prev_state['stoch'].reshape((*batch_shape, -1))
 
+    parts = [stoch_flat]
     if self._action_mode == 'concat':
-      x = jnp.concatenate([stoch_flat, prev_action.reshape((*batch_shape, -1))], -1)
-    else:
-      x = stoch_flat
+      parts.append(prev_action.reshape((*batch_shape, -1)))
+    if self._reward_mode == 'concat':
+      parts.append(self._reward_features(
+          prev_state, training and not imagine, rewfn))
+    x = jnp.concatenate(parts, -1) if len(parts) > 1 else stoch_flat
     new_embedding = self.get('projection_layer', Linear, **self._kw)(x)
     tf_context = jnp.concatenate(
         [prev_state['tf_context'][:, 1:], new_embedding[:, None, :]], axis=1)
@@ -381,18 +437,23 @@ class TSSM(nj.Module):
 
 class ObjectCentricTSSM(TSSM):
 
+  _reward_modes = ('none', 'slot')
+
   def __init__(
       self, num_slots, deter=512, units=512, stoch=32, classes=32,
       tf_context_length=16, tf_layers=4, tf_heads=8, feedforward_units=1024,
       dropout=0.0, unroll=False, unimix=0.01, action_clip=1.0,
-      action_mode='none', winit='normal', **kw):
+      action_mode='none', reward_mode='none', reward_mask_prob=0.0,
+      reward_predicted_prob=0.0, winit='normal', **kw):
     assert action_mode in ('none', 'slot', 'cross_attn'), action_mode
     super().__init__(
         deter=deter, units=units, stoch=stoch, classes=classes,
         tf_context_length=tf_context_length, tf_layers=tf_layers,
         tf_heads=tf_heads, feedforward_units=feedforward_units,
         dropout=dropout, unroll=unroll, unimix=unimix,
-        action_clip=action_clip, winit=winit, **kw)
+        action_clip=action_clip, reward_mode=reward_mode,
+        reward_mask_prob=reward_mask_prob,
+        reward_predicted_prob=reward_predicted_prob, winit=winit, **kw)
     from .transformer import ObjectCentricDynamicsTransformer
     self._num_slots = num_slots
     self._action_mode = action_mode
@@ -416,28 +477,18 @@ class ObjectCentricTSSM(TSSM):
     if self._action_mode in ('slot', 'cross_attn'):
       state['action_context'] = jnp.zeros(
           [batch_size, self._tf_context_length, self._units], f32)
+    if self.uses_reward:
+      state['reward'] = jnp.zeros([batch_size], f32)
+      state['reward_context'] = jnp.zeros(
+          [batch_size, self._tf_context_length, self._units], f32)
     init_deter = self.get(
         'initial', jnp.zeros, state['deter'][0].shape, f32)
     state['deter'] = jnp.repeat(jnp.tanh(init_deter)[None], batch_size, 0)
     state['stoch'] = self._prior(cast(state['deter']), sample=True)['stoch']
     return cast(state)
 
-  def obs_step(self, prev_state, prev_action, embed, is_first, training=True):
-    prev_action = jaxutils.concat_dict(prev_action)
-    prev_state, prev_action = tree_map(
-        lambda prev, init: jaxutils.switch(is_first, init, prev),
-        (prev_state, prev_action),
-        (self.initial(len(is_first)), jnp.zeros_like(prev_action)))
-    next_state = self._step(prev_state, prev_action, training=training)
-    deter = next_state['deter']  # (B, num_slots, units)
-    x = jnp.concatenate([deter, embed], -1)
-    x = self.get('obs_out', Linear, **self._kw)(x)
-    stats = self._stats('obs_stats', x)
-    stoch = self.get_dist(stats).sample(seed=nj.rng())
-    post = {'stoch': stoch, **next_state, **stats}
-    return cast(post)
-
-  def _step(self, prev_state, prev_action, training=True):
+  def _step(self, prev_state, prev_action, training=True, rewfn=None,
+            imagine=False):
     prev_action = cast(prev_action)
     if self._action_clip > 0.0:
       prev_action = prev_action * sg(self._action_clip / jnp.maximum(
@@ -463,10 +514,23 @@ class ObjectCentricTSSM(TSSM):
       action_context = jnp.concatenate(
           [prev_state['action_context'][:, 1:], action_embedding[:, None, :]], axis=1)
 
+    if self.uses_reward:
+      reward_embedding = self.get('reward_proj', Linear, **self._kw)(
+          self._reward_features(
+              prev_state, training and not imagine, rewfn))  # (B, units)
+      reward_context = jnp.concatenate(
+          [prev_state['reward_context'][:, 1:], reward_embedding[:, None, :]],
+          axis=1)
+
+    # Extra per-step tokens live after the slot tokens on the slot axis, so the
+    # first num_slots outputs stay aligned with the slots.
+    extra_tokens = []
     if self._action_mode == 'slot':
-      # Append action as an extra slot: (B, L, num_slots+1, units)
-      action_slots = action_context[:, :, None, :]
-      tf_input = jnp.concatenate([tf_context, action_slots], axis=2)
+      extra_tokens.append(action_context[:, :, None, :])
+    if self._reward_mode == 'slot':
+      extra_tokens.append(reward_context[:, :, None, :])
+    if extra_tokens:
+      tf_input = jnp.concatenate([tf_context, *extra_tokens], axis=2)
     else:
       tf_input = tf_context
 
@@ -477,13 +541,15 @@ class ObjectCentricTSSM(TSSM):
         key_padding_mask=key_pad_mask,
         training=training)
 
-    deter = out[:, -1]  # (B, num_slots[+1], units)
-    if self._action_mode == 'slot':
-      deter = deter[:, :-1]  # drop action slot
+    deter = out[:, -1]  # (B, num_slots[+extra], units)
+    if extra_tokens:
+      deter = deter[:, :self._num_slots]
 
     next_state = {'deter': cast(deter), 'tf_context': cast(tf_context), 'valid': valid}
     if self._action_mode in ('slot', 'cross_attn'):
       next_state['action_context'] = cast(action_context)
+    if self.uses_reward:
+      next_state['reward_context'] = cast(reward_context)
     return next_state
 
   def loss(self, post, free=1.0):

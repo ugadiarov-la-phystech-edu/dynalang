@@ -71,6 +71,10 @@ class Agent(nj.Module):
     if self.config.rssm_type == "token":
       latent = self.wm.rssm.obs_step(
           prev_latent, prev_action, embed, obs["token"], obs['is_first'])
+    elif self.wm.uses_reward_input:
+      latent = self.wm.rssm.obs_step(
+          prev_latent, prev_action, embed, obs['is_first'], obs['reward'],
+          training=(mode != 'eval'), rewfn=self.wm.rewfn)
     else:
       latent = self.wm.rssm.obs_step(
           prev_latent, prev_action, embed, obs['is_first'],
@@ -237,6 +241,31 @@ class WorldModel(nj.Module):
         for k, v in self.act_space.items()}
     return prev_latent, prev_action
 
+  @property
+  def uses_reward_input(self):
+    """Whether the dynamics consumes the previous reward as an input token."""
+    return getattr(self.rssm, 'uses_reward', False)
+
+  def rewfn(self, state):
+    """Reward prediction for a single-step state, shaped like the head expects.
+
+    The heads infer how many leading axes are batch dims from the rank of the
+    features, so a singleton time axis is added to match the trajectory case.
+    """
+    dist = self.heads['reward'](tree_map(lambda x: x[None], state))
+    return dist.mean()[0]
+
+  def _observe(self, embed, prev_actions, is_first, reward, state=None):
+    if not self.uses_reward_input:
+      return self.rssm.observe(embed, prev_actions, is_first, state)
+    return self.rssm.observe(
+        embed, prev_actions, is_first, state, reward=reward, rewfn=self.rewfn)
+
+  def _rssm_imagine(self, actions, start):
+    if not self.uses_reward_input:
+      return self.rssm.imagine(actions, start)
+    return self.rssm.imagine(actions, start, rewfn=self.rewfn)
+
   def train(self, data, state):
     for key in [x for x in self.config.zero_data_keys if x]:
       data[key] = jnp.zeros_like(data[key])
@@ -274,8 +303,8 @@ class WorldModel(nj.Module):
       post = self.rssm.observe(
           prev_actions, embed, data["token"], data['is_first'], prev_latent)
     else:
-      post = self.rssm.observe(
-          embed, prev_actions, data['is_first'], prev_latent)
+      post = self._observe(
+          embed, prev_actions, data['is_first'], data['reward'], prev_latent)
     dists = {}
     feats = {**post, 'embed': embed}
     for name, head in self.heads.items():
@@ -305,7 +334,7 @@ class WorldModel(nj.Module):
       context = {k: v[:, :-1].reshape((-1, *v.shape[2:]))
                  for k, v in post.items()}
       one_step_openl = self.heads["decoder"](
-        self.rssm.imagine(next_ac, context),
+        self._rssm_imagine(next_ac, context),
       )
       truth = data["token"][:, 1:].reshape((-1, 1, *data["token"].shape[2:]))
       nll = -(one_step_openl["token"].log_prob(truth)).mean(-1)
@@ -338,9 +367,15 @@ class WorldModel(nj.Module):
     action, carry = policy(state, carry)
     keys = list(state.keys()) + list(action.keys()) + list(carry.keys())
     assert len(set(keys)) == len(keys), ('Colliding keys', keys)
+    if self.uses_reward_input:
+      # The reward token feeds the next step, so it has to be predicted inside
+      # the rollout instead of once over the finished trajectory.
+      img_step = lambda s, a: self.rssm.img_step(s, a, rewfn=self.rewfn)
+    else:
+      img_step = self.rssm.img_step
     def step(prev, _):
       state, action, carry = prev
-      state = self.rssm.img_step(state, action)
+      state = img_step(state, action)
       action, carry = policy(state, carry)
       return state, action, carry
     states, actions, carries = jaxutils.scan(
@@ -377,17 +412,18 @@ class WorldModel(nj.Module):
           data['token'][:6, :5],
           data['is_first'][:6, :5])
     else:
-      context = self.rssm.observe(
+      context = self._observe(
           embed[:6, :5], 
           {k: data[k][:6, :5] for k in act_keys},
-          data['is_first'][:6, :5])
+          data['is_first'][:6, :5],
+          data['reward'][:6, :5])
     # context:
     # - deter (batch, prefix_len, rssm.deter)
     # - logit, stoch (batch, prefix_len, rssm.stoch, rssm.classes)
     start = {k: v[:, -1] for k, v in context.items()}
     recon = self.heads['decoder'](context)
     openl = self.heads['decoder'](
-        self.rssm.imagine({k: data[k][:6, 5:] for k in act_keys}, start),
+        self._rssm_imagine({k: data[k][:6, 5:] for k in act_keys}, start),
     )
     for key in self.heads['decoder'].cnn_shapes.keys():
       truth = data[key][:6].astype(jnp.float32)
@@ -416,14 +452,14 @@ class WorldModel(nj.Module):
               data[k][:, :-1]], 1)
           for k in act_keys}
       embed = self.encoder(data)
-      context = self.rssm.observe(
-          embed, prev_actions, data["is_first"])
+      context = self._observe(
+          embed, prev_actions, data["is_first"], data['reward'])
       # a_t is action out of o_t, cut off last timestep since we don't have truth
       context = {k: v[:, :-1].reshape((-1, *v.shape[2:])) for k, v in context.items()}
       next_ac = {k: data[k][:, :-1].reshape((-1, 1, *data[k].shape[2:]))
                  for k in act_keys}
       one_step_openl = self.heads["decoder"](
-        self.rssm.imagine(next_ac, context),
+        self._rssm_imagine(next_ac, context),
       )
       truth = data["token"][:, 1:].reshape((-1, 1, *data["token"].shape[2:]))
       nll = -(one_step_openl["token"].log_prob(truth)).mean(-1)
@@ -447,19 +483,20 @@ class WorldModel(nj.Module):
         for k in act_keys}
     embed = self.encoder(data)
 
-    context = self.rssm.observe(
-      embed=embed[:, :num_obs],
-      action={k: v[:, :num_obs] for k, v in prev_actions.items()},
-      is_first=data["is_first"][:, :num_obs])
+    context = self._observe(
+      embed[:, :num_obs],
+      {k: v[:, :num_obs] for k, v in prev_actions.items()},
+      data["is_first"][:, :num_obs],
+      data['reward'][:, :num_obs])
     start = {k: v[:, -1] for k, v in context.items()}
     recon = self.heads['decoder'](context)
     end = num_obs + num_imagine
     openl = self.heads['decoder'](
-      self.rssm.imagine(
+      self._rssm_imagine(
           {k: data[k][:, num_obs-1:end] for k in act_keys}, start),
     )
     reward = self.heads['reward'](
-      self.rssm.imagine(
+      self._rssm_imagine(
           {k: data[k][:, num_obs-1:end] for k in act_keys}, start),
     )
     return recon, openl, reward
