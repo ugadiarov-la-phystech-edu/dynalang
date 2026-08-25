@@ -217,13 +217,19 @@ class RSSM(nj.Module):
 
 class TSSM(nj.Module):
 
+  # 'none' keeps deter out of the recurrence, so only the discrete stoch sample
+  # crosses the step boundary. 'detached' adds deter as a forward-only channel;
+  # 'grad' also lets gradients flow along the resulting step-to-step chain.
+  _deter_feedbacks = ('none', 'detached', 'grad')
+
   def __init__(
       self, deter=512, units=512, stoch=32, classes=32, tf_context_length=16,
       tf_layers=4, tf_heads=8, feedforward_units=1024, dropout=0.0,
       unroll=False, unimix=0.01, action_clip=1.0, action_mode='concat',
-      winit='normal', **kw):
+      deter_feedback='none', winit='normal', **kw):
     assert deter == units, (deter, units)
     assert action_mode in ('none', 'concat', 'cross_attn'), action_mode
+    assert deter_feedback in self._deter_feedbacks, deter_feedback
     from .transformer import TransformerEncoder, TransformerDecoder
     self._deter = deter
     self._units = units
@@ -234,6 +240,7 @@ class TSSM(nj.Module):
     self._unimix = unimix
     self._action_clip = action_clip
     self._action_mode = action_mode
+    self._deter_feedback = deter_feedback
     self._kw = {'units': units, 'winit': winit, **kw}
     if action_mode == 'cross_attn':
       self._decoder = TransformerDecoder(
@@ -308,6 +315,15 @@ class TSSM(nj.Module):
     prior = self._prior(next_state['deter'], sample=True)
     return cast({**prior, **next_state})
 
+  def _deter_parts(self, prev_state):
+    """Previous deter as an extra input; empty when the channel is disabled."""
+    if self._deter_feedback == 'none':
+      return []
+    prev_deter = prev_state['deter']
+    if self._deter_feedback == 'detached':
+      prev_deter = sg(prev_deter)
+    return [prev_deter]
+
   def _step(self, prev_state, prev_action, training=True):
     prev_action = cast(prev_action)
     if self._action_clip > 0.0:
@@ -316,10 +332,11 @@ class TSSM(nj.Module):
     batch_shape = prev_state['deter'].shape[:-1]
     stoch_flat = prev_state['stoch'].reshape((*batch_shape, -1))
 
+    parts = [stoch_flat]
     if self._action_mode == 'concat':
-      x = jnp.concatenate([stoch_flat, prev_action.reshape((*batch_shape, -1))], -1)
-    else:
-      x = stoch_flat
+      parts.append(prev_action.reshape((*batch_shape, -1)))
+    parts.extend(self._deter_parts(prev_state))
+    x = jnp.concatenate(parts, -1) if len(parts) > 1 else stoch_flat
     new_embedding = self.get('projection_layer', Linear, **self._kw)(x)
     tf_context = jnp.concatenate(
         [prev_state['tf_context'][:, 1:], new_embedding[:, None, :]], axis=1)
@@ -385,14 +402,15 @@ class ObjectCentricTSSM(TSSM):
       self, num_slots, deter=512, units=512, stoch=32, classes=32,
       tf_context_length=16, tf_layers=4, tf_heads=8, feedforward_units=1024,
       dropout=0.0, unroll=False, unimix=0.01, action_clip=1.0,
-      action_mode='none', winit='normal', **kw):
+      action_mode='none', deter_feedback='none', winit='normal', **kw):
     assert action_mode in ('none', 'slot', 'cross_attn'), action_mode
     super().__init__(
         deter=deter, units=units, stoch=stoch, classes=classes,
         tf_context_length=tf_context_length, tf_layers=tf_layers,
         tf_heads=tf_heads, feedforward_units=feedforward_units,
         dropout=dropout, unroll=unroll, unimix=unimix,
-        action_clip=action_clip, winit=winit, **kw)
+        action_clip=action_clip, deter_feedback=deter_feedback,
+        winit=winit, **kw)
     from .transformer import ObjectCentricDynamicsTransformer
     self._num_slots = num_slots
     self._action_mode = action_mode
@@ -445,8 +463,12 @@ class ObjectCentricTSSM(TSSM):
     batch_shape = prev_state['deter'].shape[:-2]
     stoch_flat = prev_state['stoch'].reshape(
         (*batch_shape, self._num_slots, -1))  # (B, num_slots, stoch*classes)
+    # Each slot is paired with its own previous deter, so slots stay separate
+    # here and only start interacting inside the transformer.
+    parts = [stoch_flat] + self._deter_parts(prev_state)
+    x = jnp.concatenate(parts, -1) if len(parts) > 1 else stoch_flat
     new_slot_embed = self.get('projection_layer', Linear, **self._kw)(
-        stoch_flat)  # (B, num_slots, units)
+        x)  # (B, num_slots, units)
 
     tf_context = jnp.concatenate(
         [prev_state['tf_context'][:, 1:], new_slot_embed[:, None, :, :]], axis=1)
