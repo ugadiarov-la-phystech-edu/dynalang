@@ -260,7 +260,7 @@ class WorldModel(nj.Module):
     metrics.update(mets)
     return state, outs, metrics
 
-  def loss(self, data, state):
+  def loss(self, data, state, full_metrics=False):
     embed = self.encoder(
       data,
       zero_mlp=self.config.zero_mlp,
@@ -326,7 +326,8 @@ class WorldModel(nj.Module):
     last_latent = {k: v[:, -1] for k, v in post.items()}
     last_action = {k: data[k][:, -1] for k in self.act_space}
     state = last_latent, last_action
-    metrics = self._metrics(data, dists, post, prior, losses, model_loss)
+    metrics = self._metrics(
+        data, dists, post, prior, losses, model_loss, full_metrics)
     return model_loss.mean() + lm_loss, (state, out, metrics)
 
   def imagine(self, policy, start, horizon, carry=None):
@@ -366,7 +367,7 @@ class WorldModel(nj.Module):
     # data: dict, each val with shape (batch, length, <obs shape>)
     state = self.initial(len(data['is_first']))
     report = {}
-    report.update(self.loss(data, state)[-1][-1])
+    report.update(self.loss(data, state, full_metrics=True)[-1][-1])
     
     embed = self.encoder(data)
     act_keys = list(self.act_space.keys())
@@ -464,13 +465,16 @@ class WorldModel(nj.Module):
     )
     return recon, openl, reward
   
-  def _metrics(self, data, dists, post, prior, losses, model_loss):
+  def _metrics(self, data, dists, post, prior, losses, model_loss, full=False):
     entropy = lambda feat: self.rssm.get_dist(feat).entropy()
     metrics = {}
     metrics.update(jaxutils.tensorstats(entropy(prior), 'prior_ent'))
     metrics.update(jaxutils.tensorstats(entropy(post), 'post_ent'))
     metrics.update({f'{k}_loss_mean': v.mean() for k, v in losses.items()})
     metrics.update({f'{k}_loss_std': v.std() for k, v in losses.items()})
+    metrics.update(self._kl_metrics(post, prior))
+    if full:
+      metrics.update(self._prior_loss_metrics(data, prior, losses))
     metrics['model_loss_mean'] = model_loss.mean()
     metrics['model_loss_std'] = model_loss.std()
     metrics['reward_max_data'] = jnp.abs(data['reward']).max()
@@ -481,6 +485,61 @@ class WorldModel(nj.Module):
     if 'cont' in dists and not self.config.jax.debug_nans:
       stats = jaxutils.balance_stats(dists['cont'], data['cont'], 0.5)
       metrics.update({f'cont_{k}': v for k, v in stats.items()})
+    return metrics
+
+  def _kl_metrics(self, post, prior):
+    """The posterior-prior KL as the loss sees it before reducing it.
+
+    `dyn_loss` and `rep_loss` are the same KL up to where `sg()` sits, and the
+    object-centric dynamics averages it over slots and then clips it at
+    `rssm_loss.free`. Both steps hide where the error is: a text slot off by
+    ten nats and seven object slots near zero look the same as a uniform
+    mistake, and any slot under the clip contributes no gradient at all.
+    """
+    kl = self.rssm.get_dist(sg(post)).kl_divergence(self.rssm.get_dist(prior))
+    metrics = {'dyn_kl_mean': kl.mean(), 'dyn_kl_max': kl.max()}
+    free = self.config.rssm_loss.free if 'free' in self.config.rssm_loss else 0
+    if free:
+      # How often the term the loss actually clips lands inside the clip.
+      reduced = kl.mean(-1) if kl.ndim > 2 else kl
+      metrics['dyn_kl_free_frac'] = (reduced < free).astype(jnp.float32).mean()
+    if kl.ndim > 2:
+      # (batch, time, slots), and the encoder appends the text slot last.
+      for slot in range(kl.shape[-1]):
+        metrics[f'dyn_kl_slot{slot}'] = kl[..., slot].mean()
+    return metrics
+
+  def _prior_loss_metrics(self, data, prior, losses):
+    """Head losses recomputed on one-step prior features.
+
+    The heads are trained on posterior features only, so this is the training
+    time version of the `prior1` regime of the imagination eval: `deter` is the
+    posterior's own and only `stoch` is predicted, so the gap against the
+    posterior loss says how much each head suffers from that single guess.
+
+    Only reported, never computed during a train step: each head listed here
+    runs a second forward pass, and on the object-centric config the reward and
+    cont heads are a quarter of the world model's weights between them.
+    """
+    if 'prior_loss_heads' not in self.config:
+      return {}  # Checkpoints written before this metric existed.
+    names = [k for k in self.config.prior_loss_heads if k in self.heads]
+    if not names:
+      return {}
+    # `_prior` leaves `stoch` empty when it does not sample; the mode keeps the
+    # metric deterministic instead of spending a random key on it.
+    stoch = jaxutils.cast_to_compute(self.rssm.get_dist(prior).mode())
+    feats = sg({**prior, 'stoch': stoch})
+    metrics = {}
+    for name in names:
+      out = self.heads[name](feats)
+      out = out if isinstance(out, dict) else {name: out}
+      for key, dist in out.items():
+        if key not in losses:
+          continue
+        loss = -dist.log_prob(data[key].astype(jnp.float32))
+        metrics[f'{key}_prior_loss_mean'] = loss.mean()
+        metrics[f'{key}_prior_loss_gap'] = loss.mean() - losses[key].mean()
     return metrics
 
 

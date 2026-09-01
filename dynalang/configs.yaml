@@ -149,6 +149,10 @@ defaults:
     transformer: {layers: 2, heads: 8, ffup: 4, act: silu, norm: layer, dropout: 0.1, output: binary}
   loss_scales: {image: 1.0, vector: 1.0, reward: 1.0, cont: 1.0, dyn: 0.5, rep: 0.1, actor: 1.0, critic: 1.0, slowreg: 1.0, token: 1.0, lm: 0.0}
   rssm_loss: {free: 1.0}
+  # Heads to also evaluate on prior features for logging; [''] turns it off.
+  # The decoder doubles its own cost, so it is left out unless the token or
+  # slot gap is the question.
+  prior_loss_heads: [reward, cont]
   model_opt: {opt: adam, lr: 1e-4, eps: 1e-8, clip: 1000.0, wd: 0.0, warmup: 0, lateclip: 0.0, frozen_keys: '^$'}
   skip_cnn_training: False
   skip_mlp_training: False
