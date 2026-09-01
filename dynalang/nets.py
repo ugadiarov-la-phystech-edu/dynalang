@@ -803,8 +803,11 @@ class MultiEncoder(nj.Module):
       self, shapes, cnn_keys=r'.*', mlp_keys=r'.*', mlp_layers=4,
       mlp_units=512, cnn='resize', cnn_depth=48,
       cnn_blocks=2, resize='stride',
-      symlog_inputs=False, minres=4, **kw):
+      symlog_inputs=False, minres=4, flatten_slots=False, **kw):
     excluded = ('is_first', 'is_last')
+    # Only the object-centric dynamics consumes a slot axis; every other one
+    # takes a single vector per step and would fail on the extra dimension.
+    self._flatten_slots = flatten_slots
     shapes = {k: v for k, v in shapes.items() if (
         k not in excluded and not k.startswith('log_'))}
     self.slot_shapes = {k: v for k, v in shapes.items() if k == 'slot'}
@@ -868,7 +871,14 @@ class MultiEncoder(nj.Module):
     elif 'image' in result and 'text' in result:
       result['image'] = jnp.concatenate([result['image'], result['text']], axis=-1)
 
-    return result['slot'] if 'slot' in result else result['image']
+    if 'slot' not in result:
+      return result['image']
+    slots = result['slot']
+    if self._flatten_slots:
+      # Slot order is fixed, so folding the axis into features keeps the same
+      # information and only hides the structure from the dynamics.
+      return slots.reshape(slots.shape[:-2] + (-1,))
+    return slots
 
 
 
@@ -878,8 +888,11 @@ class MultiDecoder(nj.Module):
       self, shapes, inputs=['tensor'], cnn_keys=r'.*', mlp_keys=r'.*',
       mlp_layers=4, mlp_units=512, cnn='resize', cnn_depth=48, cnn_blocks=2,
       image_dist='mse', vector_dist='mse', resize='stride', bins=255,
-      outscale=1.0, minres=4, cnn_sigmoid=False, **kw):
+      outscale=1.0, minres=4, cnn_sigmoid=False, flatten_slots=False, **kw):
     excluded = ('is_first', 'is_last', 'is_terminal', 'reward')
+    # Mirrors the encoder: without a slot axis in the latent, the slots are
+    # read out of the whole vector instead of one at a time.
+    self._flatten_slots = flatten_slots
     shapes = {k: v for k, v in shapes.items() if k not in excluded}
     self.slot_shapes = {k: v for k, v in shapes.items() if k == 'slot'}
     self.cnn_shapes = {
@@ -919,11 +932,20 @@ class MultiDecoder(nj.Module):
     if self.slot_shapes:
       shape = self.slot_shapes['slot']
       n_obj_slots = shape[0]
-      # features may have more slots than the ground truth (e.g. +1 text slot);
-      # reconstruct only the first n_obj_slots entries.
-      obj_features = features[..., :n_obj_slots, :]
-      projector = self.get('slot_proj', Linear, shape[-1], act='none')
-      slot_mean = projector(obj_features)
+      if self._flatten_slots:
+        # One map to all slots at once, the way the image decoder emits every
+        # pixel at once. Per-slot weight sharing would need its own hidden
+        # layer over the full latent and would cost more, not less.
+        projector = self.get(
+            'slot_proj', Linear, n_obj_slots * shape[-1], act='none')
+        slot_mean = projector(features).reshape(
+            features.shape[:-1] + (n_obj_slots, shape[-1]))
+      else:
+        # features may have more slots than the ground truth (e.g. +1 text slot);
+        # reconstruct only the first n_obj_slots entries.
+        obj_features = features[..., :n_obj_slots, :]
+        projector = self.get('slot_proj', Linear, shape[-1], act='none')
+        slot_mean = projector(obj_features)
       dists['slot'] = jaxutils.MSEDist(slot_mean, 2, 'sum')
 
     if self.cnn_shapes:
@@ -939,7 +961,7 @@ class MultiDecoder(nj.Module):
           key: self._make_image_dist(key, mean)
           for (key, shape), mean in zip(self.cnn_shapes.items(), means)})
     if self.mlp_shapes:
-      if self.slot_shapes:
+      if self.slot_shapes and not self._flatten_slots:
         # Text observations are encoded as the last slot
         n_obj_slots = self.slot_shapes['slot'][0]
         mlp_features = features[..., n_obj_slots:, :].reshape(

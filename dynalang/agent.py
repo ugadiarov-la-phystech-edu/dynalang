@@ -167,7 +167,11 @@ class WorldModel(nj.Module):
     self.config = config
 #    shapes = {k: tuple(v.shape) for k, v in obs_space.items()}
 #    shapes = {k: v for k, v in shapes.items() if not k.startswith('log_')}
-    self.encoder = nets.MultiEncoder(shapes, **config.encoder, name='enc')
+    # Slot observations keep their slot axis only for the object-centric
+    # dynamics; the others read one vector per step.
+    flatten_slots = self.config.rssm_type != 'octssm'
+    self.encoder = nets.MultiEncoder(
+        shapes, **config.encoder, flatten_slots=flatten_slots, name='enc')
     if self.config.rssm_type == 'rssm':
       self.rssm = nets.RSSM(**config.rssm, name='rssm')
     elif self.config.rssm_type == 'early':
@@ -218,7 +222,9 @@ class WorldModel(nj.Module):
       raise NotImplementedError(f'cont_head.typ: {self.config.cont_head.typ}')
     
     self.heads = {
-        'decoder': nets.MultiDecoder(shapes, **config.decoder, name='dec'),
+        'decoder': nets.MultiDecoder(
+            shapes, **config.decoder, flatten_slots=flatten_slots,
+            name='dec'),
         'reward': reward_head,
         'cont': cont_head}
     self.opt = jaxutils.Optimizer(name='model_opt', **config.model_opt)

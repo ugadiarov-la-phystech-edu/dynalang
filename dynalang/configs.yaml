@@ -422,6 +422,14 @@ deter_feedback:
   tssm.deter_feedback: detached
   octssm.deter_feedback: detached
 
+# The GRU dynamics on SlotContrast slots: the slot axis is folded into one
+# vector per step and the decoder reads every slot back out of the flat latent.
+# The sizes are the image RSSM baseline's, so the only difference against it is
+# what the encoder sees, and the only difference against octssm is recurrence.
+rssm_slots:
+  rssm_type: rssm
+  rssm: {deter: 512, units: 512}
+
 # Reward is ~0.1% of the model loss at the default scale because positives are
 # under 1% of steps. Matches dyn_reward_coef in STICA.
 reward_scale:
