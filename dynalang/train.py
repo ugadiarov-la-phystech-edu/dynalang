@@ -257,29 +257,31 @@ def make_slot_extractor(config):
   
   if typ == 'slotcontrast':
     from embodied.torch.ocr.slotcontrast.slotcontrast_extractor import SlotContrastExtractor
-    cls = SlotContrastExtractor
+    # Get image size from environment config
+    suite, task = config.task.split('_', 1)
+    image_size = config.env.get(suite, {}).get('size', (64, 64))
+    if isinstance(image_size, (list, tuple)):
+      image_size = image_size[0]  # Assume square images
+    return SlotContrastExtractor(
+        config_path=slot_config.config_path,
+        checkpoint_path=slot_config.checkpoint_path,
+        image_size=image_size,
+        device=slot_config.get('device', 'cuda'),
+        backbone_input_size=slot_config.get('backbone_input_size', 0)
+    )
+  elif typ == 'solv_sam':
+    from embodied.torch.ocr.solvsam.solvsam_extractor import SolvSamExtractor
+    return SolvSamExtractor(
+        checkpoint_path=slot_config.checkpoint_path,
+        device=slot_config.get('device', 'cuda'),
+        cosmos_checkpoint_dir=slot_config.get('cosmos_checkpoint_dir', ''),
+    )
   elif typ == 'dinov2saur':
     raise NotImplementedError("DINOv2-Saur extractor not implemented yet")
   elif typ == 'slate':
     raise NotImplementedError("SLATE extractor not implemented yet")
   else:
     raise ValueError(f'Unknown slot extractor type: {typ}')
-  
-  # Get image size from environment config
-  suite, task = config.task.split('_', 1)
-  image_size = config.env.get(suite, {}).get('size', (64, 64))
-  if isinstance(image_size, (list, tuple)):
-    image_size = image_size[0]  # Assume square images
-  
-  extractor = cls(
-      config_path=slot_config.config_path,
-      checkpoint_path=slot_config.checkpoint_path,
-      image_size=image_size,
-      device=slot_config.get('device', 'cuda'),
-      backbone_input_size=slot_config.get('backbone_input_size', 0)
-  )
-  
-  return extractor
 
 
 def wrapped_env(config, batch, is_eval=False, **overrides):

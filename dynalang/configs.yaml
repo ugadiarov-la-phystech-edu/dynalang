@@ -26,6 +26,7 @@ defaults:
     type: slotcontrast 
     config_path: ''
     checkpoint_path: ''
+    cosmos_checkpoint_dir: ''
     device: cuda
     backbone_input_size: 0
     image_key: image
@@ -462,5 +463,25 @@ slotcontrast:
     flatten_slots: False
   
   # Slots are handled specially; mlp_keys='$^' disables vector MLP (override for text).
+  encoder: {mlp_keys: '$^', cnn_keys: '$^'}
+  decoder: {mlp_keys: '$^', cnn_keys: '$^'}
+
+solv_sam:
+  use_slot_extractor: True
+  slot_extractor:
+    type: solv_sam
+    checkpoint_path: /path/to/causal/checkpoint.pt
+    # Only needed for Cosmos backbones: directory holding their encoder.jit.
+    # A decoder.jit next to it is optional and only renders slots as pixels
+    # in the training report.
+    cosmos_checkpoint_dir: ''
+    device: cuda
+    image_key: image
+    use_previous_slots: True
+    # Re-running the extractor on the first frame would look like a second
+    # time step to the causal temporal binder.
+    initialize_twice: False
+    flatten_slots: False
+
   encoder: {mlp_keys: '$^', cnn_keys: '$^'}
   decoder: {mlp_keys: '$^', cnn_keys: '$^'}

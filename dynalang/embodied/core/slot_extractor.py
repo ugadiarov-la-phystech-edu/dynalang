@@ -58,18 +58,14 @@ class SlotExtractor(ABC):
     
     Args:
       images: Batch of images, shape (B, H, W, C) or (B, C, H, W)
-      previous_slots: Recurrent carry state for initialization, shape
-                     (B, n_slots, dim) or None. This should be the
-                     `predicted` value returned by the previous call,
-                     not the `slots` observation it returned.
+      previous_slots: Opaque recurrent carry returned by the previous call,
+        with batch dimension first in every array leaf, or None.
     
     Returns:
       slots: Extracted slots, shape (B, n_slots, dim), suitable as an
         observation.
-      predicted: The recurrent carry state, shape (B, n_slots, dim),
-        suitable as `previous_slots` on the next call. For models
-        without a separate transition/predictor step, this can simply
-        equal `slots`.
+      predicted: Opaque recurrent carry suitable as `previous_slots` on the
+        next call. For models without separate state, this can equal `slots`.
     """
     pass
   
@@ -86,15 +82,13 @@ class SlotExtractor(ABC):
     Args:
       images: Images in format (H, W, C) or (B, H, W, C),
               dtype uint8 [0, 255]
-      previous_slots: Recurrent carry (n_slots, dim) or (B, n_slots, dim).
-              This should be the `predicted` value returned by a previous
-              call
+      previous_slots: Opaque recurrent carry returned by a previous call.
+        Every array leaf is unbatched for one image and batched otherwise.
       to_numpy: Convert result to numpy array
     
     Returns:
       slots: shape (n_slots, dim) or (B, n_slots, dim)
-      predicted: same shape as `slots`, the carry to pass back in as
-              `previous_slots` on the next call
+      predicted: Opaque carry to pass back as `previous_slots`.
     """
     # Determine single image or batch
     one_image = len(images.shape) == 3
@@ -103,16 +97,24 @@ class SlotExtractor(ABC):
     else:
       batch_images = images  # (B, H, W, C)
     
-    # Handle previous_slots
+    def _tree_map(fn, value):
+      if isinstance(value, dict):
+        return {key: _tree_map(fn, item) for key, item in value.items()}
+      if isinstance(value, tuple):
+        return tuple(_tree_map(fn, item) for item in value)
+      if isinstance(value, list):
+        return [_tree_map(fn, item) for item in value]
+      return fn(value)
+
     if previous_slots is not None and one_image:
-      batch_prev_slots = previous_slots[np.newaxis, ...]
+      batch_prev_slots = _tree_map(lambda x: x[np.newaxis, ...], previous_slots)
     else:
       batch_prev_slots = previous_slots
     
     # Call slot extraction
     slots, predicted = self(batch_images, previous_slots=batch_prev_slots)
 
-    def _postprocess(x):
+    def _postprocess_leaf(x):
       if one_image:
         x = x[0]
       if to_numpy:
@@ -122,7 +124,10 @@ class SlotExtractor(ABC):
           x = x.detach().cpu().numpy()
       return x
 
-    return _postprocess(slots), _postprocess(predicted)
+    return (
+        _tree_map(_postprocess_leaf, slots),
+        _tree_map(_postprocess_leaf, predicted),
+    )
 
 
 class DummySlotExtractor(SlotExtractor):

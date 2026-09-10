@@ -10,6 +10,45 @@ from . import space as spacelib
 from .batch_env import BatchEnv
 
 
+def _tree_take(tree, indices):
+  if tree is None:
+    return None
+  if isinstance(tree, dict):
+    return {key: _tree_take(value, indices) for key, value in tree.items()}
+  if isinstance(tree, tuple):
+    return tuple(_tree_take(value, indices) for value in tree)
+  if isinstance(tree, list):
+    return [_tree_take(value, indices) for value in tree]
+  return tree[indices]
+
+
+def _tree_scatter(tree, indices, values, batch_size):
+  if values is None:
+    return tree
+  if isinstance(values, dict):
+    current = tree or {}
+    return {
+        key: _tree_scatter(current.get(key), indices, value, batch_size)
+        for key, value in values.items()
+    }
+  if isinstance(values, tuple):
+    current = tree or (None,) * len(values)
+    return tuple(
+        _tree_scatter(old, indices, value, batch_size)
+        for old, value in zip(current, values)
+    )
+  if isinstance(values, list):
+    current = tree or [None] * len(values)
+    return [
+        _tree_scatter(old, indices, value, batch_size)
+        for old, value in zip(current, values)
+    ]
+  if tree is None:
+    tree = np.zeros((batch_size,) + values.shape[1:], dtype=values.dtype)
+  tree[indices] = values
+  return tree
+
+
 class BatchSlotExtractorEnv(BatchEnv):
   """
   Batch environment that automatically extracts slots from images.
@@ -52,11 +91,7 @@ class BatchSlotExtractorEnv(BatchEnv):
           f"Available keys: {list(super().obs_space.keys())}"
       )
 
-    n_envs = len(self._envs)
-    self._previous_slots = np.zeros(
-        (n_envs, slot_extractor.n_slots, slot_extractor.dim),
-        dtype=np.float32
-    )
+    self._previous_state = None
   
   @functools.cached_property
   def obs_space(self):
@@ -90,10 +125,12 @@ class BatchSlotExtractorEnv(BatchEnv):
     
     if self._use_previous_slots:
       is_first = obs['is_first']
-      slots = np.zeros_like(self._previous_slots)
-      # This is what should be threaded through as `previous_slots` on the
-      # next step to correctly use the trained transition model.
-      carry = np.zeros_like(self._previous_slots)
+      n_envs = len(self._envs)
+      slots = np.zeros(
+          (n_envs, self._slot_extractor.n_slots, self._slot_extractor.dim),
+          dtype=np.float32,
+      )
+      next_state = None
       
       if is_first.any():
         first_images = images[is_first]
@@ -103,7 +140,6 @@ class BatchSlotExtractorEnv(BatchEnv):
             to_numpy=True,
         )
         slots[is_first] = first_slots
-        carry[is_first] = first_carry
         
         if self._initialize_twice:
           second_slots, second_carry = self._slot_extractor.get_slots(
@@ -112,20 +148,29 @@ class BatchSlotExtractorEnv(BatchEnv):
               to_numpy=True,
           )
           slots[is_first] = second_slots
-          carry[is_first] = second_carry
+          first_carry = second_carry
+        next_state = _tree_scatter(
+            next_state, is_first, first_carry, n_envs
+        )
       
       if not is_first.all():
+        if self._previous_state is None:
+          raise RuntimeError(
+              "slot extractor has continuing environments but no recurrent state"
+          )
         continuing_images = images[~is_first]
-        continuing_prev_carry = self._previous_slots[~is_first]
+        continuing_prev_carry = _tree_take(self._previous_state, ~is_first)
         continuing_slots, continuing_carry = self._slot_extractor.get_slots(
             continuing_images,
             previous_slots=continuing_prev_carry,
             to_numpy=True,
         )
         slots[~is_first] = continuing_slots
-        carry[~is_first] = continuing_carry
+        next_state = _tree_scatter(
+            next_state, ~is_first, continuing_carry, n_envs
+        )
       
-      self._previous_slots = carry.copy()
+      self._previous_state = next_state
     
     else:
       slots, _ = self._slot_extractor.get_slots(

@@ -1,11 +1,12 @@
-"""Adds SlotContrast-vs-world-model mask comparisons to agent.report()'s
-output during training (report/openl_slot_mask_overlay,
-report/openl_slots_grid_soft, report/openl_slots_grid_hard), mirroring the
-truth/model/error convention of agent.py's own openl_{cnn_key} videos.
+"""Adds extractor-vs-world-model mask comparisons to agent.report()'s output
+during training (report/openl_slot_mask_overlay, report/openl_slots_grid_soft,
+report/openl_slots_grid_hard, and report/openl_slot_rgb where the extractor can
+render slots as pixels), mirroring the truth/model/error convention of
+agent.py's own openl_{cnn_key} videos.
 
 Both the real ('slot'/'flatten_slots') and world-model-predicted
 ('model_slot_raw') slot vectors are decoded into per-patch masks via the
-extractor's frozen SlotContrast decoder -- the only way to get a spatial
+extractor's frozen decoder -- the only way to get a spatial
 mask for the world model's own prediction, since it only ever
 sees/predicts slot vectors, never patch features. Runs as a plain-Python
 post-processing step since it needs torch calls that can't happen inside
@@ -154,6 +155,35 @@ def _rgb_error_panel(truth_img, model_img):
   return np.clip(error * 255.0, 0, 255).astype(np.uint8)
 
 
+def _match_size(image, height, width):
+  from PIL import Image as PILImage
+  if image.shape[:2] == (height, width):
+    return image
+  return np.asarray(
+      PILImage.fromarray(image).resize((width, height), PILImage.BILINEAR))
+
+
+def rgb_comparison_frame(image, real_rgb, model_rgb, scale=4):
+  """image | slots rendered as pixels | the same for the model's slots | error.
+
+  The reconstructions come out at the encoder's own resolution, so they are
+  brought down to the frame's size rather than the frame up to theirs; that
+  keeps the error panel about the content and not about interpolation.
+  """
+  h, w = image.shape[:2]
+  real_rgb = _match_size(real_rgb, h, w)
+  model_rgb = _match_size(model_rgb, h, w)
+  error = _rgb_error_panel(real_rgb, model_rgb)
+  gray = (128, 128, 128)
+  panels = [
+      _label_panel(_upscale(image, scale), gray, 'image'),
+      _label_panel(_upscale(real_rgb, scale), gray, 'truth rec'),
+      _label_panel(_upscale(model_rgb, scale), gray, 'model rec'),
+      _label_panel(_upscale(error, scale), gray, 'error'),
+  ]
+  return np.concatenate(panels, axis=1)
+
+
 def overlay_comparison_frame(image, real_masks, wm_masks, scale=4):
   """image | truth argmax overlay | model argmax overlay | their error."""
   truth_overlay = masks_to_overlay(image, real_masks)
@@ -169,7 +199,8 @@ def overlay_comparison_frame(image, real_masks, wm_masks, scale=4):
   return np.concatenate(panels, axis=1)
 
 
-def add_slot_mask_report(env, report, batch, seq_idx=0, max_frames=60):
+def add_slot_mask_report(
+    env, report, batch, seq_idx=0, max_frames=60, max_rgb_frames=16):
   model_slot_raw = report.pop('model_slot_raw', None)
   extractor = getattr(env, '_slot_extractor', None)
   if extractor is None or extractor.decoder is None:
@@ -218,5 +249,15 @@ def add_slot_mask_report(env, report, batch, seq_idx=0, max_frames=60):
   report['openl_slots_grid_hard'] = np.stack([
       combined_slot_grid(images[i], real_masks[i], wm_masks[i], hard=True)
       for i in range(t_len)], 0)
+
+  # Rendering pixels runs the backbone's decoder over every frame, which costs
+  # far more than the mask decode, so it covers a shorter window.
+  if getattr(extractor, 'can_decode_images', False):
+    rgb_len = min(t_len, max_rgb_frames)
+    real_rgb = extractor.decode_images(real_slots[:rgb_len])
+    model_rgb = extractor.decode_images(model_slots[:rgb_len])
+    report['openl_slot_rgb'] = np.stack([
+        rgb_comparison_frame(images[i], real_rgb[i], model_rgb[i])
+        for i in range(rgb_len)], 0)
 
   return report

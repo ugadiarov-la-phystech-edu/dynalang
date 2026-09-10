@@ -41,6 +41,11 @@ cuda = [
     "jax-cuda12-plugin==0.4.33",
     "jax-cuda12-pjrt==0.4.33",
 ]
+solv-sam = [
+    # Only the DINOv2 backbone needs this; Cosmos backbones load from a
+    # TorchScript encoder and need nothing beyond torch.
+    "transformers",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
