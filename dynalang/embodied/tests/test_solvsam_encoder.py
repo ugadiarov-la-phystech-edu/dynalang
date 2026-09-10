@@ -53,15 +53,13 @@ class FakeCosmosDecoder(nn.Module):
     return self.conv(latent)
 
 
-def write_cosmos_jit(directory, config, with_decoder=True):
+def write_cosmos_jit(directory, config, with_decoder=True, dtype=torch.float32):
   directory.mkdir(parents=True, exist_ok=True)
-  torch.jit.save(
-      torch.jit.script(FakeCosmosEncoder(config.patch_size, config.token_dim)),
-      directory / 'encoder.jit')
+  encoder = FakeCosmosEncoder(config.patch_size, config.token_dim).to(dtype)
+  torch.jit.save(torch.jit.script(encoder), directory / 'encoder.jit')
   if with_decoder:
-    torch.jit.save(
-        torch.jit.script(FakeCosmosDecoder(config.patch_size, config.token_dim)),
-        directory / 'decoder.jit')
+    decoder = FakeCosmosDecoder(config.patch_size, config.token_dim).to(dtype)
+    torch.jit.save(torch.jit.script(decoder), directory / 'decoder.jit')
   return directory
 
 
@@ -241,6 +239,25 @@ def test_cosmos_backbone_encodes_and_renders(tmp_path):
 
   single = encoder.decode_rgb(slots[0])
   assert single.shape == (3,) + config.resize_to
+
+
+def test_cosmos_weights_are_cast_to_float32(tmp_path):
+  # The released decoder.jit is stored in bfloat16 while everything else here
+  # works in float32, so the loader has to cast rather than trust the file.
+  config = tiny_config()
+  path = tmp_path / 'causal.pt'
+  write_checkpoint(path, config)
+  directory = write_cosmos_jit(
+      tmp_path / config.encoder, config, dtype=torch.bfloat16)
+
+  encoder = SolvSamEncoder(
+      checkpoint_path=path, device='cpu', cosmos_checkpoint_dir=directory)
+  for module in (encoder.backbone.tokenizer, encoder.backbone.decoder):
+    assert all(p.dtype == torch.float32 for p in module.parameters())
+
+  slots, _ = encoder.forward_step(frames(2, seed=8), None)
+  assert slots.dtype == torch.float32
+  assert encoder.decode_rgb(slots).dtype == torch.float32
 
 
 def test_decoding_in_chunks_changes_nothing(tmp_path):

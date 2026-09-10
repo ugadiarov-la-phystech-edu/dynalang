@@ -96,13 +96,24 @@ class CosmosBackbone(Backbone):
     path = directory / 'encoder.jit'
     if not path.is_file():
       raise FileNotFoundError(f'no Cosmos encoder found at {path}')
-    self.tokenizer = freeze(torch.jit.load(path, map_location='cpu'))
+    self.tokenizer = self._load(path)
 
     self.feat_res = [size // config.patch_size for size in config.resize_to]
     decoder_path = directory / 'decoder.jit'
     self.decoder = None
     if decoder_path.is_file():
-      self.decoder = freeze(torch.jit.load(decoder_path, map_location='cpu'))
+      self.decoder = self._load(decoder_path)
+
+  @staticmethod
+  def _load(path):
+    """Load a tokenizer half the way dyn-O does, weights cast to float32.
+
+    dyn-O goes through cosmos' `ImageTokenizer(dtype='float32')`, which casts
+    the TorchScript weights on load. The released files are not all stored in
+    the same dtype -- decoder.jit ships in bfloat16 -- so without the cast it
+    rejects the float32 latents everything else here works in.
+    """
+    return freeze(torch.jit.load(path, map_location='cpu').float())
 
   @property
   def can_decode(self):
