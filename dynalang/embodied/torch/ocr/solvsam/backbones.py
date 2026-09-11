@@ -15,6 +15,13 @@ IMAGENET_DEFAULT_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_DEFAULT_STD = [0.229, 0.224, 0.225]
 
 
+def weight_dtype(module, default=torch.float32):
+  """The dtype a module's own weights are stored in."""
+  for parameter in module.parameters():
+    return parameter.dtype
+  return default
+
+
 def freeze(module):
   """Freeze a module, TorchScript included.
 
@@ -67,11 +74,17 @@ class DinoBackbone(Backbone):
 
 
 class CosmosBackbone(Backbone):
-  """Continuous Cosmos image tokenizer, loaded from its TorchScript modules.
+  """Continuous Cosmos image tokenizer, run straight from its released traces.
 
-  dyn-O rebuilds the tokenizer in eager mode and then fills it from the same
-  `encoder.jit` file, so loading that file directly gives the same weights and
-  the same graph without vendoring the tokenizer implementation.
+  dyn-O uses `encoder.jit` only as a weight file: cosmos' loader rebuilds the
+  tokenizer in eager mode, fills it from that state dict and casts it to
+  float32. Running the trace itself instead keeps the same weights without
+  vendoring the tokenizer implementation, at the cost of the dtype the trace was
+  captured in -- these files were traced in bfloat16, and a trace freezes the
+  `dtype = x.dtype` its patcher read at capture time, so the tokenizer computes
+  in bfloat16 no matter what is handed to it. Tensors are therefore brought to
+  the module's dtype on the way in and back to float32 on the way out; casting
+  the weights instead only breaks the halves that already agree with themselves.
 
   `decoder.jit` is optional and only used to render slots as pixels. Nothing in
   it was trained here: for a Cosmos backbone dyn-O's RGB reconstruction is this
@@ -96,35 +109,27 @@ class CosmosBackbone(Backbone):
     path = directory / 'encoder.jit'
     if not path.is_file():
       raise FileNotFoundError(f'no Cosmos encoder found at {path}')
-    self.tokenizer = self._load(path)
+    self.tokenizer = freeze(torch.jit.load(path, map_location='cpu'))
+    self.tokenizer_dtype = weight_dtype(self.tokenizer)
 
     self.feat_res = [size // config.patch_size for size in config.resize_to]
     decoder_path = directory / 'decoder.jit'
     self.decoder = None
+    self.decoder_dtype = torch.float32
     if decoder_path.is_file():
-      self.decoder = self._load(decoder_path)
-
-  @staticmethod
-  def _load(path):
-    """Load a tokenizer half the way dyn-O does, weights cast to float32.
-
-    dyn-O goes through cosmos' `ImageTokenizer(dtype='float32')`, which casts
-    the TorchScript weights on load. The released files are not all stored in
-    the same dtype -- decoder.jit ships in bfloat16 -- so without the cast it
-    rejects the float32 latents everything else here works in.
-    """
-    return freeze(torch.jit.load(path, map_location='cpu').float())
+      self.decoder = freeze(torch.jit.load(decoder_path, map_location='cpu'))
+      self.decoder_dtype = weight_dtype(self.decoder)
 
   @property
   def can_decode(self):
     return self.decoder is not None
 
   def forward(self, images):
-    latent = self.tokenizer(images)
+    latent = self.tokenizer(images.to(self.tokenizer_dtype))
     if isinstance(latent, (tuple, list)):
       # The continuous tokenizer returns (latent, distribution parameters).
       latent = latent[0]
-    return rearrange(latent, 'b c h w -> b (h w) c')
+    return rearrange(latent, 'b c h w -> b (h w) c').float()
 
   def decode(self, features):
     """Render `(B, tokens, token_dim)` latents back into `(B, 3, H, W)`."""
@@ -135,10 +140,10 @@ class CosmosBackbone(Backbone):
     latent = rearrange(
         features, 'b (h w) c -> b c h w',
         h=self.feat_res[0], w=self.feat_res[1])
-    images = self.decoder(latent)
+    images = self.decoder(latent.to(self.decoder_dtype))
     if isinstance(images, (tuple, list)):
       images = images[0]
-    return images
+    return images.float()
 
 
 def build_backbone(config, cosmos_checkpoint_dir=None, dino_model_name=None):

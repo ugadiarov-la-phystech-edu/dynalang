@@ -44,13 +44,19 @@ class FakeCosmosEncoder(nn.Module):
 
 
 class FakeCosmosDecoder(nn.Module):
+  """Upsamples by shuffling channels, which the real decoder also does.
+
+  A transposed convolution would be the obvious stand-in, but it has no
+  bfloat16 kernel on CPU, and the released files are bfloat16.
+  """
 
   def __init__(self, patch_size, token_dim):
     super().__init__()
-    self.conv = nn.ConvTranspose2d(token_dim, 3, patch_size, stride=patch_size)
+    self.patch_size = patch_size
+    self.conv = nn.Conv2d(token_dim, 3 * patch_size ** 2, 1)
 
   def forward(self, latent):
-    return self.conv(latent)
+    return nn.functional.pixel_shuffle(self.conv(latent), self.patch_size)
 
 
 def write_cosmos_jit(directory, config, with_decoder=True, dtype=torch.float32):
@@ -241,9 +247,9 @@ def test_cosmos_backbone_encodes_and_renders(tmp_path):
   assert single.shape == (3,) + config.resize_to
 
 
-def test_cosmos_weights_are_cast_to_float32(tmp_path):
-  # The released decoder.jit is stored in bfloat16 while everything else here
-  # works in float32, so the loader has to cast rather than trust the file.
+def test_bfloat16_tokenizer_files_are_met_in_their_own_dtype(tmp_path):
+  # The released files are bfloat16 traces, so the images and latents have to
+  # arrive in that dtype while everything downstream stays in float32.
   config = tiny_config()
   path = tmp_path / 'causal.pt'
   write_checkpoint(path, config)
@@ -252,12 +258,13 @@ def test_cosmos_weights_are_cast_to_float32(tmp_path):
 
   encoder = SolvSamEncoder(
       checkpoint_path=path, device='cpu', cosmos_checkpoint_dir=directory)
-  for module in (encoder.backbone.tokenizer, encoder.backbone.decoder):
-    assert all(p.dtype == torch.float32 for p in module.parameters())
+  assert encoder.backbone.tokenizer_dtype == torch.bfloat16
+  assert encoder.backbone.decoder_dtype == torch.bfloat16
 
   slots, _ = encoder.forward_step(frames(2, seed=8), None)
   assert slots.dtype == torch.float32
   assert encoder.decode_rgb(slots).dtype == torch.float32
+  assert encoder.decode_patch_masks(slots).dtype == torch.float32
 
 
 def test_decoding_in_chunks_changes_nothing(tmp_path):
