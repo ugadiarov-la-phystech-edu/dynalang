@@ -405,8 +405,10 @@ class WorldModel(nj.Module):
     state = self.initial(len(data['is_first']))
     report = {}
     report.update(self.loss(data, state)[-1][-1])
-    
+    report.update(self._binding_grad_metrics(data, state))
+
     embed = self.encoder(data)
+    report.update(self._slot_stats(embed))
     act_keys = list(self.act_space.keys())
     if self.config.rssm_type == "token":
       context = self.rssm.observe(
@@ -471,6 +473,7 @@ class WorldModel(nj.Module):
       if self._slot_ae:
         # The 'ae' projection only exists when the autoencoder loss trains it.
         outs['ae'] = dec.slot_decode(embed[:nseq, :nframes], proj='ae')
+        report.update(self._slot_mask_stats(outs['ae']))
 
       def slot_strip(x):
         # (B, T, K, H, W, C) -> (B, T, H, K * W, C)
@@ -567,6 +570,93 @@ class WorldModel(nj.Module):
     if 'cont' in dists and not self.config.jax.debug_nans:
       stats = jaxutils.balance_stats(dists['cont'], data['cont'], 0.5)
       metrics.update({f'cont_{k}': v for k, v in stats.items()})
+    return metrics
+
+  def _binding_grad_metrics(self, data, state):
+    """Gradient that each slot loss puts on the slot encoder's parameters.
+
+    The two slot losses cannot be ranked by their values: slot_ae sums over
+    pixels and slot_pred over slot dimensions, so the numbers are in different
+    units. The gradient they put on the same parameters is comparable, and it
+    is what decides which objective shapes the binding.
+
+    Worth measuring because slot_pred reaches the encoder as well, not only the
+    dynamics: its stop-gradient pins the target, but its input is the posterior,
+    which is computed from the encoder output. Predicting the encoder's own
+    slots is minimized by an encoder that ignores the frame, so slot_ae is the
+    only term keeping the slots tied to pixels, and these two norms say which
+    of the two is actually louder.
+
+    Costs one forward and backward pass per key, hence report() only.
+    """
+    if 'binding_grad_keys' not in self.config:
+      return {}  # Config files written before this metric existed.
+    dec = self.heads['decoder']
+    # loss() builds the posterior differently for the token RSSM.
+    via_post = self.config.rssm_type != 'token'
+    available = {
+        'slot_ae': self._slot_ae,
+        'slot_pred': dec.has_slot_pred and via_post}
+    if dec.has_wm_recon and via_post:
+      # Reconstructing pixels from the posterior reaches the encoder through
+      # the RSSM, the way it does for a monolithic representation. Comparable
+      # to slot_ae, which reaches it directly.
+      available.update({k: True for k in dec.cnn_shapes})
+    keys = [k for k in self.config.binding_grad_keys if available.get(k)]
+    if not keys or not self.encoder.slot_carry_shape:
+      return {}
+    prev_latent, prev_action, enc_state = state
+    prev_actions = {
+        k: jnp.concatenate([prev_action[k][:, None], data[k][:, :-1]], 1)
+        for k in self.act_space}
+
+    def term(key):
+      embed, _ = self.encoder(
+          data, slot_carry=enc_state.get('slot'), return_extra=True)
+      if key == 'slot_ae':
+        dist, _ = dec.slot_image_dist(embed, proj='ae')
+        loss = -dist.log_prob(data[self._slot_image_key].astype(jnp.float32))
+      else:
+        post = self.rssm.observe(
+            embed, prev_actions, data['is_first'], prev_latent)
+        if key == 'slot_pred':
+          dist = dec.slot_pred_dist(post)
+          loss = -dist.log_prob(sg(embed).astype(jnp.float32))
+        else:
+          dist = dec({**post, 'embed': embed})[key]
+          loss = -dist.log_prob(data[key].astype(jnp.float32))
+      # loss() differentiates mean(sum_k scale_k * loss_k), so applying the
+      # scale here makes this one term's contribution to that same scalar.
+      return self.scales[key] * loss.mean()
+
+    metrics = {}
+    for key in keys:
+      _, _, grads = nj.grad(lambda k=key: term(k), self.encoder)()
+      metrics[f'{key}_gradenc_norm'] = optax.global_norm(grads)
+    return metrics
+
+  def _slot_stats(self, embed):
+    """Collapse indicators for the slot binding.
+
+    Two failures that the losses alone do not reveal: the slots turn into copies
+    of each other, which sends `slot_spread` to zero, or they stop depending on
+    the frame, which sends `slot_activity` to zero.
+    """
+    if embed.ndim != 4:
+      return {}  # Not a slot-shaped embedding.
+    x = embed.astype(jnp.float32)
+    return {
+        'slot_spread': x.std(-2).mean(),
+        'slot_activity': x.std((0, 1)).mean()}
+
+  def _slot_mask_stats(self, out):
+    """How the encoder's alpha masks divide the image between slots."""
+    # (batch, time, slots, height, width, 1), softmax over the slot axis.
+    masks = out['slot_masks'].astype(jnp.float32)
+    share = masks.mean((0, 1, 3, 4, 5))
+    metrics = {f'slot_mask_share{i}': share[i] for i in range(share.shape[0])}
+    # 1.0 means every pixel is claimed by a single slot, 1/slots means mush.
+    metrics['slot_mask_conf'] = masks.max(2).mean()
     return metrics
 
 
