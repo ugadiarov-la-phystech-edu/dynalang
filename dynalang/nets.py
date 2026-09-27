@@ -989,6 +989,10 @@ class MultiDecoder(nj.Module):
     return bool(self.cnn_shapes) and self._wm_recon
 
   @property
+  def has_slot_pred(self):
+    return self._slot_pred
+
+  @property
   def n_obj_slots(self):
     """Number of leading object slots, excluding appended text slots."""
     if self._slot_layout:
@@ -1017,6 +1021,21 @@ class MultiDecoder(nj.Module):
     out = self.decode_slot_image(slots, proj=proj)
     return self._make_image_dist(key, out['image']), out
 
+  def slot_pred_dist(self, inputs):
+    """Distribution over the encoder's slots, predicted from latent features.
+
+    Stand-in for decoding pixels out of the posterior, which would cost as much
+    again as the encoder's own reconstruction. The caller supplies the target
+    and is expected to stop its gradient; note that this only keeps the target
+    from moving, it does not isolate the encoder, whose gradient path runs
+    through the features via the posterior.
+    """
+    assert self._slot_pred, 'decoder.slot_pred is disabled'
+    features = self._inputs(inputs) if isinstance(inputs, dict) else inputs
+    width = self._slot_layout[-1] if self._slot_layout else features.shape[-1]
+    mean = self.get('slot_pred', Linear, width, act='none')(features)
+    return jaxutils.MSEDist(mean, 2, 'sum')
+
   def slot_decode(self, inputs, proj='wm'):
     """Per-slot renders and masks from either a slot tensor or a latent dict.
 
@@ -1041,12 +1060,7 @@ class MultiDecoder(nj.Module):
       dists['slot'] = jaxutils.MSEDist(slot_mean, 2, 'sum')
 
     if self._slot_pred:
-      # Cheap stand-in for decoding pixels out of the posterior: predict the
-      # encoder's own slots instead. The caller supplies a stop-gradient target,
-      # so this trains the dynamics without pulling on the slot binding.
-      width = self._slot_layout[-1] if self._slot_layout else features.shape[-1]
-      mean = self.get('slot_pred', Linear, width, act='none')(features)
-      dists['slot_pred'] = jaxutils.MSEDist(mean, 2, 'sum')
+      dists['slot_pred'] = self.slot_pred_dist(features)
 
     if self.cnn_shapes and self._wm_recon:
       feat = features
