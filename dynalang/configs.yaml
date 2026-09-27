@@ -488,3 +488,27 @@ stica_slots:
     slot_decoder: {depth: 64, layers: 4, kernel: 5, res: 8, bg_logit: 3.0, background: append, act: relu, norm: none}
   loss_scales.slot_ae: 1.0
   loss_scales.slot_pred: 1.0
+
+# Apply after `stica_slots` to train the world model on pixels decoded from the
+# posterior, the way Dreamer does for a monolithic representation, instead of
+# having it predict the encoder's slots.
+#
+# The motivation is where the encoder's gradient comes from. slot_pred puts far
+# more of it on the encoder than slot_ae does, and its target is the encoder's
+# own output, which an encoder that ignores the frame minimizes perfectly; the
+# stop-gradient pins that target but leaves the path through the posterior open.
+# Swapping it for the pixel loss leaves the encoder with external targets only.
+#
+# slot_ae stays on, because the dynamics transformer lets all slots attend to
+# each other, so pixels decoded from the posterior can come out right even when
+# the binding itself is muddled. Reconstructing from the encoder slots directly
+# is the only term that constrains the binding. The cost is decoding pixels
+# twice per step; drop loss_scales.slot_ae to 0 for a single decode that relies
+# on the posterior alone.
+stica_slots_wm_recon:
+  decoder:
+    wm_recon: True
+    slot_pred: False
+  loss_scales.image: 1.0
+  loss_scales.slot_pred: 0.0
+  binding_grad_keys: [slot_ae, image]
