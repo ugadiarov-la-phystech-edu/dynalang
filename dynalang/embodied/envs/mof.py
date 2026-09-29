@@ -87,6 +87,18 @@ def _valid_num_distractors(task: str, n: int) -> bool:
   return True
 
 
+def _patch_gym_goalenv() -> None:
+  """fetch-block-construction still subclasses gym.GoalEnv (removed in gym 0.26)."""
+  if hasattr(gym, "GoalEnv"):
+    return
+
+  class GoalEnv(gym.Env):
+    def compute_reward(self, achieved_goal, desired_goal, info):
+      raise NotImplementedError
+
+  gym.GoalEnv = GoalEnv
+
+
 class _ActionRepeat(gym.Wrapper):
 
   def __init__(self, env: gym.Env, repeat: int) -> None:
@@ -220,6 +232,7 @@ class MOF:
   ) -> None:
     if "MUJOCO_GL" not in os.environ:
       os.environ["MUJOCO_GL"] = "egl"
+    _patch_gym_goalenv()
     import multi_object_fetch  # noqa: F401  # gym registrations
 
     self._parsed = parse_mof_name(task)
