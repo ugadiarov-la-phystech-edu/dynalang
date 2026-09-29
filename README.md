@@ -39,7 +39,7 @@ Verify GPU access:
 python -c "import jax; print(jax.devices())"
 ```
 
-See the sections below for environment-specific setup (HomeGrid, Messenger, VLN, LangRoom).
+See the sections below for environment-specific setup (HomeGrid, MOF, Messenger, VLN, LangRoom).
 
 ## 🏠 HomeGrid
 
@@ -48,6 +48,46 @@ Install the HomeGrid environment and run the example training script with the ta
 ```bash
 pip install homegrid
 sh scripts/run_homegrid.sh homegrid_task EXP_NAME GPU_IDS SEED
+```
+
+## 🤖 Multi-object Fetch (MOF, Linux)
+
+Dynalang talks to [`multi-object-fetch-with-text`](https://github.com/) through the `mof` suite (`--task mof_ReachMulticolor_0to4Distractors_Dense-v1`). Observations are `64×64` RGB plus a streamed T5 `token`, same channel split as HomeGrid.
+
+**Keep it as a cloned repo, install editable with `--no-deps`.** Do not `pip install` the package with its default dependencies and do not run `create_conda_env.sh` inside `ocdreamer`. The env `setup.py` pins `gym<=0.17.3` and `numpy==1.24.3`; that downgrade breaks HomeGrid (this env uses gym `0.26`) and can disturb JAX.
+
+Safe extras only (leave gym and numpy alone):
+
+```bash
+conda activate ocdreamer
+
+# MuJoCo 2.1.0 binaries go in $HOME — no sudo (mujoco-py does not use the pip `mujoco` package)
+mkdir -p "$HOME/.mujoco"
+if [ ! -d "$HOME/.mujoco/mujoco210" ]; then
+  wget -q https://github.com/deepmind/mujoco/releases/download/2.1.0/mujoco210-linux-x86_64.tar.gz
+  tar -xf mujoco210-linux-x86_64.tar.gz -C "$HOME/.mujoco"
+  rm mujoco210-linux-x86_64.tar.gz
+fi
+export MUJOCO_PY_MUJOCO_PATH="$HOME/.mujoco/mujoco210"
+export LD_LIBRARY_PATH="$HOME/.mujoco/mujoco210/bin:${LD_LIBRARY_PATH:-}"
+export MUJOCO_GL=egl   # headless GPU; use glfw only if you have a display
+
+# Compilers / GL for mujoco-py. Skip apt if there is no sudo: GPU nodes
+# usually already have gcc + libEGL. If `pip install mujoco-py` fails to
+# compile, install the same stack into *this* conda env:
+#   conda install -c conda-forge compilers patchelf mesalib glew glfw
+# Optional, only if you have sudo and the conda line is not enough:
+#   sudo apt-get install -y --no-install-recommends \
+#     build-essential gcc patchelf \
+#     libosmesa6-dev libgl1-mesa-dev libgl1-mesa-glx \
+#     libglew-dev libglfw3 libglib2.0-0
+
+# Clone next to dynalang. Branch `text` has Multicolor + language.
+git clone -b text https://github.com/AntoninaKOR/multi-object-fetch-with-text.git /path/to/multi-object-fetch-with-text
+pip install 'cython<3' colormath opencv-python
+pip install --no-deps git+https://github.com/maltemosbach/fetch-block-construction.git
+pip install mujoco-py
+pip install --no-deps -e /path/to/multi-object-fetch-with-text
 ```
 
 ## 👾 Messenger
