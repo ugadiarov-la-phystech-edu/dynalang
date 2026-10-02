@@ -153,6 +153,47 @@ class _VariableDistractors(gym.Wrapper):
     return self.env.reset(**kwargs)
 
 
+def _overlay_language(
+    image: np.ndarray,
+    instruction: str,
+    current_piece: str = "",
+    token: int | None = None,
+) -> np.ndarray:
+  """Draw readable instruction text onto a vis-resolution RGB frame."""
+  from PIL import Image, ImageDraw, ImageFont
+
+  h = int(image.shape[0])
+  bar_h = max(48, h // 5)
+  title_pt = max(18, h // 14)
+  stream_pt = max(16, h // 16)
+  candidates = (
+      "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+      "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+      "/System/Library/Fonts/Supplemental/Arial.ttf",
+      "/Library/Fonts/Arial.ttf",
+  )
+
+  def _font(size: int):
+    for path in candidates:
+      try:
+        return ImageFont.truetype(path, size)
+      except OSError:
+        continue
+    return ImageFont.load_default()
+
+  base = Image.fromarray(np.asarray(image).copy()).convert("RGBA")
+  overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+  draw = ImageDraw.Draw(overlay)
+  draw.rectangle([(0, 0), (base.size[0], bar_h)], fill=(0, 0, 0, 170))
+  piece = (current_piece or "<pad>").strip() or "<pad>"
+  stream = f"Stream: {piece}"
+  if token is not None:
+    stream += f"  |  token_id={token}"
+  draw.text((10, 6), f"Instruction: {instruction}", fill=(255, 255, 255, 255), font=_font(title_pt))
+  draw.text((10, 8 + title_pt), stream, fill=(255, 255, 255, 255), font=_font(stream_pt))
+  return np.asarray(Image.alpha_composite(base, overlay).convert("RGB")).copy()
+
+
 class _PixelLangObs(gym.Wrapper):
   """Replace privileged state with a uint8 image; keep streamed language."""
 
@@ -162,12 +203,15 @@ class _PixelLangObs(gym.Wrapper):
       image_size: Sequence[int],
       use_language: bool,
       vis: bool,
+      vis_size: Sequence[int] = (256, 256),
   ) -> None:
     super().__init__(env)
     self._size = tuple(int(x) for x in image_size)
+    self._vis_size = tuple(int(x) for x in vis_size)
     self._use_language = bool(use_language)
     self._vis = bool(vis)
     image_space = spaces.Box(0, 255, self._size + (3,), dtype=np.uint8)
+    vis_space = spaces.Box(0, 255, self._vis_size + (3,), dtype=np.uint8)
     obs_spaces = {
         "image": image_space,
         "log_success": spaces.Box(0, 1, (), dtype=np.float32),
@@ -177,7 +221,7 @@ class _PixelLangObs(gym.Wrapper):
       obs_spaces["token"] = base["token"]
       obs_spaces["is_read_step"] = base["is_read_step"]
     if self._vis:
-      obs_spaces["log_image"] = image_space
+      obs_spaces["log_image"] = vis_space
     self.observation_space = spaces.Dict(obs_spaces)
 
   def reset(self, **kwargs):
@@ -206,10 +250,11 @@ class _PixelLangObs(gym.Wrapper):
       packed["token"] = np.asarray(obs["token"], dtype=np.uint32)
       packed["is_read_step"] = np.asarray(obs["is_read_step"], dtype=bool)
     if self._vis:
-      from multi_object_fetch.utils.viz import overlay_language
-
-      packed["log_image"] = overlay_language(
-          image,
+      vis = np.asarray(
+          self.env.render(mode="rgb_array", size=self._vis_size), dtype=np.uint8
+      )
+      packed["log_image"] = _overlay_language(
+          vis,
           instruction=str(info.get("instruction", getattr(self.env, "instruction", ""))),
           current_piece=str(info.get("log_token_piece", "")),
           token=int(obs["token"]) if self._use_language else None,
@@ -228,6 +273,7 @@ class MOF:
       max_steps: int = 50,
       use_language: bool = True,
       vis: bool = False,
+      vis_size: Sequence[int] = (256, 256),
       repeat_task_every: int = 20,
   ) -> None:
     if "MUJOCO_GL" not in os.environ:
@@ -241,6 +287,7 @@ class MOF:
     self._max_steps = int(max_steps)
     self._use_language = bool(use_language)
     self._vis = bool(vis)
+    self._vis_size = tuple(int(x) for x in vis_size)
     self._repeat_task_every = int(repeat_task_every)
 
     ids: List[str] = self._parsed["ids"]
@@ -275,7 +322,9 @@ class MOF:
           repeat_task_every=self._repeat_task_every,
           visualize=False,
       )
-    return _PixelLangObs(env, self._size, self._use_language, self._vis)
+    return _PixelLangObs(
+        env, self._size, self._use_language, self._vis, self._vis_size
+    )
 
   def reset(self):
     return self._env.reset()

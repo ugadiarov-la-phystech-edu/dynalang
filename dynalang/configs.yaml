@@ -120,6 +120,7 @@ defaults:
       p_unsafe: 0.
     mof:
       size: [64, 64]
+      vis_size: [256, 256]
       repeat: 2
       max_steps: 50
       use_language: True
