@@ -402,8 +402,12 @@ class ObjectCentricTSSM(TSSM):
       self, num_slots, deter=512, units=512, stoch=32, classes=32,
       tf_context_length=16, tf_layers=4, tf_heads=8, feedforward_units=1024,
       dropout=0.0, unroll=False, unimix=0.01, action_clip=1.0,
-      action_mode='none', deter_feedback='none', winit='normal', **kw):
+      action_mode='none', deter_feedback='none', winit='normal',
+      kv_cache=False, pe='window', **kw):
     assert action_mode in ('none', 'slot', 'cross_attn'), action_mode
+    assert pe in ('window', 'rope'), pe
+    if kv_cache and pe != 'rope':
+      raise ValueError('kv_cache=True requires pe=rope')
     super().__init__(
         deter=deter, units=units, stoch=stoch, classes=classes,
         tf_context_length=tf_context_length, tf_layers=tf_layers,
@@ -414,11 +418,16 @@ class ObjectCentricTSSM(TSSM):
     from .transformer import ObjectCentricDynamicsTransformer
     self._num_slots = num_slots
     self._action_mode = action_mode
+    self._kv_cache = kv_cache
+    self._pe = pe
+    self._tf_layers = tf_layers
+    self._tf_heads = tf_heads
+    self._tf_tokens = num_slots + (1 if action_mode == 'slot' else 0)
     self._oc_transformer = ObjectCentricDynamicsTransformer(
         num_layers=tf_layers, d_model=units, nhead=tf_heads,
         feedforward_units=feedforward_units, dropout=dropout,
         norm_first=True, norm=True, action_mode=action_mode,
-        name='oc_transformer')
+        pe=pe, name='oc_transformer')
 
   def initial(self, batch_size):
     state = dict(
@@ -434,6 +443,15 @@ class ObjectCentricTSSM(TSSM):
     if self._action_mode in ('slot', 'cross_attn'):
       state['action_context'] = jnp.zeros(
           [batch_size, self._tf_context_length, self._units], f32)
+    if self._pe == 'rope':
+      state['step_pos'] = jnp.zeros([batch_size], jnp.int32)
+    if self._kv_cache:
+      head_dim = self._units // self._tf_heads
+      cache_shape = (
+          batch_size, self._tf_layers, self._tf_context_length,
+          self._tf_tokens, self._tf_heads, head_dim)
+      state['kv_k'] = jnp.zeros(cache_shape, f32)
+      state['kv_v'] = jnp.zeros(cache_shape, f32)
     init_deter = self.get(
         'initial', jnp.zeros, state['deter'][0].shape, f32)
     state['deter'] = jnp.repeat(jnp.tanh(init_deter)[None], batch_size, 0)
@@ -492,20 +510,50 @@ class ObjectCentricTSSM(TSSM):
     else:
       tf_input = tf_context
 
-    out = self._oc_transformer(
-        cast(tf_input),
-        causal_mask=causal_mask,
-        action_embeds=cast(action_context) if self._action_mode == 'cross_attn' else None,
-        key_padding_mask=key_pad_mask,
-        training=training)
+    window_pos = None
+    step_pos = None
+    if self._pe == 'rope':
+      step_pos = prev_state['step_pos']
+      # Positions of the L window slots after the slide, matching tf_context.
+      window_pos = (
+          step_pos[:, None] - self._tf_context_length + 1 +
+          jnp.arange(self._tf_context_length, dtype=step_pos.dtype)[None, :])
 
-    deter = out[:, -1]  # (B, num_slots[+1], units)
+    if self._kv_cache:
+      new_tokens = tf_input[:, -1]
+      out_last, kv_k, kv_v = self._oc_transformer.incremental(
+          cast(new_tokens),
+          cast(prev_state['kv_k']),
+          cast(prev_state['kv_v']),
+          step_pos,
+          valid=valid,
+          action_embed=(
+              cast(action_context[:, -1])
+              if self._action_mode == 'cross_attn' else None),
+          training=training)
+      deter = out_last
+    else:
+      out = self._oc_transformer(
+          cast(tf_input),
+          causal_mask=causal_mask,
+          action_embeds=(
+              cast(action_context) if self._action_mode == 'cross_attn'
+              else None),
+          key_padding_mask=key_pad_mask,
+          training=training,
+          positions=window_pos)
+      deter = out[:, -1]  # (B, num_slots[+1], units)
     if self._action_mode == 'slot':
       deter = deter[:, :-1]  # drop action slot
 
     next_state = {'deter': cast(deter), 'tf_context': cast(tf_context), 'valid': valid}
     if self._action_mode in ('slot', 'cross_attn'):
       next_state['action_context'] = cast(action_context)
+    if self._kv_cache:
+      next_state['kv_k'] = cast(kv_k)
+      next_state['kv_v'] = cast(kv_v)
+    if step_pos is not None:
+      next_state['step_pos'] = step_pos + 1
     return next_state
 
   def loss(self, post, free=1.0):
