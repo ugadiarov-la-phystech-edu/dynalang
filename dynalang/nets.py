@@ -16,6 +16,15 @@ cast = jaxutils.cast_to_compute
 
 from typing import List
 
+
+def _cast_tssm_state(state):
+  """Cast model activations without rounding the absolute RoPE clock."""
+  result = cast(state)
+  if 'step_pos' in state:
+    result['step_pos'] = jnp.asarray(state['step_pos'], jnp.int32)
+  return result
+
+
 class RSSM(nj.Module):
 
   def __init__(
@@ -266,7 +275,7 @@ class TSSM(nj.Module):
     deter = self.get('initial', jnp.zeros, state['deter'][0].shape, f32)
     state['deter'] = jnp.repeat(jnp.tanh(deter)[None], batch_size, 0)
     state['stoch'] = self._prior(cast(state['deter']), sample=True)['stoch']
-    return cast(state)
+    return _cast_tssm_state(state)
 
   def observe(self, embed, action, is_first, state=None):
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
@@ -307,13 +316,13 @@ class TSSM(nj.Module):
     stats = self._stats('obs_stats', x)
     stoch = self.get_dist(stats).sample(seed=nj.rng())
     post = {'stoch': stoch, **next_state, **stats}
-    return cast(post)
+    return _cast_tssm_state(post)
   
   def img_step(self, prev_state, prev_action):
     prev_action = jaxutils.concat_dict(prev_action)
     next_state = self._step(prev_state, prev_action)
     prior = self._prior(next_state['deter'], sample=True)
-    return cast({**prior, **next_state})
+    return _cast_tssm_state({**prior, **next_state})
 
   def _deter_parts(self, prev_state):
     """Previous deter as an extra input; empty when the channel is disabled."""
@@ -456,7 +465,7 @@ class ObjectCentricTSSM(TSSM):
         'initial', jnp.zeros, state['deter'][0].shape, f32)
     state['deter'] = jnp.repeat(jnp.tanh(init_deter)[None], batch_size, 0)
     state['stoch'] = self._prior(cast(state['deter']), sample=True)['stoch']
-    return cast(state)
+    return _cast_tssm_state(state)
 
   def obs_step(self, prev_state, prev_action, embed, is_first, training=True):
     prev_action = jaxutils.concat_dict(prev_action)
@@ -471,7 +480,7 @@ class ObjectCentricTSSM(TSSM):
     stats = self._stats('obs_stats', x)
     stoch = self.get_dist(stats).sample(seed=nj.rng())
     post = {'stoch': stoch, **next_state, **stats}
-    return cast(post)
+    return _cast_tssm_state(post)
 
   def _step(self, prev_state, prev_action, training=True):
     prev_action = cast(prev_action)

@@ -55,15 +55,19 @@ def apply_rope(x, positions, max_wavelength=10000.0):
   head_dim = x.shape[-1]
   if head_dim % 2:
     raise ValueError(f'RoPE needs an even head dim, got {head_dim}')
+  # Position/phase arithmetic in low precision aliases adjacent timesteps
+  # (and float16 positions can overflow). Only cast back after rotation.
+  dtype = x.dtype
+  x = x.astype(jnp.float32)
   freq = 1.0 / (
-      max_wavelength ** (jnp.arange(0, head_dim, 2, dtype=x.dtype) / head_dim))
-  pos = jnp.asarray(positions).astype(x.dtype)
+      max_wavelength ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
+  pos = jnp.asarray(positions, jnp.float32)
   radians = pos[..., None] * freq  # (B, T, hd/2)
   cos = jnp.cos(radians)[..., None, :]  # (B, T, 1, hd/2)
   sin = jnp.sin(radians)[..., None, :]
   x1, x2 = x[..., 0::2], x[..., 1::2]
   rotated = jnp.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
-  return rotated.reshape(x.shape)
+  return rotated.reshape(x.shape).astype(dtype)
 
 
 def scaled_dot_product_attention(
