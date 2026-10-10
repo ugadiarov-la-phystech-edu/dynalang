@@ -23,6 +23,18 @@ from . import ninjax as nj
 import optax
 
 
+def subsample_imag_starts(start, n_keep, rng):
+  """Keep ``n_keep`` random posterior states; ``n_keep<=0`` keeps all B*T."""
+  n_keep = int(n_keep)
+  if n_keep <= 0:
+    return start
+  n = start['deter'].shape[0]
+  if n_keep >= n:
+    return start
+  idx = jax.random.permutation(rng, n)[:n_keep]
+  return tree_map(lambda x: x[idx], start)
+
+
 @jaxagent.Wrapper
 class Agent(nj.Module):
 
@@ -96,6 +108,8 @@ class Agent(nj.Module):
         return wm_outs, state, metrics
     # Flatten (batch, seq) -> (batch * seq)
     start = tree_map(lambda x: x.reshape([-1] + list(x.shape[2:])), context)
+    start = subsample_imag_starts(
+        start, getattr(self.config, 'imag_starts', 0), nj.rng())
     _, mets = self.task_behavior.train(self.wm.imagine, start, context)
     metrics.update(mets)
     if self.config.expl_behavior != 'None':

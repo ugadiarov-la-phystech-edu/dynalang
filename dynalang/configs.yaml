@@ -185,6 +185,9 @@ defaults:
   actor_grad_cont: backprop
   critic_type: vfunction
   imag_horizon: 15
+  # 0 = imagine from every (batch, time) posterior state (Dreamer default).
+  # A positive cap (e.g. 512) is the main cheap OctSSM speedup on long batches.
+  imag_starts: 0
   imag_unroll: False
   imag_cont: mean
   horizon: 333
@@ -420,6 +423,7 @@ debug:
     actor_batch: 2
   batch_size: 8
   batch_length: 12
+  imag_starts: 0
   replay_size: 1e5
   encoder.cnn_depth: 8
   decoder.cnn_depth: 8
@@ -434,6 +438,16 @@ debug:
 
 octssm:
   rssm_type: octssm
+
+# HomeGrid-style OctSSM: shorter imagination, fewer starts, narrower FFN,
+# incremental transformer. feedforward_units is 4*D for deter=256; override
+# when using deter=128 (--octssm.feedforward_units 512).
+octssm_fast:
+  imag_horizon: 5
+  imag_starts: 512
+  octssm.feedforward_units: 1024
+  octssm.kv_cache: True
+  octssm.pe: rope
 
 deter_feedback:
   tssm.deter_feedback: detached
@@ -464,6 +478,38 @@ min_debug:
   .*unroll: False
   .*\.layers: 2
   .*\.units: 64
+
+savi:
+  use_slot_extractor: True
+  slot_extractor:
+    type: savi
+    config_path: ''  # Architecture is stored in the SOLD Lightning checkpoint.
+    checkpoint_path: checkpoints/savi/reach_red.ckpt
+    device: cuda
+    use_previous_slots: True
+    initialize_twice: False  # SAVi uses its trained first-frame corrector.
+    flatten_slots: False
+  encoder: {mlp_keys: 'token$', cnn_keys: '$^'}
+  decoder: {mlp_keys: 'token$', cnn_keys: '$^'}
+
+mof_savi:
+  task: mof_ReachRed_0to4Distractors_Dense-v1
+  env.mof.size: [64, 64]
+  rssm_type: octssm
+  use_slot_extractor: True
+  slot_extractor:
+    type: savi
+    config_path: ''
+    checkpoint_path: checkpoints/savi/reach_red.ckpt
+    device: cuda
+    use_previous_slots: True
+    initialize_twice: False
+    flatten_slots: False
+  encoder: {mlp_keys: 'token$', cnn_keys: '$^'}
+  decoder: {mlp_keys: 'token$', cnn_keys: '$^', vector_dist: onehot}
+  run:
+    log_keys_max: '^log_success$'
+    log_keys_mean: '^log_success$'
 
 slotcontrast:
   use_slot_extractor: True

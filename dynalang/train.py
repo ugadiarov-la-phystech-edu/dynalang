@@ -258,6 +258,9 @@ def make_slot_extractor(config):
   if typ == 'slotcontrast':
     from embodied.torch.ocr.slotcontrast.slotcontrast_extractor import SlotContrastExtractor
     cls = SlotContrastExtractor
+  elif typ == 'savi':
+    from embodied.torch.ocr.savi import SAViExtractor
+    cls = SAViExtractor
   elif typ == 'dinov2saur':
     raise NotImplementedError("DINOv2-Saur extractor not implemented yet")
   elif typ == 'slate':
