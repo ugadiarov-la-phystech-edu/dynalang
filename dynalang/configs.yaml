@@ -166,6 +166,7 @@ defaults:
   skip_mlp_training: False
   # Auxiliary RGB MSE through the frozen SAVi decoder, on posterior slots.
   savi_image_loss: {scale: 0.0, starts: 8}
+  openloop_loss: {slot_scale: 0.0, image_scale: 0.0, horizon: 3, starts: 4, context: 3}
   zero_data_keys: ['']
   zero_cnn: False
   zero_mlp: False
@@ -496,6 +497,14 @@ savi:
 
 savi_image_mse:
   savi_image_loss: {scale: 1.0, starts: 8}
+
+savi_openloop_slots:
+  octssm.action_mode: slot
+  openloop_loss: {slot_scale: 1.0, image_scale: 0.0, horizon: 3, starts: 4, context: 3}
+
+savi_openloop_images:
+  octssm.action_mode: slot
+  openloop_loss: {slot_scale: 1.0, image_scale: 1.0, horizon: 3, starts: 4, context: 3}
 
 mof_savi:
   task: mof_ReachRed_0to4Distractors_Dense-v1

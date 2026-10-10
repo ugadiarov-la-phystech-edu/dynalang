@@ -243,12 +243,26 @@ class WorldModel(nj.Module):
     scales.update({k: vector for k in self.heads['decoder'].slot_shapes})
     self.scales = scales
     self.savi_decoder = None
+    self.openloop_cfg = getattr(config, 'openloop_loss', embodied.Config(
+        {'slot_scale': 0.0, 'image_scale': 0.0, 'horizon': 3, 'starts': 4, 'context': 3}))
+    oc = self.openloop_cfg
+    self.use_openloop_loss = bool(oc.slot_scale or oc.image_scale)
+    if (oc.slot_scale < 0 or oc.image_scale < 0 or
+        min(oc.horizon, oc.starts, oc.context) < 1):
+      raise ValueError('Invalid openloop_loss scales or window dimensions')
+    if self.use_openloop_loss:
+      if not self.encoder.slot_shapes or config.rssm_type != 'octssm':
+        raise ValueError('Open-loop slot loss requires OCTSSM with object slots')
+      if config.batch_length < oc.context + oc.horizon:
+        raise ValueError('Open-loop loss needs batch_length >= context + horizon')
+      if config.octssm.action_mode == 'none':
+        raise ValueError('Open-loop action-conditioned loss needs action_mode slot or cross_attn')
     image_cfg = getattr(config, 'savi_image_loss', embodied.Config(
         {'scale': 0.0, 'starts': 8}))
     self.savi_image_cfg = image_cfg
     if image_cfg.scale < 0 or image_cfg.starts < 1:
       raise ValueError('savi_image_loss requires scale >= 0 and starts >= 1')
-    if image_cfg.scale:
+    if image_cfg.scale or oc.image_scale:
       if (not self.encoder.slot_shapes or config.slot_extractor.type != 'savi'
           or not config.use_slot_extractor or 'image' not in shapes):
         raise ValueError('SAVi image loss requires SAVi slots and replay images')
@@ -351,13 +365,17 @@ class WorldModel(nj.Module):
     scaled = {k: v * self.scales[k] for k, v in losses.items()}
     model_loss = sum(scaled.values())
     savi_image_loss = jnp.array(0.0, jnp.float32)
-    if self.savi_decoder is not None:
+    if self.savi_image_cfg.scale:
       slots = dists['slot'].mode()
       flat_slots = slots.reshape(-1, *slots.shape[2:])
       images = data['image'].reshape(-1, *data['image'].shape[2:])
       count = min(self.savi_image_cfg.starts, len(flat_slots))
       idx = jax.random.permutation(nj.rng(), len(flat_slots))[:count]
       savi_image_loss = self.savi_decoder.mse(flat_slots[idx], images[idx]).mean()
+    openloop_loss = jnp.array(0.0, jnp.float32)
+    openloop_metrics = {}
+    if self.use_openloop_loss:
+      openloop_loss, openloop_metrics = self.openloop_loss(data, post)
     out = {'embed':  embed, 'post': post, 'prior': prior}
     out.update({f'{k}_loss': v for k, v in losses.items()})
     last_latent = {k: v[:, -1] for k, v in post.items()}
@@ -365,10 +383,40 @@ class WorldModel(nj.Module):
     state = last_latent, last_action
     metrics = self._metrics(
         data, dists, post, prior, losses, model_loss, full_metrics)
-    if self.savi_decoder is not None:
+    if self.savi_image_cfg.scale:
       metrics['savi_image_mse'] = savi_image_loss
+    metrics.update(openloop_metrics)
     return (model_loss.mean() + lm_loss +
-            self.savi_image_cfg.scale * savi_image_loss), (state, out, metrics)
+            self.savi_image_cfg.scale * savi_image_loss + openloop_loss), (state, out, metrics)
+
+  def openloop_predictions(self, data, post):
+    from .openloop import sample_windows
+    cfg = self.openloop_cfg
+    start, b, times, targets, weights = sample_windows(
+        data, post, cfg.horizon, cfg.context, cfg.starts, nj.rng())
+    # No future observation is passed to rssm.imagine; each next state is prior.
+    actions = {k: data[k][b[:, None], times] for k in self.act_space}
+    prior = self.rssm.imagine(actions, start)
+    predicted = self.heads['decoder'](prior)['slot'].mode()
+    truth = sg(data['slot'][b[:, None], targets])
+    images = sg(data['image'][b[:, None], targets]) if cfg.image_scale else None
+    return predicted, truth, images, weights
+
+  def openloop_loss(self, data, post):
+    from .openloop import masked_mean
+    cfg = self.openloop_cfg
+    predicted, truth, images, weights = self.openloop_predictions(data, post)
+    errors = jnp.square(predicted.astype(jnp.float32) - truth).mean((-1, -2))
+    slot_mse = masked_mean(errors, weights)
+    image_mse = jnp.array(0.0, jnp.float32)
+    if cfg.image_scale:
+      image_mse = masked_mean(self.savi_decoder.mse(predicted, images), weights)
+    metrics = {'openloop_slot_mse': slot_mse, 'openloop_image_mse': image_mse,
+               'openloop_valid_starts': weights.sum()}
+    for h in range(cfg.horizon):
+      metrics[f'openloop_slot_mse_h{h + 1}'] = (
+          errors[:, h] * weights).sum() / jnp.maximum(weights.sum(), 1)
+    return cfg.slot_scale * slot_mse + cfg.image_scale * image_mse, metrics
 
   def imagine(self, policy, start, horizon, carry=None):
     if carry is None:

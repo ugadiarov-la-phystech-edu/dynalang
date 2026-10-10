@@ -47,6 +47,12 @@ class DecoderTests(unittest.TestCase):
           'slot gradient norm:', float(jnp.linalg.norm(gradient)), flush=True)
 
   def test_world_model_image_loss_updates_projection(self):
+    self._world_model_update(False)
+
+  def test_world_model_openloop_image_loss_updates_projection(self):
+    self._world_model_update(True)
+
+  def _world_model_update(self, openloop):
     import embodied
     from dynalang.agent import Agent
     from dynalang import ninjax as nj
@@ -54,6 +60,11 @@ class DecoderTests(unittest.TestCase):
     config = make_config().update({'batch_size': 1, 'batch_length': 2,
         'run.pretrain_wm_only': True,
         'savi_image_loss.scale': 1.0, 'savi_image_loss.starts': 1})
+    if openloop:
+      config = config.update({'octssm.action_mode': 'slot',
+          'openloop_loss.slot_scale': 1.0, 'openloop_loss.image_scale': 1.0,
+          'openloop_loss.horizon': 1, 'openloop_loss.context': 1,
+          'openloop_loss.starts': 1})
     frames = np.repeat((self.images * 255).astype(np.uint8), 2, axis=0)
     slots = np.repeat(self.slots, 2, axis=0)
     env = FrameEnv(frames, np.ones(2, bool))
@@ -71,6 +82,9 @@ class DecoderTests(unittest.TestCase):
     (state, outputs, metrics), after = jax.jit(nj.pure(update))(
         before, jax.random.PRNGKey(4), converted)
     self.assertTrue(np.isfinite(float(metrics['savi_image_mse'])))
+    if openloop:
+      self.assertEqual(float(metrics['openloop_valid_starts']), 1)
+      self.assertTrue(np.isfinite(float(metrics['openloop_image_mse'])))
     keys = [k for k in before if '/dec/slot_proj/' in k and '/opt/' not in k]
     self.assertTrue(keys)
     self.assertTrue(any(not np.array_equal(before[k], after[k]) for k in keys))
