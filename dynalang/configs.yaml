@@ -164,6 +164,8 @@ defaults:
   model_opt: {opt: adam, lr: 1e-4, eps: 1e-8, clip: 1000.0, wd: 0.0, warmup: 0, lateclip: 0.0, frozen_keys: '^$'}
   skip_cnn_training: False
   skip_mlp_training: False
+  # Auxiliary RGB MSE through the frozen SAVi decoder, on posterior slots.
+  savi_image_loss: {scale: 0.0, starts: 8}
   zero_data_keys: ['']
   zero_cnn: False
   zero_mlp: False
@@ -491,6 +493,9 @@ savi:
     flatten_slots: False
   encoder: {mlp_keys: 'token$', cnn_keys: '$^'}
   decoder: {mlp_keys: 'token$', cnn_keys: '$^'}
+
+savi_image_mse:
+  savi_image_loss: {scale: 1.0, starts: 8}
 
 mof_savi:
   task: mof_ReachRed_0to4Distractors_Dense-v1

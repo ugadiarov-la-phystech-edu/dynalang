@@ -242,6 +242,21 @@ class WorldModel(nj.Module):
     scales.update({k: vector for k in self.heads['decoder'].mlp_shapes})
     scales.update({k: vector for k in self.heads['decoder'].slot_shapes})
     self.scales = scales
+    self.savi_decoder = None
+    image_cfg = getattr(config, 'savi_image_loss', embodied.Config(
+        {'scale': 0.0, 'starts': 8}))
+    self.savi_image_cfg = image_cfg
+    if image_cfg.scale < 0 or image_cfg.starts < 1:
+      raise ValueError('savi_image_loss requires scale >= 0 and starts >= 1')
+    if image_cfg.scale:
+      if (not self.encoder.slot_shapes or config.slot_extractor.type != 'savi'
+          or not config.use_slot_extractor or 'image' not in shapes):
+        raise ValueError('SAVi image loss requires SAVi slots and replay images')
+      if 'image' in config.dataset_excluded_keys:
+        raise ValueError('SAVi image loss needs image in the replay dataset')
+      from .savi_decoder import FrozenSAViDecoder
+      self.savi_decoder = FrozenSAViDecoder(config.slot_extractor.checkpoint_path)
+      print('Frozen SAVi decoder SHA256:', self.savi_decoder.checkpoint_sha256)
 
   def initial(self, batch_size):
     prev_latent = self.rssm.initial(batch_size)
@@ -335,6 +350,14 @@ class WorldModel(nj.Module):
       losses[key] = loss
     scaled = {k: v * self.scales[k] for k, v in losses.items()}
     model_loss = sum(scaled.values())
+    savi_image_loss = jnp.array(0.0, jnp.float32)
+    if self.savi_decoder is not None:
+      slots = dists['slot'].mode()
+      flat_slots = slots.reshape(-1, *slots.shape[2:])
+      images = data['image'].reshape(-1, *data['image'].shape[2:])
+      count = min(self.savi_image_cfg.starts, len(flat_slots))
+      idx = jax.random.permutation(nj.rng(), len(flat_slots))[:count]
+      savi_image_loss = self.savi_decoder.mse(flat_slots[idx], images[idx]).mean()
     out = {'embed':  embed, 'post': post, 'prior': prior}
     out.update({f'{k}_loss': v for k, v in losses.items()})
     last_latent = {k: v[:, -1] for k, v in post.items()}
@@ -342,7 +365,10 @@ class WorldModel(nj.Module):
     state = last_latent, last_action
     metrics = self._metrics(
         data, dists, post, prior, losses, model_loss, full_metrics)
-    return model_loss.mean() + lm_loss, (state, out, metrics)
+    if self.savi_decoder is not None:
+      metrics['savi_image_mse'] = savi_image_loss
+    return (model_loss.mean() + lm_loss +
+            self.savi_image_cfg.scale * savi_image_loss), (state, out, metrics)
 
   def imagine(self, policy, start, horizon, carry=None):
     if carry is None:
