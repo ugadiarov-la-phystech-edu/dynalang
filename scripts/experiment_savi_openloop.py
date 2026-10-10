@@ -99,6 +99,9 @@ def train(args):
       'slot_extractor.checkpoint_path': str(args.checkpoint),
       'encoder.mlp_keys': '$^', 'decoder.mlp_keys': '$^',
       'encoder.cnn_keys': '$^', 'decoder.cnn_keys': '$^',
+      # Existing slot reconstruction sums over K*D. Normalize it to a mean
+      # here so auxiliary mean-MSE coefficients have comparable units.
+      'loss_scales.vector': 1.0 / int(np.prod(training[0]['slot'].shape[1:])),
       'octssm': {'deter': 128, 'units': 128, 'stoch': 8, 'classes': 8,
           'tf_layers': 2, 'tf_heads': 4, 'feedforward_units': 512,
           'tf_context_length': 16, 'action_mode': 'slot',
